@@ -1,0 +1,17 @@
+{
+  "title": "ML System Design",
+  "description": "Design production ML systems end to end",
+  "icon": "BrainCircuit",
+  "root": true,
+  "pages": [
+    "index",
+    "problem-framing",
+    "requirements",
+    "data",
+    "features",
+    "modeling",
+    "evaluation",
+    "deployment",
+    "monitoring"
+  ]
+}

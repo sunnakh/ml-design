@@ -1,0 +1,46 @@
+---
+title: ML System Design
+description: A step-by-step framework for designing production machine learning systems.
+icon: BrainCircuit
+---
+
+ML system design is about turning a vague business problem into a working ML system that can be trained, served, evaluated and maintained in production. This course follows 8 stages in 3 phases, in the order you would use in a real design review or a 45-minute interview.
+
+<Diagram src="problem-framing/ml-system-design-8-stages.svg" />
+
+## The 8 stages
+
+<Cards>
+  <Card icon={<Target />} title="1. Problem Framing" href="/courses/ml-system-design/problem-framing">
+    What business problem are we solving? Is ML even needed? What kind of ML task is it?
+  </Card>
+  <Card icon={<ClipboardList />} title="2. Requirements" href="/courses/ml-system-design/requirements">
+    How do we measure success? What are the latency, scale and cost limits?
+  </Card>
+  <Card icon={<Database />} title="3. Data" href="/courses/ml-system-design/data">
+    Where does the data come from, and how do we get labels?
+  </Card>
+  <Card icon={<Layers />} title="4. Features" href="/courses/ml-system-design/features">
+    Which signals predict the target? How are they computed and stored?
+  </Card>
+  <Card icon={<Network />} title="5. Modeling" href="/courses/ml-system-design/modeling">
+    What's the baseline? Which model do we pick after that, and how do we train it?
+  </Card>
+  <Card icon={<ChartColumn />} title="6. Evaluation" href="/courses/ml-system-design/evaluation">
+    Does the model beat the baseline offline? Does it hold up in an A/B test?
+  </Card>
+  <Card icon={<Rocket />} title="7. Deployment" href="/courses/ml-system-design/deployment">
+    Batch or online? How do we meet the latency limit and roll out safely?
+  </Card>
+  <Card icon={<Activity />} title="8. Monitoring" href="/courses/ml-system-design/monitoring">
+    Is the model degrading, or has the data drifted? When should we retrain?
+  </Card>
+</Cards>
+
+## It's a loop, not a line
+
+Production ML systems never finish. What monitoring finds sends you back to earlier stages: a data bug back to Data, drift back to retraining, a changed world back to Problem Framing. Interviewers look for this.
+
+<Callout title="Interview tip">
+  Stages 1–2 are where most people rush, and they carry the most weight in interviews and in real projects.
+</Callout>
