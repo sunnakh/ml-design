@@ -27,6 +27,9 @@ html > body[data-scroll-locked] {
   --text-danger: var(--color-fd-error);
   --text-success: var(--color-fd-success);
   --radius: 8px;
+  /* Shorthands some session diagrams use without defining. */
+  --b: var(--border-strong);
+  --t: var(--text-secondary);
 
   --d-gray-fill: #f1efe8;
   --d-gray-stroke: #5f5e5a;
