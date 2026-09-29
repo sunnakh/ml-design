@@ -1,0 +1,157 @@
+---
+title: 5. Scaling and reliability
+description: Handling load and failures.
+---
+
+## 5.1 Autoscaling and load balancing
+
+### The problem it solves
+
+Traffic is never flat:
+- PayFlow's daily cycle varies about **10×** between 4am and noon.
+- Black Friday runs about **3× a normal peak**.
+- A flash sale can **quadruple Offers traffic in a minute**.
+
+Provisioning for the maximum all the time wastes most of the fleet's cost. Provisioning for the average breaks the SLO at every peak. The two tools that address this:
+- **Autoscaling** changes *how many* instances run.
+- **Load balancing** decides *which* instance gets each request.
+
+Both have ML-specific traps.
+
+### Load balancing
+
+**Layer matters, especially with gRPC.**
+- **L4** (connection-level) balancing assigns a *connection* to an instance.
+- gRPC uses HTTP/2, which sends **many requests over one long-lived connection**. So an L4 balancer sends *all* of a client's requests to one instance, and a few instances become hot while the rest idle.
+- For gRPC, balance **per request (L7)** or on the client side.
+
+**Choice of algorithm:**
+
+| Algorithm | How | Good for | Weakness |
+|---|---|---|---|
+| Round robin | Rotate through instances | Uniform, cheap requests | Ignores load; bad with variable latency |
+| **Least outstanding requests** | Send to the instance with the fewest requests in flight | Variable latency (ML inference) | Needs load tracking |
+| **Power of two choices** | Pick 2 at random, send to the less loaded one | Near-optimal, cheap, scales well | Slightly worse than full information |
+| **Consistent hashing** | The same key always goes to the same instance | **Cache affinity** (L1 hits, 3.4), LLM prefix and KV reuse (4.5) | Hot keys make hot instances; rehashing when instances change |
+
+**Factors specific to ML:**
+- **Model-aware routing.** In multi-model servers, route only to instances that have the requested model and version loaded.
+- **Affinity vs balance.** Routing a conversation to the instance holding its KV cache (4.5) saves prefill time, but can overload that instance. Use affinity **with a load cap**, falling back to the least-loaded instance.
+- **Outlier ejection.** Temporarily remove instances whose errors or latency are far worse than their peers', such as a GPU with a failing driver.
+
+### Autoscaling: the control loop
+
+```
+   ┌──────────── measure signal (per instance) ◄──────────────┐
+   ▼                                                          │
+ desired = current × (signal / target)                        │
+   │   scale UP fast, scale DOWN slow (stabilization window)  │
+   ▼                                                          │
+ request instances ─► node provisioned ─► image pulled ─► model loaded + warmed ─► READY
+```
+
+**Choosing the signal** is the most important decision:
+
+| Signal | Good for | Misleading when |
+|---|---|---|
+| CPU utilization | CPU-bound services (GBDT, feature logic) | Service is I/O-bound (waiting on the feature store) or runs on GPU. Never scales while latency explodes |
+| GPU "utilization" | Rarely | It measures **% of time any kernel is running**, not how full the GPU is. Shows 100% at batch size 1 while mostly idle |
+| **Requests in flight (concurrency)** | Most online services | Leading indicator, and ties directly to Little's law (2.2) |
+| **Batcher queue depth** (4.4) | GPU model servers | Leading indicator of saturation |
+| Latency p99 | Guardrail | **Lagging.** By the time it rises, the SLO is already broken |
+| KV-cache usage, tokens/s | LLM servers (4.5) | Model-specific |
+
+**Rule: scale on a leading indicator that's tied to capacity (concurrency, queue depth). Use latency as an alarm, not as the scaling signal.**
+
+### Reaction time: autoscaling is slower than bursts
+
+```
+ burst starts
+   │ detect (metrics window)        30–60s
+   │ provision node (VM / GPU node)  1–5 min   ← GPU nodes slower, may be unavailable (4.3)
+   │ pull image (CUDA + model: 5–20 GB) 1–5 min
+   │ load model + warmup (3.1)       30s–2 min
+   ▼
+ capacity arrives:  ~3–12 minutes later
+```
+
+A flash sale ramps up in about a minute. **Reactive autoscaling alone can't absorb it.** You need several layers:
+1. **Headroom** (4.1): run at 40–60% utilization, so bursts land on spare capacity.
+2. **Scheduled or predictive scaling:** known daily cycles; pre-scale Black Friday a day ahead.
+3. **Shorten the reaction chain:** pre-pull images onto nodes, keep models on the node's local disk, and keep **warm pools** of started-but-idle instances.
+4. **Fallback and shedding** (3.5) for the minutes until capacity arrives.
+
+There are **two autoscalers** working together. One adds *instances*; the other adds *nodes* for them to run on. If the cluster has no free nodes, new instances just wait unscheduled, and the scale-up silently doesn't happen.
+
+### PayFlow's configuration
+
+| Service | Signal | Minimum | Strategy |
+|---|---|---|---|
+| Fraud service (CPU) | In-flight requests, target 40/instance | 3 per zone | Scheduled pre-scale for lunch and evening peaks; reserve 3× capacity a day before Black Friday |
+| Transformer pool (GPU) | Batcher queue depth, with p99 as guardrail | 1 per zone, plus a **warm pool of 2** | Reserved GPU capacity (never spot); overflow falls back to the GBDT decision (2.4) |
+| Offers ranker | Queue depth | 1 per zone | Scales aggressively; degrades to cached popular offers during bursts (3.5) |
+| Batch scoring (2.1) | The job schedule | 0 (scale to zero) | Spot instances; no latency SLO |
+
+**Never scale latency-critical services to zero.** A cold start takes minutes.
+
+### Assumptions
+
+- Traffic changes **more slowly than the reaction time**, or predictably.
+- **Capacity is available.** Cloud quotas, GPU scarcity (4.3).
+- Instances are **stateless** (2.2), so any instance can serve any request.
+- Metrics are **timely** and measured **per instance**, not only averaged.
+
+### Trade-offs
+
+- **Cost vs headroom:** paying for idle capacity buys absorption of bursts.
+- **Reactive vs predictive:** simple and self-correcting vs faster but able to be wrong.
+- **Aggressive scale-down:** saves money but risks thrashing and churning out warm caches.
+- **Affinity vs balance:** cache and KV reuse vs hot instances.
+
+### Failure modes
+
+1. **Wrong signal.** Scaling an I/O-bound service on CPU means it never scales. Scaling a GPU pool on "GPU utilization" means it scales when it's idle.
+2. **Too slow for a burst.** The SLO breaks for minutes, then capacity arrives after the burst has passed and overshoots.
+3. **Flapping.** Scale up, down, up, with no stabilization window. Every cycle cold-starts instances.
+4. **Cold-start amplification.** New instances take traffic before they're warm, so latency rises, which triggers more scale-up, which adds more cold instances. **Readiness gates (3.1)** break this loop.
+5. **Health-check death spiral.** Overload makes health checks time out. The load balancer removes those instances, the remaining ones get more overloaded, and eventually they're all removed.
+   - Fixes: health checks that don't depend on request latency, "panic mode" (keep routing when most instances look unhealthy), and load shedding (5.3).
+6. **gRPC imbalance.** A few instances are pinned at 100% while the fleet average looks fine, so the autoscaler does nothing.
+7. **Quota and capacity limits.** The autoscaler asks for 40 GPUs and the cloud provides 12.
+8. **Scale-down kills in-flight work.** Instances terminated mid-batch or mid-generation. Fix: **graceful draining**: stop accepting new requests, finish in-flight ones, then exit.
+9. **Averages hide hot instances.** Scale and alert on the **maximum or p95 per instance**, not the fleet mean.
+
+### Connections
+
+- **2.2:** Little's law and target concurrency.
+- **3.1:** readiness and warmup gate new instances.
+- **3.4:** new instances start with empty L1 caches, which briefly increases misses (herd risk).
+- **3.5:** fallback and shedding cover the scaling gap.
+- **4.1:** headroom. **4.3:** GPU scarcity and scaling granularity. **4.4:** queue depth as the signal. **4.5:** KV affinity.
+- **5.3:** load shedding. **5.5:** reservations and pre-scaling for peaks.
+- **Branch 6:** a canary running alongside production needs capacity for **both** versions.
+- **Branch 9:** per-instance saturation dashboards.
+
+<Callout title="Exercise 5.1 (incident timeline)">
+
+At **12:00**, a flash sale pushes Offers traffic from **800 to 3,000 req/s within 60 seconds**. Current setup:
+- Scales on **CPU at 60%**, with a **60s** metrics window.
+- A new node takes **3 min** to provision. The **12GB image** takes **4 min** to pull. Model load and warmup take **1 min**.
+- The ranker is **GPU-based**, and its instances were at 45% CPU before the sale.
+
+1. Build the timeline. When does new capacity actually serve traffic? What do users experience in the meantime, and which part of 3.5 should be doing the work? Also, is CPU even the right signal for this service?
+2. Propose **three concrete changes** that shrink or cover the gap, each with its cost.
+
+</Callout>
+
+## 5.2 Sharding big models
+
+Split large models or embedding tables across machines when they don't fit on one.
+
+## 5.3 Timeouts, retries, breakers
+
+Bound how long you wait, retry carefully, and cut off failing dependencies so failures don't cascade.
+
+## 5.4 Multi-region failover
+
+Run in several regions so an outage in one doesn't take the system down.

@@ -1,0 +1,573 @@
+---
+title: 3. Serving architecture
+description: Which components do the work, and how they connect.
+---
+
+## 3.1 Model server and API
+
+### The problem it solves
+
+A model artifact is just a file. Serving needs a process that **loads** it safely, **accepts** requests, **runs inference efficiently**, **reports health**, **manages versions**, and **handles concurrency**. Flask + `pickle.load()` works in a demo and breaks under load: the GIL serializes inference, no batching leaves GPUs idle, no version management, and no difference between "process up" and "model ready". A **model server** solves exactly these.
+
+### The key split: prediction service vs model server
+
+```
+ caller
+   │
+   ▼
+┌───────────────────────────────┐        ┌──────────────────────────────┐
+│ PREDICTION SERVICE  (CPU)     │  gRPC  │ MODEL SERVER  (GPU/CPU pool) │
+│  - validate request (1.2)     │───────►│  - load artifact by version  │
+│  - fetch features (2.2)       │deadline│  - dynamic batching          │
+│  - call model(s), cascade     │◄───────│  - optimized runtime         │
+│  - threshold, rules, fallback │ tensors│  - tensor in → tensor out    │
+│  - log decision               │        │  - knows NOTHING about fraud │
+└───────────────────────────────┘        └──────────────▲───────────────┘
+                                                        │ pull + verify
+                                                ┌───────┴────────┐
+                                                │ model registry │ (branch 7)
+                                                └────────────────┘
+```
+
+The **prediction service** holds business logic: changes often, CPU, owned by the fraud team. The **model server** is generic tensor-in, tensor-out inference on expensive hardware, often platform-owned. They deploy, scale and fail independently; this is the cascade's architecture.
+
+### What's inside a model server
+
+| Component | What it does |
+|---|---|
+| Loader | Pulls a version from the registry, **verifies checksum and signature**, loads, warms up |
+| Protocol | REST+JSON (easy, slower) or **gRPC+protobuf** (binary, typed, deadlines) |
+| Runtime | ONNX Runtime, TensorRT, Treelite (trees compiled to C), native XGBoost |
+| Concurrency | Worker processes or threads avoiding the GIL |
+| Batching queue | Up to N requests or at most 2ms wait (branch 4) |
+| Version manager | Several versions loaded, routed by header, swapped without restart |
+| Health endpoints | **Liveness** (alive) vs **readiness** (model loaded and warmed) |
+| Metrics | Per-model latency, queue time, batch size, errors |
+
+Complete model servers: NVIDIA Triton, TorchServe, TF Serving, KServe, vLLM (for LLMs).
+
+### Four deployment topologies
+
+| Topology | Extra latency | Coupling | Scaling | PayFlow use |
+|---|---|---|---|---|
+| **Embedded** (library in the service) | 0 | Deploy together | Together | GBDT (2ms, CPU) |
+| **Sidecar** (container on the same host) | ~0.2ms | Deploy separately | Together | Option for moving GBDT out |
+| **Remote pool** | 1–3ms | Fully separate | **Independent** (GPUs sized to the routed share) | Transformer, cascade stage 2 |
+| **Managed endpoint** | 1–5ms | Separate | Vendor-handled | Fast start; costlier, less tail control |
+
+### API design details that matter
+
+1. **Named, schema-checked features, not positional arrays.** With `[0.3, 12, 4.1, ...]` the order *is* the contract and nothing checks it. Use a **model signature**; the server checks it against the incoming schema **at load time** and refuses readiness on mismatch.
+2. **Deadline propagation.** The server **drops requests past their deadline** instead of computing answers nobody reads.
+3. **Echo the version** in every response.
+4. **Separate online and bulk endpoints**, so backfills never compete with live traffic.
+
+### Assumptions
+
+- The model is **stateless per request** (state lives in feature stores), enabling horizontal scaling.
+- The artifact **converts cleanly** to the serving runtime.
+- Load and warmup time suits how fast you need to scale.
+
+### Trade-offs
+
+- **Embedded vs remote:** latency and simplicity vs independent scaling and deploys.
+- **Generic server vs custom code:** batching, versioning and metrics for free vs full control of the tail.
+- **Managed vs self-hosted:** offloaded operations vs cost, lock-in and fixed limits.
+- **gRPC vs REST:** performance and typed schemas vs debuggability and compatibility.
+
+### Failure modes
+
+1. **Feature order mismatch:** positional arrays, reordered features, garbage scores, no error.
+2. **Readiness equals liveness:** traffic hits instances still loading a 2GB model; every scale-up causes timeouts.
+3. **GIL bottleneck:** p99 explodes as concurrency rises.
+4. **Runtime conversion drift** (ONNX float precision, unsupported ops): environment skew. Run a **parity test at load time**.
+5. **OOM from multiple versions** (canary + shadow + production).
+6. **Wasted work under overload** without deadlines.
+7. **Unsafe artifact loading.** A security risk: `pickle` and `joblib` execute arbitrary code on load, so anyone who can write to model storage can run code on a fleet handling payment data. Load only **signed artifacts from the registry**, preferring formats that don't execute code (ONNX, safetensors, native tree formats).
+
+### Connections
+
+- **1.1:** thresholds and rules live in the service. **1.2:** deadlines implement the budget; gRPC schemas the interface. **1.3:** conversion is environment skew. **2.2, 2.4:** embedded vs remote; cascade calls with timeouts. **Branch 4:** batching and runtimes. **Branch 6:** multiple versions enable shadow and canary. **Branch 7:** signed, versioned artifacts.
+
+<Callout title="Exercise 3.1">
+  GBDT **v8** adds 3 new features **inserted in the middle** of the list. The prediction service sends a **positional float array**. Plan: deploy the model server with v8 on Monday, update the service to send the new features on Tuesday. What happens to decisions between Monday and Tuesday, and why does nothing alert? Redesign the contract and deploy order so the change is safe: what checks where, and what's deployed first?
+</Callout>
+
+## 3.2 Online feature retrieval and feature stores
+
+### The problem it solves
+
+Look at what the last few parts piled up:
+- Features come from **four sources**: request, inline, batch and streaming (2.2).
+- Each feature is computed **twice**, once offline and once online, which invites skew (1.3).
+- Training needs **point-in-time-correct** history (1.3, 2.1).
+- Serving needs the **latest value within milliseconds** (2.2).
+- Freshness varies from **seconds to days** (2.3).
+
+Without a system to manage this, every team builds its own pipelines. That leads to duplicated work, skew, nobody knowing which features exist, and nobody knowing who owns them.
+
+A **feature store** manages feature definitions **once** and serves them consistently in two ways:
+- **history** for training, and
+- **the latest value** for serving.
+
+### Architecture
+
+```
+                       ┌──────────────────────────────────────┐
+                       │ FEATURE REGISTRY (definitions)        │
+                       │ name · entity key · source · transform│
+                       │ owner · freshness SLO · missing value │
+                       │ version · consuming models (lineage)  │
+                       └───────────────┬──────────────────────┘
+                                       │ one definition
+                        ┌──────────────┴──────────────┐
+                        ▼                             ▼
+ sources         MATERIALIZATION (batch jobs 2.1 + stream jobs 2.3)
+ (warehouse,            │ writes to BOTH, same logic │
+  Kafka)                ▼                             ▼
+            ┌──────────────────────┐      ┌──────────────────────┐
+            │ OFFLINE STORE        │      │ ONLINE STORE         │
+            │ full history +       │      │ latest value per key │
+            │ timestamps (lake)    │      │ (Redis / DynamoDB)   │
+            └──────────┬───────────┘      └──────────┬───────────┘
+                       │                              │
+       get_historical_features(                get_online_features(
+         entity rows + timestamps)               keys, feature list)   p99 ~5ms
+                       │                              │
+                       ▼                              ▼
+                 TRAINING (1.3)              PREDICTION SERVICE (2.2, 3.1)
+```
+
+Examples: Feast (open source), Tecton, and the feature stores built into Databricks, SageMaker and Vertex AI.
+
+### The central mechanism: point-in-time joins
+
+Training input is an **entity dataframe**: rows of `(card_id, event_ts, label)`. For each row and each feature, the store picks:
+
+> the value with the **latest `available_at` ≤ `event_ts`**, provided it's **no older than the feature's TTL**. Otherwise the value is **missing**.
+
+This follows three rules. Each one mirrors a serving-time behavior from earlier parts:
+
+1. **Join on `available_at`, not event time.** A value computed for window 13:59–14:00 that landed in the online store at 14:00:04 **didn't exist** for a request at 14:00:02. Serving couldn't have seen it, so training mustn't either.
+2. **Apply the TTL the same way serving does.** In 2.3, the service treats values that are too old as missing. The join must too.
+3. **Missing means missing.** Use the declared missing value (NaN), never 0. This is the XGBoost trap from 1.3.
+
+(This also answers part of open Exercise 2.1: a nightly score only counts once it has landed.)
+
+### Kappa vs Lambda: how both stores get the same values
+
+| | Lambda | Kappa | Unified definitions (modern) |
+|---|---|---|---|
+| How | A batch path and a separate streaming path, merged | One streaming codebase; backfill by replaying the event log | One definition (SQL or DSL) compiled to both batch and streaming engines |
+| Skew risk | **High**: two implementations | Low | Low |
+| Cost | Two systems to maintain | Long log retention; replays are heavy | Platform complexity, and not everything compiles to both |
+
+### On-demand features
+
+Some features can only be computed from the request, such as `amount / user_avg_spend_90d`. The feature store can register these as **on-demand transformations**: one function that runs at request time online and inside the historical join offline. That keeps even the hand-written inline features skew-free, at the cost of running that code on the latency path.
+
+### Performance of online reads
+
+One PayFlow request needs features for **3 entities**: card, merchant and device.
+- **Store all features for an entity in one row**, so it's one read per entity rather than one per feature (~20 per entity).
+- Use **multi-get, in parallel**: 3 reads, not 60.
+- The online store's p99 is now **directly on the request path**, and fan-out amplifies its tail (1.2).
+
+### Design choices
+
+| Choice | Options and trade-off |
+|---|---|
+| Build, buy or skip | With 1 model and 1 team, a shared feature library plus tables may be enough. With many models and teams, a feature store pays for itself. |
+| Online store | Redis: lowest p99, but expensive memory. DynamoDB/Bigtable: cheaper per GB, higher tail latency. |
+| Materialization cadence | Per feature, driven by its freshness SLO. Not "everything hourly." |
+| Entity and key design | Row per entity vs row per feature: read count vs update granularity |
+
+### Assumptions
+
+- Sources carry **reliable timestamps**, including when each value became available.
+- The feature store is **at least as available as serving needs**. It's now a hard dependency of every model, so the availability multiplication from 1.2 applies.
+- **Nobody goes around it.** Its guarantees only hold if definitions are the only way features get made.
+
+### Failure modes
+
+1. **Joining on event time instead of availability time.** A mild form of leakage: the model trains on fresher values than it will ever get in serving.
+2. **Materialization fails silently.** The online store goes stale. Monitor **freshness per feature** (`updated_at`), not just "the job ran."
+3. **The two stores diverge.** The online write succeeded but the offline write failed. Training data has a gap, or skews toward whichever days succeeded.
+4. **It becomes a single point of failure.** A feature store outage takes down **every model at once**. This needs multi-zone deployment plus fallbacks (3.5).
+5. **Bypass.** An engineer computes a feature inline "just for now," and skew comes back.
+6. **Deleting a feature that's still in use.** Without lineage, someone deletes a "deprecated" feature, and a production model starts receiving nulls. Lineage prevents this: record which models consume which features.
+7. **Cost creep.** 50M cards × 200 features in Redis gets expensive. Prune features no model uses.
+
+### Connections
+
+- **1.3:** the feature store exists mainly to eliminate code skew and time skew.
+- **2.1 and 2.3:** batch and streaming jobs are how features get materialized.
+- **2.2 and 3.1:** the prediction service's parallel fetch is `get_online_features`.
+- **3.5 (coming):** what serving does when the feature store is slow or down.
+- **Branch 7:** feature versioning and lineage.
+- **Branch 9:** per-feature freshness and divergence monitoring.
+
+<Callout title="Exercise 3.2 (point-in-time join)">
+
+Training row: transaction at **2026-03-10 14:00:05**, card C, merchant M.
+
+| Feature | Available values | TTL |
+|---|---|---|
+| `card_risk_prior` | Mar 9 run landed **03:30 Mar 9**; Mar 10 run landed **03:30 Mar 10** | 26h |
+| `txn_count_10min` | Window ending 14:00:00 landed **14:00:04**; window ending 14:00:05 landed **14:00:08** | 60s |
+| `merchant_risk_score` | Last successful run landed **03:30 Mar 7** (jobs failed Mar 8–10) | 48h |
+
+1. Which value (or *missing*) goes in the training row for each feature? Give a one-line reason for each.
+2. The team's join uses **event time** instead of `available_at`. Which feature's value changes? Does that make the model look better or worse offline than it will actually perform online, and why?
+
+</Callout>
+
+## 3.3 Retrieve-then-rank infrastructure
+
+PayFlow's fraud problem only needs this infrastructure in a minor role, so I'm adding a **second example** that uses it at full strength, and it's the one interviews ask about most.
+
+**PayFlow Offers:** the consumer app shows each user personalized cashback offers.
+- **200k active offers**, and **30M users**.
+- Budget: **p99 150ms** to show the top 10 offers.
+- New offers are added all day, and offers expire.
+
+### The problem it solves
+
+In 2.4 you learned the funnel shape (retrieve → rank → re-rank). This part is about the **machinery that makes retrieval fast**.
+
+Scoring all 200k offers with a heavy ranker for every request is impossible: 200k × 0.1ms = 20 seconds. Retrieval needs to find the ~500 most relevant offers **without looking at every offer**, meaning in *sublinear* time. The standard answer is **embeddings plus approximate nearest-neighbor (ANN) search**.
+
+### How it works
+
+**Step 1: Two-tower model.** Two neural networks map users and offers into the **same vector space**. The relevance score is the dot product of the two vectors.
+- The **offer tower** runs **in batch** (2.1). Offers change slowly, so their vectors are precomputed and indexed.
+- The **user tower** runs **online** (2.2), using session features, so the vector reflects what the user is doing right now.
+
+**Step 2: ANN index.** Exact nearest-neighbor search compares the query against every vector: O(N·d) per query. ANN gives up a little **recall** (the true top-K results it manages to return) in exchange for a large speedup.
+
+| Index family | How it works | Strengths | Weaknesses |
+|---|---|---|---|
+| **HNSW** (graph) | Navigate a layered graph of nearest neighbors | High recall, fast, supports inserts | Memory-heavy; deletes are only tombstones |
+| **IVF** (clustering) | Split vectors into cells; search only the `nprobe` nearest cells | Tunable, scales well | Recall depends on how the clusters are shaped |
+| **IVF + PQ** (product quantization) | Also compress vectors to a few bytes each | Billions of vectors in RAM | Lower recall; approximate distances |
+| **Disk-based** (DiskANN) | Graph stored on SSD | Very large scale, cheap | Higher latency |
+
+Libraries: FAISS, hnswlib, ScaNN. Vector databases: Milvus, Qdrant, Weaviate, pgvector, Vespa, OpenSearch k-NN.
+
+**Tuning knobs:** HNSW's `efSearch` and IVF's `nprobe` each trade **recall against latency**. Choose them by measuring recall@500 against exact search on a held-out set of queries.
+
+### The full system
+
+```
+ OFFLINE (batch, nightly + incremental)
+ offer catalog ─► offer tower (v5) ─► 200k vectors ─► build index ─► validate ─► publish
+                                                      (HNSW)        recall@500   atomic swap,
+                                                                    vs exact kNN tagged "v5"
+ ONLINE (per request, p99 150ms)
+ request ─► user tower (v5!) ─► user vector ──┐
+            ~10ms                             ├─► ANN top 500 ~10ms ┐
+                  other candidate generators: │                     ├─► merge + dedupe
+                  popular nearby, recently ───┘   rules, trending ──┘   + filters (active,
+                  viewed merchants                                       country, eligible)
+                                                                              │ ~500
+                              ranker (heavy model, feature store 3.2) ◄───────┘ ~70ms
+                                     │ ~500 scored
+                              re-rank: diversity, budget pacing, policy ~5ms
+                                     │
+                                  top 10
+```
+
+Three points in this diagram need more explanation:
+
+1. **Several candidate generators, merged.** Embeddings alone miss things, such as brand-new offers or strong local popularity. Real systems combine ANN results with rules, popularity and recency, then dedupe. Each generator adds recall.
+2. **Filtering: before or after the search?** Suppose only 1% of offers are valid for a user's country. If you retrieve 500 and *then* filter, only about 5 remain. This is **post-filter starvation**. Options: filtering during the search (filtered ANN), a separate index per country, or retrieving more candidates to compensate.
+3. **Version coupling.** The user tower and the index **must come from the same model version**. Vectors from v6 queried against a v5 index are comparisons between two unrelated spaces. The results aren't slightly worse; they're **meaningless**, and nothing throws an error.
+
+### PayFlow fraud uses ANN too, as a feature
+
+PayFlow keeps an index of device embeddings from **known fraud rings**. At request time, the service looks up how close this transaction's device is to its nearest known-fraud device. The ANN lookup becomes **one feature** in the fraud model. Same infrastructure, different role.
+
+### Assumptions
+
+- The embedding space actually captures **relevance for your objective.** Clicks, conversions and fraud similarity are different spaces.
+- The **item set changes slowly relative to index rebuilds**, or you support incremental inserts.
+- **Approximate recall is acceptable**, typically about 95% of exact.
+- The **filters work with the index** you chose.
+
+### Trade-offs
+
+- **Recall vs latency vs memory:** the three-way trade-off at the heart of every ANN choice.
+- **Freshness:** full nightly rebuilds are clean and validated but stale. Incremental inserts are fresh, but graph quality degrades and deletes are awkward.
+- **Library in-process vs vector database:** the lowest latency and no extra hop vs managed updates, filtering and replication.
+- **More candidate generators:** higher recall vs more latency, merge complexity and debugging effort.
+
+### Failure modes
+
+1. **Tower/index version mismatch.** The results are garbage and nothing errors. You can only see it in engagement metrics, days later.
+2. **Stale index / new-item cold start.** Offers added today can't be retrieved until tomorrow's rebuild, and merchants paying for promotion get zero impressions.
+   - Fix: incremental inserts, or a separate generator for new items.
+3. **Post-filter starvation.** Users in small markets see 3 offers, or only fallback offers.
+4. **Unmonitored recall decay.** The catalog grows, the index parameters don't change, and recall@500 slides from 96% to 80%. Only ranker metrics are watched, so no one sees it. This is the **recall ceiling from 2.4**, hidden.
+5. **Memory blowup.** 100M vectors × 256 dimensions × 4 bytes = ~100GB, **before** HNSW's graph overhead. Use PQ compression or sharding (branch 5).
+6. **Expired items returned.** HNSW deletes are soft, so expired offers keep appearing unless validity is checked after retrieval.
+7. **Popularity feedback loop.** The retrieval model trains on what it chose to show, so popular offers get more popular and new ones never get a chance (branch 9: feedback loops and exploration).
+
+### Connections
+
+- **2.4:** this is the machinery behind the funnel, and retrieval sets the recall ceiling.
+- **2.1 and 2.2:** item tower in batch, user tower online. This is the two-tower hybrid.
+- **3.1:** the towers are served by the model server.
+- **3.2:** the ranker's features come from the feature store.
+- **3.4 (next):** user vectors and popular results are good caching candidates.
+- **Branch 4:** PQ is quantization applied to retrieval.
+- **Branch 6:** coupled versions have to roll out together.
+- **Branch 9:** monitoring recall@K, plus exploration to break feedback loops.
+
+<Callout title="Exercise 3.3 (rollout design)">
+
+The Offers team retrains the two-tower model as **v6**. Their plan:
+- **Night:** rebuild the ANN index with v6 offer vectors (takes 3h), then atomically swap it in at 04:00.
+- **Next morning, 10:00:** start a **10% canary** of the v6 user tower, using the usual process.
+
+1. What breaks, **for which users**, and **between which times**? Why don't the canary metrics catch it?
+2. Redesign the rollout so v6 can be canaried safely. What must be deployed and versioned **together**, and how does a request get routed consistently?
+
+</Callout>
+
+## 3.4 Caching
+
+### The problem it solves
+
+Serving repeats a lot of work. Popular search queries recur, users refresh the same page, and 5,000 transactions a second hit the same popular merchants. Caching stores results you've already computed so you can reuse them, which gives you:
+- **lower latency**,
+- **lower cost** (fewer model calls and store reads), and
+- **resilience**: a cache can serve answers while a dependency is down (the link to 3.5).
+
+In ML serving, the question is **what** to cache. Some things are safe to reuse; others become wrong the moment they're stored.
+
+### What can be cached (from most specific to broadest)
+
+| Layer | Key → value | Good when | PayFlow |
+|---|---|---|---|
+| **Prediction** | inputs + versions → output | The same inputs repeat | Offers top-10 per user: yes. **Fraud decisions: never.** Every transaction is unique, and velocity changes the answer. |
+| **Feature** | entity → feature values | The feature changes slowly and is read often | `merchant_risk_score`: yes. **Velocity counters: never.** |
+| **Embedding** | user/item → vector | The model is expensive; the vector holds up for minutes | Offers user vector, 5 min |
+| **Candidates / results** | segment → list | Many users share an answer | "Top offers in NYC" for users who aren't logged in |
+| **Precompute** (2.1) | everything, ahead of time | Inputs can be listed | Batch is caching taken to the extreme |
+
+**Rule: cache a value only if it changes more slowly than your TTL, and only if a stale value can't cause serious harm.** Velocity features fail both tests.
+
+### How it works: tiered caches
+
+```
+ request
+   │
+   ▼
+ L1: in-process cache (per instance)   ~µs    small, hot keys, short TTL
+   │ miss
+   ▼
+ L2: distributed cache (Redis)          ~1ms   shared across instances
+   │ miss
+   ▼
+ source: online store / model server    5–100ms
+   │
+   └─► fill L2 and L1 on the way back (with TTL + jitter)
+```
+
+Popularity follows a **Zipf-like** distribution: a few keys get most of the traffic. The top 1% of merchants might account for 40% of transactions, so even a small L1 cache hits often.
+
+### The five design decisions
+
+**1. The cache key must include *everything* the output depends on.**
+
+```
+key = hash(user_id, model_version, feature_set_version, experiment_arm, locale, ...)
+```
+
+Leave out `experiment_arm`, and control users get the treatment's cached results. The A/B test is silently corrupted. Leave out `model_version`, and after a rollback you keep serving outputs from the bad model until the TTL expires.
+
+**2. TTL plus invalidation.**
+- **Set the TTL from the freshness SLO** (1.2). No TTL may be longer than the freshness the contract promises.
+- **Event-driven invalidation** covers changes that can't wait for the TTL. A card reported stolen must invalidate its cached features **now**, not in 10 minutes.
+
+**3. Hit rate helps the mean, not the tail.**
+
+```
+mean latency ≈ h · t_hit + (1 − h) · t_miss
+```
+
+The slowest requests are all misses. At a 90% hit rate, the 10% that miss still set your p99. **Caching improves average latency and cost, but you still have to design the miss path to meet the p99 SLO.**
+
+**4. Protect the backend from cache failure.** The backend gets sized for the *miss* traffic. If the cache is flushed (restart, deploy, or many keys expiring at once), 100% of traffic suddenly hits a backend sized for 10%. This is a **thundering herd**. Defenses:
+- **Request coalescing** ("single-flight"): 1,000 concurrent misses for the same key cause **one** backend call.
+- **Jittered TTLs**: randomize expiry so keys don't all expire together.
+- **Stale-while-revalidate**: serve the old value while refreshing it in the background.
+- **Warm the cache** before a new instance takes traffic.
+
+**5. Negative caching.** Cache "this key doesn't exist" (e.g., a new card with no `card_risk_prior`) for a *short* time, so the store isn't hammered with lookups that will fail. If that TTL is too long, the card's first real score stays hidden.
+
+### PayFlow's caching decisions
+
+| Item | Cache? | TTL | Invalidation |
+|---|---|---|---|
+| Fraud decision per transaction | **No** | — | — |
+| `txn_count_10min` | **No** | — | — |
+| `card_risk_prior` | L1 | 5 min | Event: card reported stolen or reissued |
+| `merchant_risk_score` | L1 + L2 | 30 min | Event: merchant flagged by analyst |
+| Offers user embedding | L2 | 5 min | Event: purchase or significant session action |
+| Offers top-10 result | L2 | 2 min | Key includes model version, experiment arm, locale |
+| Popular offers by city | L2 | 15 min | Nightly rebuild |
+
+### Assumptions
+
+- Inputs **repeat** often enough (skewed popularity). Uniformly random inputs make caching useless.
+- **Staleness within the TTL is acceptable** for this value.
+- **The key captures every dependency.** This is the assumption most often wrong in practice.
+
+### Trade-offs
+
+- **Freshness vs hit rate:** a longer TTL gives more hits and staler answers.
+- **Memory vs hit rate:** a bigger cache gives diminishing returns, per the Zipf distribution.
+- **Latency vs invalidation complexity:** event invalidation needs event plumbing and makes consistency harder to reason about.
+- **Resilience vs correctness:** serving stale data during an outage keeps you up, but the answers may be wrong.
+
+### Failure modes
+
+1. **Incomplete key.** Contamination across experiment arms or model versions. A/B results are quietly invalid, and after a rollback, outputs from the bad model linger.
+2. **Thundering herd** after a flush or synchronized expiry. The backend collapses, and it looks like a model-server outage.
+3. **Stale answers after a critical event.** A stolen card is still scored with its old low-risk features.
+4. **The cache hides outages and regressions.** The backend dies, metrics stay green until TTLs expire, then everything falls off at once. Likewise, **canary traffic served from cache** makes a new model look identical to the old one.
+5. **Privacy leak.** A key without `user_id` (or a hash collision) serves one user's personalized results to another. This belongs in branch 10.
+6. **Training skew.** Serving used a cached value up to 30 minutes old, but training joins the fresh value. Log **the value actually served and its age** (1.1, 1.3).
+7. **Capacity that depends on the hit rate.** A change in traffic mix (a new market, a bot) drops the hit rate from 90% to 60%, and backend load **quadruples**, from 10% of traffic to 40%.
+
+### Connections
+
+- **1.2:** TTLs are bounded by freshness SLOs, and the miss path must meet p99.
+- **1.3:** serving cached (stale) values is a form of time skew unless it's logged.
+- **2.1:** batch is precomputation, the extreme form of caching.
+- **3.2 and 3.3:** feature and embedding caches sit in front of the online store and the towers.
+- **3.5 (next):** stale-on-error is a degradation strategy.
+- **Branch 5:** herd protection and capacity planning.
+- **Branch 6:** caches must be version- and arm-aware, or rollouts and A/B tests lie.
+- **Branch 10:** cache keys are a privacy boundary.
+
+<Callout title="Exercise 3.4 (design and calculation)">
+
+The Offers team adds a result cache: **key = `hash(user_id)`, TTL = 10 min**. The same day, at 12:00, they start an **A/B test** of ranker v7 vs v8, with arms assigned **per session**.
+
+1. Name **two concrete ways** this cache corrupts the A/B test or the user experience. Then write a corrected key and at least one invalidation trigger.
+2. After the fix: hit rate **70%**, hit latency **2ms**, miss latency **p50 80ms / p99 140ms**. Roughly what are the new mean and p99? What does this imply for sizing the ranker, if the cache is ever flushed at peak?
+
+</Callout>
+
+## 3.5 Fallbacks and graceful degradation
+
+### The problem it solves
+
+In 1.2 we did the math: hard-depending on three components with 99.9%-level availability caps you near **99.75%**, well short of the **99.99%** target. Everything in branch 3 (the model server, the feature store, the ANN index, the caches) is a dependency that **will** fail sometimes.
+
+Graceful degradation means deciding **ahead of time** what the service returns when each dependency fails. The answer should be a valid decision with **bounded risk**, not an error, and not whatever a `try/except` happens to return.
+
+### Availability with an independent fallback
+
+```
+P(no valid decision) = P(primary fails) × P(fallback fails)      (if independent)
+
+primary 99.75%, fallback 99.9%  →  1 − (0.0025 × 0.001) = 99.99975%
+```
+
+This is how you get above the ceiling your dependencies impose, **provided the two paths really are independent**. Most of the design work, and most of the failures, come down to that condition.
+
+### How it works: a degradation ladder
+
+For PayFlow fraud:
+
+```
+LEVEL  TRIGGER                          WHAT RUNS                                  RISK POLICY
+─────  ───────────────────────────────  ─────────────────────────────────────────  ──────────────────────────
+ L0    healthy                          cascade: GBDT + transformer, all features  normal thresholds
+ L1    transformer timeout / breaker    GBDT only                                  normal
+ L2    streaming features stale/missing GBDT trained to handle missing velocity    step-up band widened
+ L3    feature store down               embedded "lite" model: request features    decline > $2k, step-up
+                                        + stale L1-cached card_risk_prior + rules  > $200, approve below
+ L4    fraud service unreachable        gateway-side static rules (amount by       fail-closed high amounts,
+                                        merchant category)                         fail-open small ones
+─────
+every level: degraded=true + level in response and log; alert when degraded rate > 0.5%
+```
+
+Three principles are built into this ladder:
+
+**1. Fallback models must be *trained* for the degraded inputs.** Passing nulls into the main model gives predictions nobody has evaluated. The options:
+
+| Option | How | Trade-off |
+|---|---|---|
+| Separate fallback model | Trained only on features available in that degraded state | Known, measurable quality; but one more model to maintain and keep fresh |
+| **Feature-group dropout** | Train the main model with whole feature groups randomly masked, so it learns to handle their absence | One model, robust to missing groups; may cost a little accuracy when everything is healthy |
+| Rules | Hand-written thresholds | Needs no dependencies and is easy to explain; weak, and fraudsters learn the rules |
+
+**2. Tighten the risk policy as you degrade.** A weaker model means more fraud gets through at the same threshold. So lower the thresholds, or step up more transactions. The cost is **customer friction**, which is a business trade-off decided in advance for each level.
+
+**3. Degradation must never be the easier path for attackers.** If fraudsters can *trigger* degraded mode (for example, by sending malformed device fingerprints that break feature lookups), and degraded mode is looser, they will. **Degraded mode should be stricter, never looser.**
+
+### Mechanisms that make the ladder work
+
+| Mechanism | What it does | Trade-off |
+|---|---|---|
+| **Per-dependency timeouts** | Bound how long each call may take (from the budget in 1.2) | Too tight means false fallbacks; too loose blows the SLO |
+| **Circuit breaker** | After an error rate > X% in a time window, stop calling the dependency for a cooldown; then let a few probe requests through ("half-open") | Fails fast and gives the dependency room to recover; a badly tuned breaker flaps between states |
+| **Hedged requests** | If no reply by the p95 time, send a duplicate to another replica and use whichever answers first | Cuts the tail sharply for about 5% extra load |
+| **Bulkheads** | Separate thread and connection pools per dependency | A slow transformer can't use up the threads needed for everything else |
+| **Load shedding by priority** | Under overload, drop or degrade low-value work first | You must decide which work is low-value, in advance |
+| **Serve stale** (3.4) | Use expired cached values when the source is down | Bounded staleness vs outage |
+
+### Offers ladder: a different cost of failure
+
+```
+L0 personalized ranker → L1 ANN scores only (no ranker) → L2 cached popular-by-city → L3 static curated list
+```
+
+For fraud, degrading costs **risk** (money lost). For Offers, it costs **revenue and engagement**, and it's recoverable. So **under shared-infrastructure pressure, degrade Offers first to protect fraud.** Priority across services is part of the design.
+
+### Assumptions
+
+- **Failures are detected fast**, by timeouts and breakers, not by waiting for a TCP connection to hang.
+- **The fallback's failures are independent of the primary's.** No shared cluster, region, or config.
+- **Capacity exists** for the fallback path at full traffic.
+- **The fallback still works**, even though it rarely runs.
+
+### Failure modes
+
+1. **Accidental fail-open.** `except: return APPROVE`. This is the default someone wrote in 1.2's scenario, found during an incident.
+2. **Common-mode failure.** The L1 cache of `card_risk_prior` sits in the **same Redis cluster** as the feature store. When the cluster dies, L3 loses the data it depends on, and L3 falls to L4. The independence the math assumed doesn't exist.
+3. **Fallback rot.** The fallback model hasn't been retrained in 14 months, the rules config references merchant codes that no longer exist, and the fallback cache is empty because nothing ever fills it. **Paths that rarely run break silently.**
+   - Fixes: score **1% of healthy traffic with the fallback in shadow**, which continuously measures its quality and keeps it warm. Run **game days** (deliberately break dependencies and watch the ladder).
+4. **Degraded mode that never ends.** A breaker gets stuck open, and the service runs at L1 for three days without anyone noticing. Fix: make **degraded rate an SLI** with an alert.
+5. **Retry storms instead of falling back.** Without breakers, a slow dependency receives more calls, not fewer (2.2).
+6. **Fallback overloaded.** The rules service was sized for 1% of traffic, and now receives 100%.
+7. **Training contamination.** Decisions made in degraded mode produce outcomes and labels that get mixed with normal data. Log the `degraded` level so training and evaluation can separate or reweight them.
+8. **Attacker-induced degradation.** See principle 3.
+
+### Connections
+
+- **1.2:** this part completes the contract. The fallback policy and availability math from there are implemented here.
+- **1.3:** feature-group dropout is training for missing data on purpose.
+- **2.1:** batch scores are the natural fallback features.
+- **2.4:** the cascade's stage-2 timeout is the step from L0 to L1.
+- **3.1:** deadlines, and readiness checks, stop traffic from reaching instances that aren't ready.
+- **3.2:** the feature store is the biggest single point of failure; L3 exists because of it.
+- **3.4:** stale-on-error, and a cache as part of the fallback.
+- **Branch 5:** breakers, hedging and bulkheads in depth.
+- **Branch 6:** rollback is the fallback for a bad *release*.
+- **Branch 9:** degraded-rate SLIs, game days, runbooks.
+- **Branch 10:** attacker-induced degradation.
+
+<Callout title="Exercise 3.5 (incident walk-through)">
+
+It's **Black Friday, 14:00**. The **Redis cluster** that hosts both the **online feature store** and the **L2 cache** fails completely. Traffic is at a 12k TPS peak.
+
+1. Walk through what the PayFlow fraud service does, level by level. At which level does it actually end up, and **why not the one the design intended**? Name the flaw and the fix.
+2. Offers runs on the same Redis cluster. What should Offers serve right now, and why should it degrade **before** fraud does on shared infrastructure?
+
+</Callout>

@@ -1,0 +1,68 @@
+---
+title: Deployment
+description: Serve predictions reliably within latency, cost and scale limits, and release safely.
+icon: Rocket
+---
+
+Deployment answers three questions: **where and when** the model runs (prediction mode, cloud vs edge), **how fast** it runs (latency optimization, scaling), and **how to release it safely** (rollout, packaging and CI/CD).
+
+<Diagram src="deployment/deployment-subtopics.svg" />
+
+## Prediction mode comes first
+
+| Mode | How it works | Use when | Example |
+|---|---|---|---|
+| Batch | Precompute predictions on a schedule and store them | Inputs are known ahead and results can be hours old | Nightly email recommendations |
+| Online | Compute a prediction per request | Inputs are new at request time and you need a fast response | Search ranking, fraud check at payment |
+| Streaming | Features from an event stream plus online inference | The last few seconds of behavior matter | Feed ranking after each click |
+
+Many real systems are hybrids: batch-generate candidates, then re-rank online.
+
+## Online serving request path
+
+```
+                ┌────────────────┐        ┌───────────────┐
+ Client ──────► │ Prediction API │ ─────► │ Model server  │
+        ◄────── │ joins features │ ◄───── │ runs inference│
+                └───────▲────────┘        └───────▲───────┘
+                        │                         │
+                ┌───────┴────────┐        ┌───────┴───────┐
+                │ Feature store  │        │ Model registry│
+                │ precomputed    │        │ versioned     │
+                └────────────────┘        └───────────────┘
+```
+
+## Rollout ladder
+
+```
+shadow ──► canary ──► A/B test ──► full rollout
+(no user    (1–5%     (50/50,       (100%, old model
+ impact)     traffic)  measure)      kept for rollback)
+```
+
+## Running example: PayFlow fraud detection
+
+When someone taps their card, the payment network allows about 300 ms end to end. The fraud check gets **50 ms of that (p99)** and returns approve, decline, or step-up (SMS code).
+
+- **Model:** gradient-boosted trees, trained on 2 years of transactions.
+- **Labels:** chargebacks, arriving 30–90 days later.
+- **Features:** amount, merchant category, 90-day average spend, transactions in the last 10 minutes, distance from last transaction, device fingerprint.
+- **Volume:** 5,000 transactions per second at peak.
+
+## Topic map
+
+<Cards>
+  <Card title="1. Foundations" href="/courses/ml-system-design/deployment/foundations">What deployment is · Deployable unit · Serving contract · Training–serving skew</Card>
+  <Card title="2. Prediction mode" href="/courses/ml-system-design/deployment/prediction-mode">Batch · Online · Streaming · Hybrid</Card>
+  <Card title="3. Serving architecture" href="/courses/ml-system-design/deployment/serving-architecture">Model server · Feature retrieval · Retrieve then rank · Caching · Fallbacks</Card>
+  <Card title="4. Latency and cost" href="/courses/ml-system-design/deployment/latency-and-cost">Budgets · Quantize, distill · Hardware · Batching · LLM serving</Card>
+  <Card title="5. Scaling and reliability" href="/courses/ml-system-design/deployment/scaling-and-reliability">Autoscaling · Sharding · Timeouts and breakers · Failover</Card>
+  <Card title="6. Release and rollout" href="/courses/ml-system-design/deployment/release-and-rollout">Shadow · Canary · A/B · Blue-green · Guardrails</Card>
+  <Card title="7. Packaging and MLOps" href="/courses/ml-system-design/deployment/packaging-and-mlops">Registry · Containers · CI/CD · Validation gates</Card>
+  <Card title="8. Cloud vs edge" href="/courses/ml-system-design/deployment/cloud-vs-edge">On-device constraints · Hybrid split · Shipping updates</Card>
+  <Card title="9. Operating in production" href="/courses/ml-system-design/deployment/operating-in-production">Observability · Prediction logging · Handoff to monitoring · Runbooks</Card>
+</Cards>
+
+<Callout title="Interview tip">
+  The mistake that loses the most points is skipping the batch vs online decision. State it first, and justify it with latency and freshness requirements.
+</Callout>

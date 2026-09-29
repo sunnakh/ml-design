@@ -1,0 +1,357 @@
+---
+title: 2. Prediction mode
+description: When the prediction is computed, relative to when it's needed.
+---
+
+Three facts decide it: **are the inputs known in advance** (can you list every entity before anyone asks)? **How fresh must the prediction be?** **What's the request-time latency budget?**
+
+```
+                       output can be hours old       output must reflect "now"
+                     ┌────────────────────────────┬───────────────────────────────┐
+ inputs known        │  BATCH                     │  BATCH + online adjust        │
+ in advance          │  nightly recs email,       │  or ONLINE with               │
+ (enumerable)        │  churn scores              │  STREAMING features           │
+                     ├────────────────────────────┼───────────────────────────────┤
+ inputs only known   │  (rare: async queue,       │  ONLINE                       │
+ at request time     │   e.g. document review)    │  fraud check, search ranking  │
+                     └────────────────────────────┴───────────────────────────────┘
+```
+
+**Streaming is about how fresh the *features* are. Batch vs online is about *when inference runs*.** Separate choices; mixing them up is a common interview mistake.
+
+## 2.1 Batch (precompute)
+
+### The problem it solves
+
+Online inference is expensive and fragile. **If you can predict ahead of time, serving becomes a database lookup**: ~2ms p99, no model server in the request path, familiar failure modes.
+
+### How it works
+
+```
+ scheduler (e.g. 02:00 daily)
+      │
+      ▼
+ ┌──────────────┐   ┌──────────────┐   ┌──────────────┐   ┌───────────────┐
+ │ snapshot     │──►│ score ALL    │──►│ validate     │──►│ publish       │
+ │ features as  │   │ entities     │   │ outputs      │   │ versioned     │
+ │ of cutoff    │   │ (Spark, big  │   │ (row count,  │   │ table, then   │
+ │              │   │  batches)    │   │  distribution│   │ atomic swap   │
+ └──────────────┘   └──────────────┘   └──────┬───────┘   └───────┬───────┘
+                                              │ fail                │
+                                              ▼                     ▼
+                                     abort, keep old      KV store: key → score
+                                     version, alert       (Redis / DynamoDB)
+                                                                    │
+                                        request ──► lookup(card_id) ◄┘
+                                                    missing? → explicit default
+```
+
+Scoring maximizes **throughput**, can use cheap spot machines, and only has to finish before the next run.
+
+### PayFlow: where batch fits, and where it can't
+
+**Batch can't make the per-transaction decision**: a transaction doesn't exist until the card is tapped. But PayFlow uses batch for `card_risk_prior` (nightly, all 50M cards), `merchant_risk_score` (nightly, 2M merchants), and the morning analyst review queue (top 1,000 riskiest merchants).
+
+The first two play **two roles**: **input features for the online model** and the **degraded-mode fallback** from 1.2. This is batch's most common real role: **precomputed scores that feed the online model, not replace it.**
+
+### Cost from first principles
+
+**Batch cost ∝ entities × run frequency; online cost ∝ requests.** 50M cards × 0.2ms ≈ 2.8 CPU-hours/night, but only ~15% of cards transact daily, so **85% is wasted**. For large models over huge entity sets, **score only active entities**.
+
+### Assumptions
+
+- The entity set is **enumerable** and manageable.
+- Predictions **stay valid until the next run**.
+- **New entities** can be handled by a default.
+- The job **finishes well within its interval**.
+
+### Design choices
+
+| Choice | Options | Trade-off |
+|---|---|---|
+| Frequency | Nightly / hourly / 15 min | Freshness vs cost |
+| Scope | All / active only | Coverage vs wasted compute |
+| Store | KV (lookup) / warehouse (analytics) | Latency vs query flexibility; often both |
+| Publish | Overwrite / **versioned table + atomic swap** | Always swap: rollback, no half-written reads |
+| Missing key | Silent default / **explicit, flagged default** | See cold start below |
+
+### Failure modes
+
+1. **Silent staleness.** The job fails and the KV store serves last week's scores; every lookup succeeds. Stamp versions with `computed_at` and alert past the freshness SLO.
+2. **Partial write** mixing v6 and v7 scores. Versioned table + atomic swap.
+3. **Huge blast radius.** A bug outputs 0.0 for all 50M entities at once. Gate publishing: row count ±5%, mean score in band, null rate < 0.1%; otherwise abort and keep the old version.
+4. **Cold start exploited.** A "low risk" default for new cards invites fraudsters (who favor new cards). Default to an explicit **"unknown"**.
+5. **Runtime creep** until runs overlap. Monitor job duration.
+6. **Events between runs are missed.** A card reported stolen at 10:00 still scores low from 02:00. **The core limitation of batch**, and why PayFlow needs online and streaming.
+
+### Connections
+
+- **1.2:** freshness SLOs cap batch score age. **1.3:** as an online feature, training must use the value **from the previous nightly run** as of transaction time. **Branch 3:** batch scores are the natural fallback. **Branch 6:** shadow tables before swapping. **Branch 7:** orchestration. **Branch 9:** job success, duration, freshness.
+
+<Callout title="Exercise 2.1">
+  `card_risk_prior` becomes (a) an online model feature and (b) the degraded-mode fallback. A card **issued this morning** has no score: what should the online path receive, and why is 0.0 bad in both roles? The nightly job finishes at **03:30**; a training row has a transaction at **01:00 on March 5**. Which value belongs in that row, and what goes wrong with the one computed on March 5?
+</Callout>
+
+## 2.2 Online (request time)
+
+### The problem it solves
+
+Batch fails when **the input doesn't exist in advance** or **the input space is too big to enumerate** (every query × every user). Online prediction computes **per request, synchronously, within the budget**, at the price of a live system with many dependencies.
+
+### PayFlow's request path
+
+```
+ card tap ─► payment gateway
+                  │  request (from 1.2 contract)
+                  ▼
+        ┌────────────────────┐
+        │ fraud service      │ 1ms   validate input
+        │                    │
+        │  parallel fetch ───┼──► KV store: card_risk_prior, merchant_risk   (batch, 2.1)   ~3ms
+        │  (timeout 15ms)  ──┼──► online store: txn_count_10min, last_geo    (streaming, 2.3) ~4ms
+        │                  ──┼──► compute inline: amount_zscore, distance_km (from request)  <1ms
+        │                    │
+        │  assemble vector   │
+        │  model.predict() ──┼──► in-process GBDT                                         ~2ms
+        │  threshold + rules │ 1ms
+        └─────────┬──────────┘
+                  │ response: decision, score, model_version, degraded
+                  ▼
+             async log ──► queue ──► warehouse   (off the request path, never blocks)
+```
+
+| Kind | Source | Freshness | PayFlow example |
+|---|---|---|---|
+| Request | The payload | Exact | amount, merchant_id |
+| Derived inline | Request plus a lookup | Exact | distance_km from last location |
+| Precomputed | Batch job, KV store | Hours | card_risk_prior |
+| Real-time aggregates | Streaming pipeline, online store | Seconds | txn_count_10min |
+
+### Design choices
+
+**1. Where does the model run?**
+
+| Option | Latency | Trade-off | PayFlow |
+|---|---|---|---|
+| **In-process** | Lowest | Deploys with the service; must fit its language and memory | GBDT (~2ms, 200MB) |
+| **Separate model server** (Triton, TorchServe, KServe) | +1–3ms per hop | Independent scaling, shared GPUs, many models; one more dependency | Transformer on a GPU server |
+
+**2. Sync or async?** The payment decision is synchronous, but a heavier model can run **asynchronously after approval** and block the card *for future transactions*. Deep model without spending the sync budget, at the cost of **one fraudulent transaction getting through** (see 2.4).
+
+**3. Capacity from first principles (Little's law):**
+
+```
+concurrent requests in flight  =  throughput  ×  average time in system
+```
+
+15k TPS × 15ms = **225 requests in flight**. Divide by safe concurrency per instance, then add redundancy.
+
+**4. Target utilization.** Waiting grows like **ρ / (1 − ρ)**: 1× at 50%, 4× at 80%, 19× at 95%. **Latency-critical services run at ~40–60% utilization**, paying for idle machines on purpose.
+
+### Assumptions
+
+- Every dependency meets its own p99 SLO.
+- The request carries enough to build or look up features.
+- Inference fits its budget slice.
+- Traffic is forecastable; autoscaling alone is too slow for sudden bursts.
+
+### Batch vs online
+
+| | Batch | Online |
+|---|---|---|
+| Freshness | Hours | Request time |
+| Cost scales with | Entities × frequency | Requests |
+| Serving latency | ~2ms lookup | Tens of ms, budget-bound |
+| Failure surface | One job | Every request × every dependency |
+| Bug blast radius | All entities at once | Requests hitting the bug |
+| Reproducibility | Easy (stored table) | **Only if you log the feature vector** |
+
+### Failure modes
+
+1. **Dependency tail latency** triggers the 15ms timeout and degraded mode; fine only if the fallback was designed.
+2. **Cold starts.** New instances take ~60s to load and warm. Readiness must wait for load *and* warmup; scale ahead of known peaks.
+3. **Queueing collapse** with retries. Headroom, **load shedding** (reject early and fast), retry budgets.
+4. **Non-reproducible decisions** without the logged feature vector.
+5. **Synchronous ML chains:** latencies add, availabilities multiply.
+6. **Memory pressure during rollouts:** two versions loaded doubles memory; OOM kills mid-rollout.
+
+### Connections
+
+- **1.2:** budget and fallback govern every box. **1.3:** each feature kind is a skew source; inline-derived features are most exposed. **2.1:** batch supplies features and fallback. **2.3:** keeping `txn_count_10min` fresh. **Branches 3–5:** deeper on each piece.
+
+<Callout title="Exercise 2.2">
+  The fraud service handles a **15k TPS peak**, **15ms average** and **38ms p99** latency. Each instance safely handles **40 concurrent requests**. Instances span **3 availability zones** and must **survive losing one zone at peak**. How many instances do you need (show steps)? Little's law uses average latency, not p99: why, and where does p99 matter instead?
+</Callout>
+
+## 2.3 Streaming features
+
+### The problem it solves
+
+Some fraud signals matter **within seconds**. **Card testing**: 20 transactions of $1 within two minutes to see which cards work. Scanning each card's history per request (5,000/s inside a 15ms fetch budget) is too slow. **Streaming maintains aggregates incrementally**, so request time only needs a key lookup. Inference is still online.
+
+### How it works
+
+```
+ every authorization event
+          │
+          ▼
+ ┌─────────────────┐     ┌──────────────────────────┐     ┌───────────────────┐
+ │ event log       │────►│ stream processor         │────►│ online store      │──► fraud service
+ │ (Kafka)         │     │ (Flink / Spark Streaming)│     │ (Redis) key=card  │    reads at request
+ │ partitioned by  │     │ keyed windowed aggregates│     │ value + updated_at│
+ │ card_id         │     │ state + checkpoints      │     └───────────────────┘
+ └─────────────────┘     └────────────┬─────────────┘
+                                      │ same definitions
+                                      ▼
+                          offline store (for training, 1.3)
+
+ freshness lag = log ingest + processing + store write   → SLO: p99 < 5s (from 1.2)
+```
+
+### Core concepts
+
+**1. Event time vs processing time.** Events arrive late and out of order, so windows use event time. **Watermarks** declare "probably seen everything up to T"; later events are dropped or update the window.
+
+**2. Window types.**
+
+| Window | Shape | Use |
+|---|---|---|
+| Tumbling | Fixed, non-overlapping | Cheap counts per period |
+| Hopping (sliding) | "Last 10 min, updated every 1 min" = 10 buckets | Velocity; error up to one bucket |
+| Session | Grows with activity, closes after a gap | Bursts, sessions |
+
+Buckets trade **precision for memory**.
+
+**3. Delivery semantics.** **At-least-once** replays after failure and double-counts; **exactly-once** (checkpoints + transactional writes) adds latency and complexity. The same idempotency problem as `request_id` in 1.2.
+
+### The hard part: lag vs the attack
+
+Lag is ~2s p50, 5s p99, fine for 24h aggregates, but **card testing is faster than the lag**: ten transactions in 3 seconds all read a counter that hasn't caught up. PayFlow splits features by speed:
+
+| Feature | Where | Why |
+|---|---|---|
+| `txn_count_1min`, `txn_count_10min` | **Request path**: atomic Redis `INCR` on time buckets, dedup by `request_id`, TTL | Must include *this* transaction; one extra write per request |
+| `distinct_merchants_24h`, `amount_sum_1h` | **Flink** | Seconds of lag don't matter over hours |
+| `card_risk_prior` | **Batch** | Long-term behavior |
+
+**Match the freshness mechanism to how fast the signal changes.**
+
+### Training on streaming features
+
+Training must see **what the online store actually held, lag included**. **Log-and-wait** (no skew, weeks of delay for new features), or **backfill by replaying events through the same streaming code** (Kappa, one codebase). Lambda (separate batch code) is code skew.
+
+### Assumptions
+
+- A **durable, per-key ordered log** for replay.
+- Lag is **bounded and monitored**.
+- **State fits** (50M cards × ~20 aggregates × buckets).
+- **Keys are spread evenly** (giant merchants are hot keys).
+
+### Trade-offs
+
+- **Freshness vs operational cost:** streaming is usually the most expensive part of an ML platform to operate.
+- **Exact vs approximate windows.**
+- **At-least-once vs exactly-once.**
+- **Request-path counters vs async streaming:** freshness vs latency and a write dependency.
+
+### Failure modes
+
+1. **Consumer lag under load** on Black Friday; features go stale **silently**. Store `updated_at`; treat values older than a threshold as **missing**.
+2. **Double counting after restart** inflates velocity and declines legitimate customers.
+3. **Late events dropped** by the watermark.
+4. **State loss:** redeploy without checkpoint resets all counters to 0 ("no recent activity") for all 50M cards.
+5. **Hot keys** saturate one partition.
+6. **Missing TTLs:** unbounded memory, random evictions.
+7. **Lambda skew.**
+
+### Connections
+
+- **1.2:** freshness SLO sets the lag budget; idempotency extends into the pipeline. **1.3:** reproduce served values, lag included. **2.1:** stale streaming degrades toward batch. **2.2:** the online store is one parallel fetch. **Branch 3:** feature stores unify definitions. **Branches 5, 9:** lag, checkpoints, state size.
+
+<Callout title="Exercise 2.3">
+  A fraudster fires **12 transactions of $1** at one card within **4 seconds**. `txn_count_1min` is computed **only in Flink**, with lag **2s p50, 6s p99**. Roughly what does the model see for transactions #1, #6 and #12, and why does that defeat the feature? Later Flink restarts from a checkpoint **30 seconds old** with **at-least-once** delivery: what happens to `txn_count_1min` for cards active in those 30 seconds, and what does the model do to legitimate customers?
+</Callout>
+
+## 2.4 Hybrid and multi-stage
+
+### The problem it solves
+
+Pure modes collide: the **best model is too slow** (transformer 35ms vs a 10ms slice), there are **too many candidates** to score expensively, and **parts of the answer change slowly**. Hybrid designs **run each piece of work in the cheapest mode that meets its freshness and latency needs.**
+
+### The five core patterns
+
+**1. Precompute, then adjust online.** `card_risk_prior` in batch, adjusted with request and streaming features.
+
+**2. Cascade (tiered models).** A cheap model scores everything; only uncertain cases go to the expensive one:
+
+```
+                          ┌───────────────── score < 0.3 (93%) ──────────► approve
+ every txn ─► GBDT (2ms) ─┤
+                          ├───────────────── score > 0.9 (2%) ───────────► decline
+                          │
+                          └─ 0.3 – 0.9 (5%) ─► GPU transformer (timeout 20ms) ─► decide
+                                                    │ timeout / overload
+                                                    └──► fall back to GBDT decision
+```
+
+The expensive model runs on the ~5% where it can change the decision (~20× less GPU cost). Latency becomes bimodal but stays within budget thanks to the timeout. One valid answer to Exercise 1.2 (distillation in branch 4 is another).
+
+**3. Async post-decision scoring.** Decide fast, run the deep model asynchronously, act on *future* events. Cost: the **first** fraud gets through. Benefit: unlimited latency for the deep model.
+
+**4. Multi-stage funnel (retrieve → rank → re-rank):**
+
+```
+ millions of items
+       │  retrieval: cheap, recall-oriented (ANN over embeddings, rules, popularity)
+       ▼
+ ~1,000 candidates
+       │  ranking: heavy model, rich features, precision-oriented
+       ▼
+ ~100 scored
+       │  re-ranking: business rules, diversity, dedupe, policy filters
+       ▼
+ top 10 shown
+```
+
+PayFlow runs the same funnel **in batch** for its review queue: 2M merchants → 20k → ranked → top 1,000 by analyst capacity.
+
+**5. Precomputed embeddings (two-tower).** Item embeddings in batch, indexed; user or query embeddings online; dot product or nearest-neighbor lookup.
+
+### Early stages set the recall ceiling
+
+> **An item a stage drops can't be recovered by any later stage.**
+
+Early stages optimize **recall**; late stages optimize **precision**. **System recall ≤ first-stage recall.**
+
+### Design choices
+
+| Choice | Trade-off |
+|---|---|
+| Routing band width (0.3–0.9) | Wider: more fraud reaches stage 2, more GPU cost and latency |
+| Stage-2 timeout | Fall back to stage 1 (safe) vs wait (breaks SLO) |
+| Overflow policy | Drop to stage 1, prioritize by amount, or scale up |
+| Stage-2 training data | All data vs **routed slice**; *evaluate* on the routed slice |
+| Candidates per stage | Recall vs cost |
+
+### Assumptions
+
+- Stage-1 scores are **calibrated and stable**, so routing share is predictable.
+- **Important errors fall inside the band**; confident stage-1 mistakes aren't fixable.
+- Stage 2 has **peak capacity** for its share.
+- For async: acting on future events is worth the first loss.
+
+### Failure modes
+
+1. **Invisible recall ceiling.** Stage 2 looks great on its slice; fraud stage 1 dismissed never appears. Measure **end-to-end recall**.
+2. **Coupled retraining causes a capacity incident.** A new GBDT routes 15% instead of 5%, GPUs saturate, everything falls back. **A model change caused an outage.**
+3. **Selection skew:** stage 2 trained on all traffic, deployed on the ambiguous slice.
+4. **The async gap gets exploited:** fraudsters burst within the ~30s before the block.
+5. **Debugging opacity.** Log the **deciding stage and every model version**.
+
+### Connections
+
+- **1.2:** cascade timeout + fallback *is* degraded mode. **1.3:** routed training data is selection skew. **Branch 4:** distillation and quantization make big models fast instead. **Branch 5:** stage-2 capacity. **Branch 6:** roll out **one stage at a time**, routing rate as a guardrail. **Branch 9:** end-to-end recall, per-stage logging.
+
+<Callout title="Exercise 2.4">
+  At **15k TPS peak**, GBDT scores are < 0.3 for **93%**, 0.3–0.9 for **5%**, > 0.9 for **2%**. The transformer's GPU pool handles **600 TPS** at 20ms p99. Does routed traffic fit at peak? If not, give two fixes with trade-offs. Offline, **20% of all fraud** scores **< 0.3** on the GBDT: what's the maximum share of fraud the transformer can ever affect, and how would you raise that ceiling?
+</Callout>

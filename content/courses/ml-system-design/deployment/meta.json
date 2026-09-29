@@ -1,0 +1,5 @@
+{
+  "title": "Deployment",
+  "icon": "Rocket",
+  "pages": ["index", "foundations", "prediction-mode", "serving-architecture", "latency-and-cost", "scaling-and-reliability", "release-and-rollout", "packaging-and-mlops", "cloud-vs-edge", "operating-in-production"]
+}

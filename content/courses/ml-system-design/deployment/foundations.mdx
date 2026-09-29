@@ -1,0 +1,262 @@
+---
+title: 1. Foundations
+description: What deployment is, and what you actually ship.
+---
+
+## 1.1 What deployment is, and the deployable unit
+
+### The problem it solves
+
+A trained model in a notebook works on a **static table, once, while you watch it**. Production needs a function that:
+
+- takes inputs that arrive **one at a time, live**, in raw form,
+- answers **within a time and cost budget**,
+- keeps doing that **reliably, millions of times**, without anyone watching,
+- **drives a decision** with real consequences,
+- and can be **changed safely** later.
+
+Deployment turns "a model that scored well offline" into "a dependable prediction service whose outputs drive decisions."
+
+### The core insight: you deploy a pipeline, not a model
+
+```
+ raw request                                                        decision
+ {card, amount,   ┌──────────┐  ┌───────────┐  ┌─────────┐  ┌──────────────┐  approve /
+  merchant, ts,──►│ validate │─►│ compute   │─►│ model   │─►│ post-process │─► decline /
+  location}       │ input    │  │ features  │  │ score   │  │ threshold +  │   step-up
+                  └──────────┘  └───────────┘  └─────────┘  │ rules        │
+                                                            └──────┬───────┘
+                                                                   ▼
+                                                    log inputs, features, score, decision
+```
+
+The model is one box out of five:
+
+1. **Validate:** is `amount` a number? Cents or dollars? Is the currency present?
+2. **Features:** look up 90-day average spend (precomputed), count transactions in the last 10 minutes (live), compute distance from the last location.
+3. **Model:** returns a score, e.g. 0.83.
+4. **Post-process:** score > 0.90 → decline; 0.60–0.90 → step-up; below 0.60 → approve. Blocklist rules can override. Scores may be calibrated first.
+5. **Log:** record exactly what the model saw and decided. Without this you can't debug, monitor, or build the next training set.
+
+*Hidden Technical Debt in ML Systems* (Sculley et al., 2015) makes the same point: model code is a small fraction of a real ML system.
+
+**The deployable unit is: input schema + feature logic + model weights + post-processing config (thresholds, calibration, rules) + logging.** Version them **together**. Change any one and you've deployed a new system.
+
+### Assumptions deployment silently makes
+
+| Assumption | PayFlow example of it breaking |
+|---|---|
+| Features mean the same thing at serving time as in training | Training used dollars; serving sends cents, so $50 looks like $5,000 |
+| Every feature is available at decision time | Training included `was_refunded`, which only exists *after* the transaction (leakage) |
+| Missing values are handled the same way | Training filled nulls with the median; serving passes 0 when the feature store times out |
+| Score scale means the same thing to the consumer | v2's scores are spread differently, but the threshold is still 0.90 |
+| The world stays roughly stable | Fraudsters adapt within weeks |
+
+### Design choices
+
+**1. Where does the threshold live?** Inside the service (one owner, needs a deploy to change) or in the caller (fast tuning, but split ownership and stale thresholds). **Common choice:** return both `score` and `decision`, with the threshold in a **versioned config** bundled with the model version.
+
+**2. Feature logic bundled or in a shared platform?** Bundled keeps training and serving code identical but isn't reusable. A shared feature store is reusable but offline and online definitions can drift.
+
+**3. Artifact format?** Native (pickle, joblib) is easy but tied to library versions, and loading a pickle can execute arbitrary code, a **security risk** for untrusted files. Portable formats (ONNX, TorchScript) are safer and faster but need conversion and equivalence checks.
+
+### The most important lesson
+
+**Normal software fails loudly. ML fails silently.** Every example above returns **HTTP 200 with a plausible score**. Nothing crashes or pages anyone; fraud gets through, or good customers get declined, and you find out weeks later.
+
+Example chain: feature store times out → `txn_count_10min` comes back null → service defaults it to 0 → the model reads "no recent activity" → a fraudster running 40 cards per minute gets **approved**. The default value created the vulnerability.
+
+Validation, shadow deploys, canaries, logging and monitoring exist largely to catch failures like this.
+
+### Connections
+
+- **Data and features:** serving must compute features exactly as training did, from decision-time information only.
+- **Evaluation:** offline metrics only mean something if the evaluated pipeline is the deployed one.
+- **Monitoring:** can only watch what the logging box records.
+- **Rollout:** threshold and config changes need the same caution as model changes.
+
+<Callout title="Exercise 1.1">
+  PayFlow trains **v2** with a new feature, `merchant_chargeback_rate_30d`, from a **nightly batch job**. Offline AUC improves from 0.91 to 0.95. The team plans to "swap in the new model file" on Friday and keep the 0.90 threshold. What must ship alongside the v2 weights? Name two ways v2 could fail silently, and how you'd prevent or detect each before full traffic. Hint: when is that feature's value actually known?
+</Callout>
+
+## 1.2 Serving contract and SLOs
+
+### The problem it solves
+
+"Make it fast and reliable" isn't buildable. Engineers need **explicit, measurable promises** between the ML service and its callers. Those numbers decide batch vs online, hardware, model size, how many features you can afford, and what happens when things break. Without a contract, each decision gets made by accident.
+
+### The contract has two halves
+
+**Half 1: Interface.**
+
+```
+REQUEST                                  RESPONSE
+{                                        {
+  request_id: "tx_8f3a..."   ← idempotency  decision: "step_up",
+  card_id: "c_123",                        score: 0.74,
+  amount_minor: 5000,        ← units explicit  model_version: "fraud-v7.2",
+  currency: "USD",                         reason_codes: ["VELOCITY","NEW_DEVICE"],
+  merchant_id: "m_77",                     degraded: false        ← fallback used?
+  ts: "2026-09-30T10:02:11Z",            }
+  geo: {lat, lon}
+}
+```
+
+- `amount_minor` + `currency` prevent the dollars-vs-cents bug.
+- `model_version` traces every decision to the exact model.
+- `reason_codes` let analysts and support understand *why*.
+- `degraded` tells the caller the answer came from a fallback.
+- `request_id` makes retries idempotent (see failure modes).
+
+**Half 2: Service levels.** **SLI** is what you measure, **SLO** the target, **SLA** a contractual promise with penalties. The gap between SLO and 100% is the **error budget**.
+
+| SLI | SLO | Why |
+|---|---|---|
+| Latency, end to end | **p99 ≤ 50ms**, p99.9 ≤ 80ms | Payment network deadline |
+| Throughput | 5k TPS sustained, **15k burst** | Size for peak, not average |
+| Availability | 99.99% of requests get *some* valid decision | Payments can't stall |
+| Feature freshness | Velocity < 5s stale; batch < 26h | Stale velocity = missed card testing |
+| Decision-rate band | Decline rate 0.3%–2% per hour | **ML-specific:** catches silent failures |
+| Logging completeness | ≥ 99.9% of decisions logged | Labels and monitoring depend on it |
+
+The last three are the **ML-specific SLOs** ordinary teams forget. A service can meet every latency and uptime target while declining 15% of legitimate customers.
+
+### Why percentiles, not averages
+
+At 5,000 TPS, missing p99 means **50 customers per second** wait too long. Fan-out amplifies the tail: 5 parallel lookups, each slow 1% of the time, give `1 − 0.99⁵ ≈ 4.9%` slow requests. A 1-in-100 problem per dependency becomes 1-in-20 per request.
+
+### Latency budget: splitting 50ms
+
+```
+0ms                                                          50ms
+|net|val|──── feature fetch ────|── model ──|post|── headroom ──|
+ 5    1          15                 10        2        17
+```
+
+Each stage gets a budget and **its own timeout**. Summed p99s are a pessimistic bound (fine for budgeting), but measure end to end. **Keep ~30% headroom** for queueing, GC pauses and cold caches.
+
+### Availability multiplies
+
+Hard dependencies on a feature store (99.9%), model server (99.9%) and config service (99.95%) cap you at `0.999 × 0.999 × 0.9995 ≈ 99.75%`, far below 99.99%. **You can't promise more availability than your dependencies, unless you have fallbacks.**
+
+### The key choice: what happens when you miss the budget?
+
+| Policy | Behavior | Cost |
+|---|---|---|
+| Fail-open | Approve | Fraudsters learn to trigger timeouts |
+| Fail-closed | Decline | Lost revenue across *all* traffic during an outage |
+| **Degrade** | Rules + cached per-card risk scores, `degraded=true` | Lower accuracy, bounded risk |
+| Tiered | Degrade, fail-closed only for high amounts | More complex, usually right |
+
+**A business decision the contract must state.** Otherwise you get whatever a `try/except` defaults to, usually fail-open.
+
+### Assumptions
+
+- The traffic shape is known, including peaks and bursts.
+- Callers respect timeouts and retry policy.
+- Dependencies publish their own SLOs.
+- Quality bands are stable (they shift seasonally, so they need seasonal awareness).
+
+### Trade-offs
+
+- **Latency vs accuracy:** every millisecond for the model is taken from somewhere else.
+- **Availability vs cost:** redundancy, regions and warm fallbacks.
+- **Freshness vs cost:** 5s streaming vs 24h batch.
+- **Strict vs loose interface:** strict validation rejects bad input but breaks callers more often.
+
+### Failure modes
+
+1. **SLO on the average.** Green dashboard, timed-out checkouts.
+2. **Latency measured only at the model.** 8ms inference, 40ms queueing, unnoticed.
+3. **No explicit fallback:** accidental fail-open.
+4. **Retry storms:** slowdown → retries → double load → worse slowdown.
+5. **Retries corrupting stateful features.** A retried purchase increments the velocity counter 2–3 times and the customer looks like card testing. **Idempotency keys**: count each `request_id` once.
+6. **Contract drift.** A caller sends JPY (no minor units). Reject or normalize; never guess.
+
+### Connections
+
+- **Requirements** supply the numbers. **Branch 2** is chosen from latency and freshness SLOs. **Branch 4** meets the latency budget. **Branch 5** meets availability. **Branch 9** monitors every SLI. **1.1:** interface fields prevent its silent failures.
+
+<Callout title="Exercise 1.2">
+  Research built a **sequence model** (small transformer over each card's last 50 transactions) that catches **18% more fraud** at the same false-positive rate, but its **inference p99 is 35ms on GPU** against a 10ms model budget. They propose raising the latency SLO to 80ms. Why is that probably unacceptable (who owns the 50ms)? Design one way to capture most of its value within the 50ms p99 contract: what you change, the trade-off, and the fallback when the new component is slow.
+</Callout>
+
+## 1.3 Training–serving skew
+
+### The problem it solves
+
+There are **two pipelines**: the **offline** one that built training data and the **online** one feeding the live model. **Training–serving skew** is any difference between them. Offline metrics look great, production is worse, nothing errors.
+
+**Skew is not drift. Mixing them up leads to wrong fixes.**
+
+| | Skew | Drift |
+|---|---|---|
+| Cause | *Your pipelines* disagree | *The world* changed |
+| When it shows up | **From day 1** | **Gradually**, over weeks |
+| Retraining fixes it? | **No** | Usually yes |
+| Fix | Make pipelines match | Retrain, adapt, add features |
+
+**Bad from day one → suspect skew. Good at first, then decaying → suspect drift.**
+
+### Where skew enters
+
+```
+OFFLINE (training)                              ONLINE (serving)
+warehouse tables                                live request + stores
+      │                                               │
+      ▼                                               ▼
+ SQL/Spark feature code ◄── ① code skew ──►  Go/Java feature code
+      │                                               │
+ joined "as of when?" ◄──── ② time skew ───►  what is actually available now
+      │                                               │
+ sampled rows ◄───────── ③ selection skew ──►  all live traffic
+      │                                               │
+ py lib v1.7, NaN ◄───── ④ environment skew ─►  lib v2.0, null → 0
+      │                                               │
+      └──────────────►  same model weights  ◄─────────┘
+```
+
+**① Code skew.** `txn_count_10min` in Spark SQL counts `[t−10min, t]`, **including the current transaction**; Go reads the counter **before** adding it. Every value is off by one. Also: time zones, rounding, category-to-ID mapping (especially unseen categories).
+
+**② Time skew.** The most dangerous, because it looks like a *better* model. Training joins `user_avg_spend_90d` from **today's** snapshot onto a March transaction: learning from the future. Subtler: serving refreshes it nightly (**up to 24h stale**), so training on the exact-timestamp value teaches a fresher signal than production ever gets. Fix: **point-in-time-correct joins** on "available at" timestamps. Watch tables overwritten in place.
+
+**③ Selection skew.** **Downsampling** (1:10 fraud in training vs 1:1000 live) inflates scores and breaks thresholds; recalibrate. **Feedback loop:** the old model's declines never produced labels, so the new model only learns from what the old one **let through**. Fix: a small random **exploration holdout** (e.g. 0.5% scored but not blocked below an amount cap), a deliberate business cost, or counterfactual reweighting.
+
+**④ Environment skew.** XGBoost **learns a default direction for NaN**; serving converts null to **0**, which goes down a *different branch*. Also library bumps, float32 vs float64, tokenizer versions.
+
+### Design choices for preventing skew
+
+| Approach | How it works | Trade-off |
+|---|---|---|
+| **Two implementations** | Separate offline and online code | Skew almost guaranteed |
+| **Shared definitions** (feature store) | One definition, batch and online modes | Less code skew; platform cost and lock-in |
+| **Log-and-wait** | Log served feature vectors, train on them | **No skew by construction**; new features need weeks of logs |
+| **Hybrid** | Backfill to experiment, train production on logs, compare overlaps | Fast iteration plus safety; more moving parts |
+
+**Detecting skew:**
+- **Parity tests in CI:** ~10k golden requests through training and serving code; every feature must match within tolerance or the build fails.
+- **Online/offline replay:** recompute logged serving vectors offline by `request_id`; alert on per-feature mismatch above ~0.1%.
+- **Score distribution comparison** for the same requests.
+
+**Make missing values part of the contract:** each feature declares its missing representation (NaN, not 0) and default.
+
+### Assumptions
+
+- You can reconstruct past state (immutable, timestamped event logs).
+- You know each feature's availability delay (ties to 1.2's freshness SLOs).
+- The request log is detailed enough to replay (1.1).
+
+### Failure modes
+
+1. Offline metrics *too good* (AUC 0.99): usually time leakage.
+2. Worse from day 1, retraining doesn't help: code or environment skew.
+3. Blind exactly where the old model covered: selection feedback loop.
+4. Skew checks only at launch: a library upgrade six months later reintroduces skew.
+
+### Connections
+
+- **1.1:** skew = "evaluated pipeline ≠ deployed pipeline". **1.2:** freshness SLOs define serving-time availability. **Branch 2:** batch vs streaming sets availability delay. **Branch 3:** feature stores prevent code skew. **Branch 6:** shadow mode catches skew before users. **Monitoring:** tell skew (step change) from drift (slope).
+
+<Callout title="Exercise 1.3">
+  Model v3 runs in **shadow mode** for a week. Offline replay: mean score 0.12, would-decline rate 0.8%. Online shadow: mean score **0.21**, would-decline **2.6%**. Per-feature mismatch: `txn_count_10min` **31%**, online usually **exactly +1**; `user_avg_spend_90d` **4%**, almost all on cards active **in the last 24h**; `merchant_category` **0.5%**. Name the likely skew type and root cause for each. Which drives the score jump, and why (what does +1 on a velocity feature mean)? The team says "wait 60 days for chargebacks and measure real AUC": what's wrong with that?
+</Callout>
