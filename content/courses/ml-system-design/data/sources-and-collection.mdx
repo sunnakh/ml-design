@@ -1,0 +1,474 @@
+---
+title: 1. Sources & collection
+description: Where data comes from and how to judge a source.
+---
+
+## 1.1 Source types, and how to judge a source
+
+### The first principle
+
+A model is a function learned from examples `(x, y)`. It knows only what the examples show it. That gives one rule every later topic builds on:
+
+> **Training data must look like what the model will see at the moment it predicts.**
+
+For any data source, ask three questions:
+
+1. **Signal:** does it carry information about the label?
+2. **Availability:** can I get it *at prediction time*, and can I get its *historical* values for training?
+3. **Trust:** is it correct, fresh, stable, and owned by someone?
+
+Most beginners ask only the first question. Real systems break on the second and third.
+
+### The five source families
+
+Every source feeds two places: the **training set** (its history) and **live scoring** (its current value). A source is only useful if you can get it in both. The coral boxes are the families where that most often fails.
+
+<Diagram src="data/sources-to-training-and-serving.svg" />
+
+#### 1. Event logs (behavioral data)
+
+- **Gives you:** what the user is doing right now: logins, device fingerprint, IP address, time on the checkout page, failed card attempts.
+- **How it works:** apps emit events into an append-only stream (e.g. Kafka), archived to a data lake. Events are **immutable**.
+- **Assumption:** the logging code in the app is correct and complete.
+- **Trade-off:** strong signal and naturally historical, but high volume, noisy, and dependent on instrumentation.
+- **Failure modes:** events dropped on the client, duplicates from retries, wrong client clocks, bot traffic, a renamed field that silently becomes null.
+
+#### 2. Operational databases (OLTP)
+
+- **Gives you:** the current state of entities: account age, card on file, merchant category, KYC status.
+- **How it works:** rows are **updated in place**, so old values are overwritten.
+- **Key hazard:** the database stores *now*, not *then*. If an account is marked `status = frozen` *because* it committed fraud, joining today's table onto last year's transactions reveals the label. That's **leakage**.
+- **Design choices:** take periodic snapshots or capture every change with CDC so you can rebuild values as of any past time. Never run training queries against the production database.
+- **Trade-off:** clean and authoritative, but you lose history unless you deliberately store it.
+
+#### 3. Third-party data
+
+- **Gives you:** IP reputation, card BIN issuer and country, device-intelligence scores, email age.
+- **Assumptions:** the vendor is up, fast, stable, and *legally usable for training*.
+- **Trade-offs:** strong signal, but costs money per call and part of your 100 ms budget.
+- **Failure modes:** the vendor retrains and your feature's meaning shifts; outages turn features null; the contract forbids training use; **the API returns only current values, so there's no history to train on.**
+- **Mitigation:** log the vendor response at prediction time. From then on you build your own history.
+
+#### 4. Human feedback
+
+- **Gives you:** the labels: chargebacks, analyst decisions, customer disputes.
+- It arrives **late** (30 to 90 days), it's noisy, and it's biased by what humans chose to look at. See branch 4.
+
+#### 5. System outputs
+
+- **Gives you:** rule-engine flags, previous model scores, block decisions. Strong, cheap features.
+- **Danger:** feedback loops (a blocked transaction never gets a chargeback label, so the new model learns only from what the old system allowed) and coupling (changing the old model silently changes the new one).
+
+### Summary: judging each source
+
+| Source | Signal | Historical values for training? | Available within 100 ms? | Main failure |
+|---|---|---|---|---|
+| Event logs | High | Yes (immutable) | Yes, via stream | Instrumentation bugs, drops |
+| Operational DB | Medium–high | **Only if snapshotted or CDC'd** | Yes, via cache/replica | Leakage from overwritten state |
+| Third-party | High | **Often no** | Costs latency and money | Vendor drift, outages, licensing |
+| Human feedback | It's the label | Yes, but late | No (it's the outcome) | Delay, noise, bias |
+| System outputs | High | Yes, if logged | Yes | Feedback loops, coupling |
+
+### Connections
+
+- **Features:** every feature is a function of these sources. The feature store computes each feature the same way for training and serving.
+- **Deployment:** serve-time availability and latency limit which sources you can use.
+- **Monitoring:** a source outage or schema change shows up as sudden feature drift. Monitor *sources*, not just model outputs.
+
+<Callout title="One habit to take from this part">
+  For every candidate feature, ask: **"What value would this have had at 14:03:07 on the day of the transaction, and can I recover exactly that value today?"**
+</Callout>
+
+<Callout title="Exercise 1.1">
+  PayFlow wants to add two features and train on 12 months of transactions. **A.** `merchant_chargeback_count`, read from the `merchants` table, overwritten nightly with total chargebacks to date. **B.** `ip_risk_score`, from a vendor API that returns the *current* score and keeps no history. For each: what goes wrong with a naive training set, and how would you fix it, including going forward? Bonus: why is B still worth adding?
+</Callout>
+
+<details>
+<summary>Answer key 1.1</summary>
+
+- **A. `merchant_chargeback_count`:** the column holds today's total. For a transaction from last March, it includes chargebacks filed *after* March, possibly the chargeback on that very transaction. That's leakage. **Fix:** rebuild the count as of each transaction's timestamp from the chargeback event log (a point-in-time join using the date each chargeback *arrived*). Going forward, store the history.
+- **B. `ip_risk_score`:** no history, so you can't backfill. Scoring last year's IPs with today's scores is wrong and leaky. **Fix:** log the vendor response at every prediction starting now, and train on it once history builds up. **Bonus:** the signal is strong, and logging it builds exact point-in-time history for free. Every day you wait is history you never get.
+
+</details>
+
+## 1.2 Data types
+
+### The first principle
+
+A model only consumes **numbers**. Every data type raises the same question:
+
+> **How do I turn this into numbers without losing the signal, leaking the label, or blowing the latency budget?**
+
+The data type decides storage, processing, labeling cost, model choice and serving cost. One PayFlow transaction contains six types at once:
+
+```
+Transaction #88213 at 14:03:07
+├── Numerical     amount=249.99, account_age_days=3
+├── Categorical   country=BR, merchant_id=m_71233, card_bin=424242
+├── Text          email="jk.3381x@mailbox.xyz", merchant descriptor
+├── Sequence      this user's last 50 events (timing + order)
+├── Graph         device d-91 also used by 11 other accounts
+└── Image         ID selfie from onboarding (separate model)
+```
+
+### 1. Numerical
+
+- **Examples:** amount, account age, number of items.
+- **How it works:** trees don't care about scale; linear models and neural nets need standardizing or a log.
+- **Failure modes:** **mixed units** (100 USD and 100 JPY as the same value; normalize currency before storage), **heavy tails** ($1 to $50k; log or bucket), **sentinel values** (`-1` or `999` meaning "missing", learned as real values).
+
+### 2. Categorical
+
+Most of the difficulty in fraud data lives here. Low cardinality (country, card type): one-hot works. **High cardinality** (`merchant_id` with 2M values, BIN, IP, device ID), with **new values every day**:
+
+| Encoding | How it works | Trade-off / failure |
+|---|---|---|
+| One-hot | One column per value | Millions of sparse columns; can't handle unseen values |
+| Hashing trick | `hash(id) % N` buckets | Fixed size, handles unseen values; unrelated IDs collide |
+| Target encoding | Replace the ID with its historical fraud rate | Strong, **but leaky** unless computed only from data before the transaction; noisy for rare IDs, so smooth toward the global rate |
+| Embeddings | Learned vector per ID | Captures similarity; needs lots of data per ID; cold start for new IDs |
+
+Always reserve an explicit `UNKNOWN` value. New merchants show up in production every day.
+
+### 3. Text
+
+- **Examples:** email, merchant descriptor, shipping address, product names.
+- **How it works:** usually turned into **structured signals**: fraction of digits in the email, disposable domain, name matches email, billing matches shipping. Pretrained embeddings are the richer option.
+- **Trade-off:** a large embedding model inside a 100 ms request is expensive. Compute per *entity*, cache, look up at request time.
+- **Failure modes:** PII (branch 8), deliberate obfuscation (`g.m.a.i.l`, Unicode lookalikes), multiple languages.
+
+### 4. Sequences and time series
+
+- **Examples:** a user's event history. The signal is **order and timing**: "five small purchases in 2 minutes, then one large one" is classic card testing.
+- **Representations:** **window aggregates** (`tx_count_1h`, `amount_sum_24h`, `distinct_merchants_7d`): cheap, understandable, the industry default. **Sequence models** (RNN or transformer over the last N events): subtler patterns, costlier to train, serve and debug.
+- **Failure modes:** a window that includes the current or later events (leakage); late events missing at serve time but present in training (skew).
+
+### 5. Graph
+
+This data type does something no other can:
+
+<Diagram src="data/fraud-ring-device-graph.svg" />
+
+- **What it solves:** organized fraud. Each ring account looks clean *alone*; the *connections* give it away (one device shared by 12 accounts, one card across 4).
+- **How it works:** nodes are entities (accounts, devices, cards, IPs, addresses); edges mean "used together". Features from cheap to expensive: degree, connected component size, known-fraud neighbors, graph neural networks.
+- **Trade-off:** strongest signal against rings, most expensive to serve. **Standard pattern:** compute graph features offline or incrementally, store per entity, only look them up during the request.
+- **Failure modes:** **supernodes** (corporate IP, public Wi-Fi, carrier IPs connecting thousands of innocent users; cap or exclude); **label leakage through neighbors** (count only fraud labels *known* at the transaction's time); unbounded growth (expire old edges).
+
+### 6. Images and audio
+
+- **Example:** at onboarding (KYC), an ID photo is checked against a selfie.
+- **How it works:** a *separate model* at a *different moment*; its **score** becomes a fraud-model feature.
+- **Trade-offs:** GPU cost, storage, expensive labeling, sensitive biometric PII.
+- **Pattern:** heavy data types enter a latency-critical model as **precomputed scores or embeddings**, never raw.
+
+### Summary
+
+| Type | PayFlow example | Typical representation | Serve-time cost | Main failure |
+|---|---|---|---|---|
+| Numerical | amount | raw / log / bucket | tiny | units, sentinels, tails |
+| Categorical (high-card) | merchant_id | hash / target encoding / embedding | small (lookup) | unseen values, target-encoding leakage |
+| Text | email | derived flags, cached embedding | medium | PII, obfuscation |
+| Sequence | recent tx history | window aggregates / sequence model | medium (streaming state) | window leakage, late events |
+| Graph | shared device | precomputed degree / component / GNN | high unless precomputed | supernodes, neighbor-label leakage |
+| Image | KYC selfie | separate model → score | high (offline) | biometric PII, GPU cost |
+
+Most production fraud models are **gradient-boosted trees over tabular features**; richer types arrive as *features derived upstream*. Complex processing happens off the request path; the request path only looks things up.
+
+### Connections
+
+- **Features:** encodings, windows and graph features live in the feature store. **Ingestion:** sequence and graph features need streaming state. **Modeling:** data types decide the model family. **Privacy:** text and images carry the most PII.
+
+<Callout title="Exercise 1.2">
+  `merchant_id` has **2 million values**, with ~**3,000 new merchants** a day. (1) A teammate proposes target encoding (merchant fraud rate). Name two problems and fixes. (2) A brand-new merchant processes 400 transactions on day one: what's its encoded value, and what other signals can stand in? (3) `accounts_per_device` catches rings, but 900 students share one campus IP. Which data problem is this, and how do you keep the feature useful?
+</Callout>
+
+<details>
+<summary>Answer key 1.2</summary>
+
+1. **Leakage:** a rate over all data includes the transaction's own and future labels. Compute it only from labels *known* before the timestamp (stricter than "before the transaction", since labels arrive late). **Noise on rare merchants:** one transaction with one fraud gives 100%. Smooth toward the global rate, e.g. `(fraud + m·prior) / (n + m)`, and add a count feature.
+2. No known labels yet (chargebacks haven't arrived), so it falls back to the prior or `UNKNOWN`. Stand-ins: merchant category code and country, KYC and onboarding data, `merchant_age_days`, velocity and ticket-size patterns, graph links (same owner runs other merchants).
+3. **Supernode.** Classify IPs by network type (university, corporate, carrier, VPN) and discount shared ones; prefer device fingerprints over IPs; weight edges by identifier rarity (like IDF).
+
+</details>
+
+## 1.3 Instrumentation & event logging design
+
+### The first principle
+
+> **A model can only learn from what you logged. Data you didn't log is gone for good.**
+
+A code bug can be fixed and redeployed. A logging gap is permanent. Logging design is **part of the ML system**: what you log today decides which models you can build in six months.
+
+### What logging has to produce
+
+For every decision, linked together: **context** (what did we know) → **decision** (what did we do) → **outcome** (what happened). That means three logs:
+
+<Diagram src="data/three-logs-joined.svg" />
+
+1. **Behavioral events:** what users do (logins, adding a card, checkout steps).
+2. **Prediction log:** the most valuable log in an ML system, and the one most often missing.
+3. **Outcome events:** chargebacks, review decisions, disputes, arriving later and joined back to the exact decision.
+
+### The prediction log (feature logging)
+
+At every scoring call, record **exactly what the model saw and did**:
+
+```jsonc
+{
+  "event_id": "evt_9f2c...",          // unique, used for dedup
+  "transaction_id": "tx_88213",       // join key to outcomes
+  "request_ts_server": "2026-03-14T14:03:07.412Z",  // UTC, server clock
+  "model_version": "fraud-gbt-v42",
+  "features": {"amount_usd": 249.99, "tx_count_1h": 5, "ip_risk_score": 81},
+  "score": 0.87,
+  "threshold": 0.80,
+  "decision": "review",
+  "decision_source": "model",         // or "rule_override" / "fallback"
+  "experiment_arm": "control",
+  "latency_ms": 38
+}
+```
+
+It solves: **point-in-time correct training data by construction** (and the vendor-history problem from 1.1B); **no train-serve skew**; **debugging** ("why was this customer blocked?" months later); **evaluation and monitoring** (score distributions, drift, A/B analysis, latency).
+
+### Event schema design rules
+
+| Field / rule | Why |
+|---|---|
+| Unique `event_id` | At-least-once delivery creates duplicates; the ID enables dedup |
+| Stable **join keys** (`transaction_id`, `user_id`, `device_id`) | Outcomes must attach to decisions, or the label is lost |
+| **Several timestamps** (client event time, server receive time), UTC | Client clocks are wrong, and fraudsters fake them. Order by server time; keep client time as a signal |
+| `model_version`, `experiment_arm`, `decision_source` | Otherwise you can't tell which system decided, or evaluate experiments |
+| Schema registry (Avro/Protobuf) with compatibility rules | Stops a silent field rename turning a feature into nulls |
+| **Log every path** (declines, blocks, timeouts, fallbacks) | Logging only "successes" biases the data toward them |
+
+### Design choices and trade-offs
+
+1. **Client-side vs server-side.** Client-side gives richer behavior (typing speed) but loses events, has clock skew, and **can be tampered with**. Never rely on a client-only signal for anything security-relevant.
+2. **Log everything vs selectively.** 2 KB × 5,000/s × 86,400 s ≈ **860 GB/day**. Keep every positive and uncertain case, **downsample** clear negatives and **write the sampling rate into the record** so you can reweight. Sampling without recording the rate permanently biases the data.
+3. **Synchronous vs asynchronous.** Logging must not use the 100 ms budget, so write asynchronously, and **reconcile** hourly: prediction-log counts vs the transaction database, alerting on mismatch.
+
+### Failure modes
+
+- **Fallback paths that don't log.** Data goes missing during peaks and incidents, exactly the cases you need most.
+- **Logging the wrong value.** A counter incremented *before* logging includes the current transaction in the log but not online: skew.
+- **Join-key mismatch.** Chargebacks reference the processor's `charge_id`, not your `transaction_id`, so fraud labels never join and those transactions train as "not fraud".
+- **Blocked transactions not logged**, worsening selective labels.
+- **PII in logs.** Hash or tokenize before writing.
+- **Silent schema drift.**
+
+### Connections
+
+- **1.1:** logging vendor responses fixes history-less sources. **1.4:** the prediction log is the simplest point-in-time correctness. **Ingestion:** event IDs enable dedup; server timestamps help with late events. **Labeling:** labels are outcomes joined to predictions. **Evaluation and monitoring** are built on prediction logs.
+
+<Callout title="Exercise 1.3">
+  During Black Friday the model timed out on **3% of requests**; a rules fallback decided, and **the fallback path didn't write to the prediction log**. Two months later the team retrains on prediction logs joined with chargebacks. What's wrong with the training set (which transactions are missing, and why does it matter for fraud)? How does it affect offline evaluation? Name two logging changes and one monitor that would have caught it on the day.
+</Callout>
+
+<details>
+<summary>Answer key 1.3</summary>
+
+1. **The missing 3% isn't random.** It's peak traffic and the slowest requests (new devices, slow vendor calls, heavy graph lookups), which skew toward fraud, and fraudsters attack during peaks. Their chargebacks can't join to a prediction, so training loses the hardest, most fraud-heavy slice.
+2. Offline evaluation runs on the same biased data, so it **overstates** performance and says nothing about peak-load behavior.
+3. **Logging:** log every decision from a single chokepoint with `decision_source = fallback`; write to a durable outbox before responding; log which features were missing or timed out. **Monitor:** prediction-log counts vs authorization counts per minute, plus an alert on fallback-rate spikes.
+
+</details>
+
+## 1.4 Point-in-time availability
+
+### The first principle
+
+Every training example is a snapshot of one moment **T**, when the model must decide.
+
+> **A feature value is valid for training only if it was actually available to the serving system at time T.**
+
+*Available to the system*, not "had happened". That difference causes most production leakage and skew.
+
+### Four timestamps for every value
+
+| Timestamp | Meaning | PayFlow example |
+|---|---|---|
+| **Event time** | When it happened in the world | Customer pays at 13:40 |
+| **Ingestion time** | When your system received it | Lands in Kafka at 13:40:02 |
+| **Availability time** | When it became *queryable by serving* | Nightly batch feature ready at 05:00 next day |
+| **Label availability time** | When you *learned* the outcome | Chargeback arrives 45 days later |
+
+Most pipelines keep only event time. That's where the bugs come from.
+
+<Diagram src="data/prediction-moment-timeline.svg" />
+
+### The subtle case: staleness, not only the future
+
+The bug that actually ships is **staleness mismatch**. Serving at 14:03 on Mar 14 sees `merchant_cb_count` from a nightly batch covering data to **midnight Mar 13**, ready at **05:00**. The naive training pipeline recomputes over `[T − 30d, T)`, including everything to 14:03. Training sees **fresher** data than serving ever does, and online performance drops.
+
+**The rule:** in training, reproduce the *staleness* serving actually has, not the ideal value.
+
+### The as-of (point-in-time) join
+
+For each example at T, take the **latest feature value whose availability time ≤ T**:
+
+```sql
+SELECT t.transaction_id, t.ts, f.merchant_cb_count
+FROM transactions t
+LEFT JOIN LATERAL (
+  SELECT merchant_cb_count
+  FROM merchant_features_history f
+  WHERE f.merchant_id = t.merchant_id
+    AND f.available_at <= t.ts        -- availability time, NOT event time
+  ORDER BY f.available_at DESC
+  LIMIT 1
+) f ON TRUE;
+```
+
+This needs a **history table** of every feature version with its `available_at`. An in-place-updated database can't support it.
+
+### Three ways to get point-in-time data
+
+| Approach | How | Pros | Cons |
+|---|---|---|---|
+| **Feature logging** (1.3) | Record served values at T | Exact; no skew | Only going forward; new features have no history |
+| **Event-sourced recompute + as-of join** | Recompute from immutable logs using availability times | Can backfill new features | Must model pipeline delay; logic often duplicated |
+| **Periodic snapshots** | Daily copy of entity tables | Simple; works with mutable DBs | Coarse; storage cost; intra-day changes lost |
+
+In practice: log features for production, and use as-of joins to backfill new features. Feature stores (Feast, Tecton, Databricks) exist mostly to do the as-of join correctly with **one definition** for offline and online.
+
+### Labels have a point in time too
+
+On training day, **recent transactions are missing labels**. Treating "no chargeback yet" as "not fraud" mislabels recent data. Fix: a **label maturity window** (train only on transactions older than ~90 days, or model the delay). Trade-off: mature labels are older data, and fraud changes fast (branch 4).
+
+### Assumptions
+
+- Timestamps are correct, UTC, from a trustworthy (server) clock.
+- You store **availability time**, not just event time.
+- History is **immutable**: corrections are new versions, not overwrites.
+
+### Failure modes
+
+- **Joining on event time instead of availability time** (staleness mismatch).
+- **Off-by-one window boundaries.** Use half-open `[T−1h, T)` in *both* training and serving.
+- **Mutable-state leakage.** The account is frozen after the fraud, and training sees the frozen status.
+- **Retroactive corrections.** Training sees the corrected value; serving saw the wrong one.
+- **Features that proxy the label process.** `analyst_review_opened` is predictive only because reviews open *after* suspicion.
+- **Backfilled features that silently disagree** with the live computation.
+
+### Trade-offs
+
+- **Freshness vs cost:** what matters is that training *sees the same staleness* as serving.
+- **Exactness vs flexibility:** logging is exact but can't backfill; recomputing can, but risks skew.
+- **Label freshness vs accuracy:** the maturity window.
+
+### Connections
+
+- **1.1:** mutable DBs and history-less vendors are point-in-time problems. **1.3:** the prediction log. **Ingestion and storage:** CDC and snapshots produce history tables. **Labeling:** maturity windows. **Data risks:** most leakage and skew are point-in-time violations. **Feature store:** its main job is the as-of join.
+
+<Callout title="Exercise 1.4">
+  `user_avg_amount_30d`: **serving** uses a nightly batch starting 02:00 UTC, publishing ~**05:00**; on ~1 night in 20 it fails and serving keeps the previous value. **Training** computes the average over `[T − 30d, T]` directly from the transactions table. Offline AUC is 0.95; online is noticeably worse. List every training/serving mismatch (at least three), and rewrite the training definition to match serving.
+</Callout>
+
+<details>
+<summary>Answer key 1.4</summary>
+
+1. Mismatches: **inclusive window end `]`** (training includes the current transaction); **freshness** (training sees data to T, serving to the previous midnight, and between 00:00 and 05:00 it's two days stale); **job failures** (1 night in 20 even staler, never seen in training); **mutable source** (training sees later refunds and reversals); **window semantics** (30 calendar days UTC vs rolling 30×24h; NULL vs 0 defaults for users with no history).
+2. Store every published version with `available_at` = its real publish time from job logs (including failed nights); build training data with an as-of join on `available_at ≤ T`; going forward, log the served value and train on that.
+
+</details>
+
+## 1.5 Ownership & data contracts
+
+### The first principle
+
+> **Your model depends on data produced by teams who don't know your model exists.**
+
+Code dependencies have types, compilers and owners. Data dependencies usually have **none of that**. Sculley et al. call this "undeclared consumers" and "changing anything changes everything".
+
+### The failure it prevents
+
+1. The checkout team ships app v8.2 to 50% of users. `amount` changes from **dollars (float)** to **cents (integer)**.
+2. The schema check passes: both are numeric.
+3. For half of traffic `amount` is 100× larger. Scores jump and **thousands of legitimate payments are blocked**.
+4. Found three hours later through complaints, with no clear owner to page.
+
+The schema didn't break; the **meaning** did. Contracts catch exactly this.
+
+<Diagram src="data/data-contract.svg" />
+
+One producer usually has many consumers. The contract makes an invisible dependency explicit.
+
+### What a contract contains
+
+```yaml
+dataset: checkout.payment_events
+owner: checkout-team        # on-call: #checkout-oncall
+consumers: [fraud-model, analytics, finance-recon]   # registered, not guessed
+schema:
+  amount_minor:  {type: int64, nullable: false, unit: "minor currency units (cents)"}
+  currency:      {type: string, format: ISO-4217}
+  event_ts:      {type: timestamp, tz: UTC, source: server}
+semantics:
+  - "one event per authorization attempt, including declines"
+quality:
+  completeness: ">= 99.9% of authorizations within 5 min"
+  null_rate.amount_minor: "0%"
+freshness_sla: "p99 end-to-end < 60s"
+change_policy:
+  breaking: "new field or version + 30-day deprecation + notify consumers"
+  semantic_change_is_breaking: true
+classification: {email: PII, pan: PCI-restricted}
+```
+
+1. **Schema and semantics:** types, nullability, **units, currency, time zone, what one row means**.
+2. **SLAs:** freshness, completeness, availability.
+3. **Quality expectations:** ranges, uniqueness, null rates.
+4. **Change policy:** what's breaking, deprecation window, who's notified. **A change in meaning is breaking**, even with the same type.
+5. **Ownership and classification:** owning team, on-call, PII/PCI label.
+
+### How contracts are enforced
+
+| Where | Mechanism | Catches |
+|---|---|---|
+| Producer CI | Schema registry compatibility + contract tests | Renames, type changes, removed fields, *before* deploy |
+| Pipeline boundary | Validation (Great Expectations, Soda, TFDV) | Null spikes, out-of-range values, distribution jumps (the cents bug) |
+| Catalog / lineage (DataHub, OpenLineage) | Registered consumers | "Who breaks if I change this?" |
+| Runtime | Freshness and volume monitors paging the *owner* | Late or missing data |
+
+**Consume defensively anyway:** validate inputs at the boundary, monitor feature null rates and distributions, and keep a **feature kill switch** (drop a broken feature to a safe default, or fall back to a model without it).
+
+### Ownership model
+
+| Layer | Owner | Responsible for |
+|---|---|---|
+| Source data | Producing product team | Correctness at the source |
+| Pipelines and platform | Data platform team | Transport, storage, infrastructure SLAs |
+| Features | ML / feature team | Definitions, point-in-time correctness |
+| Model and decisions | ML team + risk owners | Model behavior, thresholds, business impact |
+
+Every dataset needs a **named owner who can be paged**.
+
+### Trade-offs
+
+- **Safety vs speed:** contract only the **consumed and critical** fields.
+- **Strictness vs evolution:** versioning plus deprecation windows.
+- **Producer-defined vs consumer-driven contracts:** consumer-driven match real use but need more coordination.
+- **Vendors:** the contract is legal/SLA; rely on defensive validation and logging responses.
+
+### Failure modes
+
+- **Undeclared consumers** reading tables directly.
+- **Documentation-only contracts**, stale by next quarter.
+- **Semantic changes that pass schema checks.** You need distribution checks, not just type checks.
+- **Ownership lost in a reorg.**
+- **Alerts routed to the consumer** instead of the producer.
+
+### Connections
+
+- **1.1:** the "trust" question is answered by contract and owner. **1.3:** schema registry enforces event contracts. **Validation:** enforces contract rules at runtime. **Governance:** PII classification is part of the contract. **Monitoring:** source monitors page the owner; kill switches limit damage.
+
+## Branch 1 checkpoint
+
+PayFlow wants a second model: **account takeover (ATO) detection at login**. Within 150 ms, allow, require 2FA, or block. Takeovers are confirmed days later.
+
+1. **Sources (1.1):** 4 data sources, each with its biggest risk (signal, availability or trust).
+2. **Data types (1.2):** 2 signals of different types, and how to represent them within 150 ms.
+3. **Logging (1.3):** 5 fields that must be in the prediction log, and 1 monitor.
+4. **Point in time (1.4):** one leakage or staleness trap specific to ATO.
+5. **Contracts (1.5):** which producer you'd demand a contract from, and the most important clause.

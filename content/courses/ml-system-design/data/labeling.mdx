@@ -1,0 +1,24 @@
+---
+title: 4. Labeling
+description: Where the "y" comes from, and how it goes wrong.
+---
+
+## 4.1 Natural labels & label delay
+
+Some labels come from the outcome itself (a purchase, a chargeback). They're cheap but can arrive days or months later.
+
+## 4.2 Human annotation
+
+When labels need people, write clear guidelines, measure agreement between annotators, and run quality checks.
+
+## 4.3 Weak supervision, active learning, LLM labeling
+
+Generate labels with rules or LLMs, or have the model pick the most useful examples for humans to label.
+
+## 4.4 Label noise
+
+Labels are wrong some of the time (a "fraud" chargeback that was really buyer's remorse). Estimate the noise and make training robust to it.
+
+## 4.5 Selective labels / censored outcomes
+
+You only see outcomes for cases you acted on in certain ways. Blocked transactions never get a label, which biases the next model.

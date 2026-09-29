@@ -1,0 +1,5 @@
+{
+  "title": "Data",
+  "icon": "Database",
+  "pages": ["index", "sources-and-collection", "ingestion-and-processing", "storage-and-management", "labeling", "quality-and-validation", "sampling-and-splits", "data-risks", "privacy-and-governance"]
+}

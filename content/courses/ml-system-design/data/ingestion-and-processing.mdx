@@ -1,0 +1,624 @@
+---
+title: 2. Ingestion & processing
+description: Moving data from where it's produced to where it's consumed.
+---
+
+## 2.1 Batch vs streaming vs micro-batch
+
+### The first principle
+
+Ingestion moves data from where it's **produced** to where it's **consumed** (feature computation, training, serving). Every choice comes down to:
+
+> **Freshness vs cost, complexity, and correctness.**
+
+Don't ask "should we stream?" Ask **"how fast does this signal lose its value?"**, its *half-life*. "5 card attempts in the last 2 minutes" is worthless 10 minutes later; "merchant's 90-day chargeback rate" barely changes in a day. The half-life decides the pipeline.
+
+### The three processing modes
+
+| Mode | How it works | Latency | Typical tools |
+|---|---|---|---|
+| **Batch** | Process a *bounded* dataset on a schedule | Hours | Spark, warehouse SQL (dbt), orchestrated by Airflow or Dagster |
+| **Micro-batch** | Small batches every few seconds to minutes | Seconds to minutes | Spark Structured Streaming |
+| **Streaming** | Process an *unbounded* stream continuously, keeping state | Milliseconds to seconds | Kafka + Flink, Kafka Streams |
+
+"Batch vs streaming" appears at **four separate layers**, often confused: **transport** (Kafka vs nightly dump), **feature computation** (this part), **inference** (stage 7), **training** (stage 5). They're independent: PayFlow scores online with batch and streaming features, and retrains weekly.
+
+### The three freshness tiers
+
+| Tier | Computed from | PayFlow examples | Freshness | Cost |
+|---|---|---|---|---|
+| **Request-time** | The request payload, inside the scoring service | amount, billing ≠ shipping country, local hour | Instant | ~0 |
+| **Streaming** | Recent events, with state in a stream processor | `tx_count_card_5m`, `failed_attempts_device_10m`, `distinct_merchants_card_1h` | Seconds | High (always-on, stateful) |
+| **Batch** | Long history, recomputed on a schedule | `merchant_cb_rate_90d`, `user_avg_amount_30d`, graph component size | Hours | Low |
+
+**Default strategy:** batch plus request-time features. Add streaming only for the **few** features whose half-life requires it. In fraud, that's velocity features, which catch card testing.
+
+### The architecture
+
+<Diagram src="data/batch-and-streaming-pipelines.svg" />
+
+The two dashed cross-writes matter:
+- **Stream → offline store:** streaming values are written with timestamps to the offline store, so training uses the same values serving saw.
+- **Batch → online store:** nightly features are loaded for ~1 ms lookups.
+
+Scoring reads only the online store plus the request. Training reads only the offline store.
+
+### Lambda vs Kappa: one computation or two?
+
+- **Lambda:** the same feature computed by a batch job (accurate, reprocessable) and a stream job (fresh). Risk: **two codebases**, and `tx_count_1h` implemented slightly differently in Spark and Flink is train-serve skew.
+- **Kappa:** streaming only; reprocess by **replaying the log** through the same code. One codebase, but replaying months is slow and needs long retention.
+- **Modern practice:** **one feature definition** (feature-store DSL, or code that runs in batch and stream mode) compiled to both paths.
+
+### Windows: the detail that causes skew
+
+| Window | Definition | Behavior |
+|---|---|---|
+| **Tumbling** | Fixed, non-overlapping buckets | Cheap; **resets at each boundary**, so a burst from 14:04 to 14:06 splits in two |
+| **Sliding / hopping** | Rolling "last 5 minutes" | Matches intuition; more state and compute |
+| **Session** | Grouped by activity with gaps | Good for login and browsing behavior |
+
+Classic bug: training computes an exact sliding `tx_count_5m` in SQL; serving uses a Flink tumbling window. Bursts across boundaries are missed online. **Use the same window type and boundary rules in training and serving**, including half-open `[T−5m, T)`.
+
+### Assumptions streaming relies on
+
+- The log is **replayable** (Kafka retention or lake archive).
+- Events carry **event-time** timestamps, with watermarks deciding when a window is complete (2.4).
+- Sinks are **idempotent**, so reprocessing doesn't double-count.
+- State is **checkpointed** durably.
+
+### Failure modes
+
+**Streaming:** **consumer lag at peak** (velocity features stale exactly when fraud is highest; provision for peak); **state lost on restart** (counters reset to 0 and every card looks clean, one of the worst silent failures); **hot keys** (one huge merchant overloads a partition); **late events dropped** by the watermark; **double counting** after replay without idempotent sinks.
+
+**Batch:** a failed job leaves features stale (monitor freshness, not just job success); runtime creeps up until SLAs are missed.
+
+**Both:** two implementations of one feature cause skew.
+
+### Trade-offs
+
+| | Batch | Streaming |
+|---|---|---|
+| Freshness | Hours | Seconds |
+| Cost | Pay per run | Always-on cluster + state store |
+| Reprocess / backfill | Easy (rerun) | Hard (replay, rebuild state) |
+| Testing / debugging | Easy | Hard (time, ordering, state) |
+| Correctness risks | Staleness | Late events, duplicates, state loss, lag |
+| Use when | Slow-changing signal, long windows | Fast-decaying signal (velocity, bursts) |
+
+### Connections
+
+- **1.4:** streaming availability time is seconds plus lag; batch is publish time. **2.3 / 2.4:** CDC feeds streams; late and duplicate events make streams hard. **Storage:** online vs offline stores. **Feature store:** single definitions. **Serving:** online store lookups of ~1–5 ms. **Monitoring:** consumer lag, freshness, counters dropping to zero.
+
+<Callout title="Exercise 2.1">
+  **Q1.** Classify as request-time, streaming or batch, and justify one by half-life: (a) `is_billing_country_ne_ip_country`, (b) `distinct_cards_per_device_10m`, (c) `merchant_refund_rate_90d`, (d) `amount_zscore_vs_user_30d_mean` (two parts, different tiers), (e) `accounts_in_device_graph_component`. **Q2.** On Black Friday the Flink job restarts **without restoring its checkpoint**, and for ~20 minutes all streaming counters rebuild from zero. What happens to decisions, and why? Name two measures that prevent or contain it.
+</Callout>
+
+<details>
+<summary>Answer key 2.1</summary>
+
+**Q1:** (a) **request-time** (billing country from the request, IP country from a local geo-IP lookup); (b) **streaming** (card testing plays out in minutes); (c) **batch** (a 90-day rate changes slowly); (d) **split**: 30-day mean and std are batch, the current amount is request-time, the z-score is combined at request time; (e) **batch or incremental** (graphs are expensive), optionally plus a streaming degree counter since rings form within hours.
+
+**Q2:** counters restart from zero, so velocity features undercount and card-testing bursts look "low velocity = safe". Result: a spike of missed fraud on the highest-fraud day. **Measures:** durable checkpoints (RocksDB state backed up to S3), refusing to start without state or rebuilding it by replaying Kafka from `now − largest window` before serving; mark features `warming` so serving falls back to rules or a model without velocity features; alert on collapsing counter distributions; keep Kafka retention longer than the largest window.
+
+</details>
+
+## 2.2 Formats, ETL vs ELT, orchestration
+
+### The first principle
+
+> **Store data in the shape of how it will be read.**
+
+| Access pattern | Who | Shape |
+|---|---|---|
+| Write one record at a time | Event producers, Kafka | Row by row, append-only |
+| Scan **few columns over billions of rows** | Training, analytics | Analytical scan |
+| Read **all fields of one entity by key** | Online scoring | Point lookup, milliseconds |
+
+No single format suits all three. Scale check: 5,000 tx/s × 86,400 s × 365 ≈ **158 billion transactions a year**, ~300 columns each. Format decides whether training takes 20 minutes or 2 days.
+
+### Row vs columnar formats
+
+| Format | Layout | Strengths | Weaknesses | PayFlow use |
+|---|---|---|---|---|
+| **CSV / JSON** | Row, text | Human-readable | No types, huge, slow, ambiguous nulls, **float precision on money** | Debugging only |
+| **Avro / Protobuf** | Row, binary, schema-aware | Compact, fast writes, **schema evolution** | Bad for scanning few columns | Kafka events |
+| **Parquet / ORC** | Columnar | Column pruning, compression, **predicate pushdown** | Bad for single-row writes and updates | Lake, training data |
+| **Arrow** | Columnar, in memory | Zero-copy between pandas, Spark, DuckDB, training | Not a storage format | Moving data into training |
+
+**How columnar pays off:** **column pruning** (40 of 300 columns ≈ 13% of bytes), **compression** (similar values adjacent), **predicate pushdown** (row-group min/max stats let queries skip data).
+
+**Table formats (Delta Lake, Iceberg, Hudi)** add a transaction log on top of Parquet: **ACID writes**, **time travel** ("this table as of Mar 14", for reproducibility and point-in-time reconstruction), **upserts and merges** (CDC, GDPR deletes), and **schema evolution** with enforcement.
+
+**Small-files problem:** streaming writes produce millions of tiny files. Fix: regular **compaction**.
+
+### ETL vs ELT
+
+- **ETL:** transform *before* loading. Smaller storage and sensitive fields removed early, but **the raw data is gone**: new features or transform bugs can't be reprocessed over history.
+- **ELT:** land raw first, transform in the lake or warehouse. **Raw is kept**, so you can reprocess and backfill, but raw PII lands in the lake and it can become a "data swamp".
+- **For ML, prefer ELT with an immutable raw layer**, with a targeted ETL step to tokenize highly sensitive fields (card numbers) before landing.
+
+The standard layering is the **medallion architecture**:
+
+<Diagram src="data/medallion-layers.svg" />
+
+- **Bronze:** exactly what arrived. **Append-only, never edited.** Your insurance policy.
+- **Silver:** deduplicated, typed, UTC timestamps, currency normalized, validated. One clean row per real-world event.
+- **Gold:** aggregates, features, point-in-time training sets.
+
+A silver or gold bug is fixable by rebuilding from bronze. A bronze bug (data lost or overwritten on arrival) is permanent.
+
+### Orchestration
+
+A pipeline is a **DAG**: ingest → clean → features → training set → train → evaluate → publish. Something must run it in order, retry, backfill, alert and record what ran on which data. Tools: Airflow (task-centric), Dagster (asset-centric), Prefect, Kubeflow/Argo.
+
+**Design rules:**
+1. **Partition by time.** Each run processes exactly one partition.
+2. **Idempotent tasks:** rerunning a partition gives the **same result**. **Overwrite the partition; never append.**
+3. **Trigger on data, not the clock:** run when upstream is complete, not "at 03:00 because it's usually done".
+4. **Check before publishing:** row counts, null rates, freshness. A bad partition should fail loudly.
+5. **Freshness SLAs with alerts** to the owner.
+
+### Assumptions
+
+- Raw data is kept immutably and long enough to reprocess.
+- Tasks are idempotent and deterministic: no `now()` in transforms, no unseeded randomness.
+- The orchestrator knows *all* dependencies.
+
+### Failure modes
+
+- **Green but wrong:** a clock-triggered job runs on a 60%-complete upstream partition, "succeeds", and training quietly loses 40% of that day, likely skewed by region or time zone.
+- **Duplicates from append + retry:** every transaction appears twice and velocity aggregates double.
+- **Float money:** use decimals or integer minor units.
+- **Small-file explosion** slowing training reads.
+- **Schema drift between layers:** a new bronze field silently dropped by an explicit silver select.
+- **Backfill stampede:** 365 partitions rerun at once starve production jobs.
+
+### Trade-offs
+
+- **Columnar vs row:** columnar for reads and training, row for writes and transport; convert at the lake boundary.
+- **ETL vs ELT:** privacy and storage vs reprocessing. For ML, reprocessing usually wins.
+- **Time vs data triggers:** use data triggers plus a deadline alert.
+- **Task- vs asset-centric orchestration:** asset-centric shows lineage and partition status, but is a newer model.
+
+### Connections
+
+- **1.3 / 1.5:** Avro/Protobuf and the schema registry enforce event contracts. **1.4:** time travel rebuilds past table states. **2.4:** dedup between bronze and silver. **2.5:** immutable bronze makes backfills possible. **Storage:** partitioning, retention, versioning. **Privacy:** tokenize before landing; table formats enable deletes.
+
+<Callout title="Exercise 2.2">
+  **Q1.** `build_silver_transactions` runs **daily at 03:00**, reading yesterday's bronze CDC data and **appending** to `silver.transactions`. One night only **60%** of the data had arrived by 03:00; the job succeeded. At 09:00 an engineer re-ran it; it succeeded again. (a) Name the two design bugs. (b) What does next week's training set look like for that day, and how could it bias the model? (c) Fix both. **Q2.** Training reads 40 of 300 columns across 12 months: why Parquet over JSON? Give one place a row format is still right.
+</Callout>
+
+<details>
+<summary>Answer key 2.2</summary>
+
+**Q1:**
+- **a) The two bugs:**
+  1. The job was **triggered by the clock**, with no check that the upstream data was complete.
+  2. It **appended** instead of overwriting, so the retry wasn't idempotent.
+- **b) The training set for that day:** about 160% of the real rows, with the early-arriving 60% **duplicated**.
+  - That early 60% probably isn't random: it's likely certain processors, regions, or time zones. That slice is now over-represented.
+  - Velocity counts double.
+  - Any fraud labels in that slice are counted twice.
+- **c) The fixes:**
+  - A data-triggered sensor that waits for CDC completeness (a partition marker, a watermark, or a row count reconciled against the source), plus a deadline alert.
+  - `INSERT OVERWRITE` of the partition, or `MERGE` on the primary key.
+  - A row-count check against the source before publishing.
+
+**Q2:** Parquet reads only the 40 columns you need, compressed, with typed values and pushdown, so roughly 13% of the bytes JSON would require. A row format is still right for **Kafka events (Avro)** and **prediction-log writes**, both of which write one record at a time.
+
+</details>
+
+## 2.3 CDC and snapshots
+
+### The first principle
+
+Operational databases store **current state**: an update overwrites the old value (1.1). ML needs the **history of state**: what was true at T (1.4). There are two ways to capture that history from a mutable database:
+
+- **Snapshots**: photographs taken at intervals.
+- **CDC (change data capture)**: a recording of every change as it happens.
+
+A snapshot shows you the state at the moments you happened to take one. CDC shows you everything that happened in between.
+
+### Three extraction methods
+
+| Method | How | Captures | Misses / costs |
+|---|---|---|---|
+| **Full snapshot** | Nightly `SELECT *` from a replica into a daily partition | State at snapshot time | **Changes within the day** (frozen at 10:00, unfrozen at 16:00: never seen); cost grows with table size |
+| **Incremental query** | `WHERE updated_at > last_run` | Rows changed since last run | **Hard deletes**; intermediate versions; any code path that forgets to update `updated_at` (bulk scripts, manual fixes) |
+| **Log-based CDC** | Read the database's transaction log (Postgres WAL, MySQL binlog) with Debezium, publish to Kafka | **Every insert, update, and delete**, in commit order, within seconds | Operational complexity: connector, log retention, schema changes |
+
+A CDC change event looks like this:
+
+```json
+{
+  "op": "u",                                   // c=create, u=update, d=delete
+  "before": {"account_id": "A1", "status": "active"},
+  "after":  {"account_id": "A1", "status": "frozen"},
+  "source": {"ts_ms": 1773652320000, "lsn": 88412933, "table": "accounts"},
+  "ts_ms": 1773652321150                       // when the connector processed it
+}
+```
+
+`lsn` is the log position. It gives the exact commit order for each key.
+
+### What CDC events become
+
+<Diagram src="data/cdc-pipeline-three-outputs.svg" />
+
+Each change event feeds three outputs:
+
+**1. Mirror table (current state).** `MERGE` each change into a Delta or Iceberg table, applied in `lsn` order per key. Used by analytics, and by features that genuinely need *now*.
+
+**2. History table (SCD Type 2).** Every version of every row, with its validity interval. **This is what point-in-time joins need** (1.4):
+
+| account_id | status | valid_from | valid_to |
+|---|---|---|---|
+| A1 | active | 2026-01-02 10:00 | 2026-03-16 09:12 |
+| A1 | frozen | 2026-03-16 09:12 | *null (current)* |
+
+For a transaction on **Mar 14, 14:03**, the as-of join picks `active`, which is correct. A naive join to the current state picks `frozen`, which is the **leakage** from 1.1. SCD2 is the structural fix for mutable-state leakage.
+
+Nuance (from 1.4): `valid_from` is the database **commit time**, but serving only sees the change after the CDC lag, typically seconds. For fast-moving features, add the typical lag, or record when each change actually reached the online store.
+
+**3. Stream features straight from changes.** Some of the strongest fraud and ATO signals *are* state changes:
+- `email_changed_last_24h`
+- `card_added_minutes_ago`
+- `password_reset → high-value tx within 1h`
+
+Nightly snapshots can't produce these. CDC can.
+
+### Snapshot vs CDC
+
+| | Nightly snapshot | Log-based CDC |
+|---|---|---|
+| Granularity | One state per day | Every change |
+| Intra-day changes | **Lost** | Captured |
+| Deletes | Only as "row missing" in the next snapshot | Explicit delete events (tombstones) |
+| Load on the database | Heavy full scan (use a replica) | Light (reads the log) |
+| Latency | ~24h | Seconds |
+| Complexity | Low | High (connector, retention, schema changes) |
+| Storage | N × full table (compress, or diff-and-store changes) | Changes only |
+| Backfilling history | Only from the day snapshots began | Only from the day CDC began |
+
+**Neither method can recover history from before it was turned on.** Same lesson as 1.3: start capturing before you need it.
+
+**Practical combination:** CDC for tables where changes carry signal or leakage risk (accounts, cards, users, merchants), plus occasional full snapshots as a **reconciliation check**. The mirror table should match a fresh snapshot; if it doesn't, CDC has lost or misapplied events.
+
+### Assumptions
+- The database log is kept long enough to cover connector downtime.
+- There's a consistent **handoff** from the initial snapshot to the stream. Debezium takes an initial snapshot and then streams from that exact log position.
+- Changes are applied **in log order per key**. Ordering is only guaranteed per Kafka partition, so partition by primary key.
+- Schema changes are coordinated (1.5 contracts).
+
+### Failure modes
+- **Replication slot fills the disk (production outage).** In Postgres, a Debezium replication slot makes the primary *keep* its WAL until the connector reads it. If the connector is down all weekend, the WAL grows by hundreds of GB, the **primary database's disk fills, and the payments database goes down.** Your ML pipeline has just taken out production. Mitigations:
+  - Monitor slot lag.
+  - Set `max_slot_wal_keep_size` (Postgres 13+) so the database drops the slot rather than dying, then re-snapshot.
+  - Page on connector downtime.
+- **Connector down longer than log retention:** a silent **gap** in history. You need a re-snapshot, and the gap stays in SCD2 forever. Mark it explicitly.
+- **Out-of-order application:** updates applied out of order because of wrong partitioning leave the mirror in the wrong state.
+- **Snapshot/stream handoff bugs:** duplicates or missing rows at the boundary.
+- **Schema change** (a column renamed or its type changed) breaks the connector or silently nulls downstream columns.
+- **Corrections vs real changes:** an ops engineer fixing a wrong country code shows up as a "change" and can look like a suspicious event in features.
+- **Snapshot off-by-one:** a snapshot taken at 01:00 on Mar 15 gets stored as partition `2026-03-15`, but it reflects state from the end of Mar 14. The as-of join is then off by a day.
+
+### Trade-offs
+- **Fidelity vs operational burden:** CDC gives full history, but it's a production dependency on your most critical database.
+- **Storage:** SCD2 history grows with the rate of change. Frequently changing columns (`last_login_at`) inflate history, so exclude or separate them.
+- **Deletes vs retention:** GDPR requires deletes to propagate (tombstones → deleted from the mirror and the history). Fraud audits may need records kept. That's a legal decision, not a technical one (branch 8).
+
+### Connections to the rest of the system
+- **1.1 / 1.4:** CDC + SCD2 is the standard fix for mutable-state leakage and gives point-in-time history.
+- **2.1:** CDC turns databases into streams, which feed streaming features.
+- **2.2:** table-format `MERGE` applies changes; bronze stores the raw change events.
+- **2.4:** ordering, duplicates, and replays of change events.
+- **Branch 3:** the cost of storing history, and retention.
+- **Branch 8:** delete propagation.
+
+<Callout title="Exercise 2.3">
+
+PayFlow wants the ATO feature **`email_changed_last_24h`** and wants to train it on the **last 12 months**. What exists today:
+- **Nightly full snapshots** of `users` for the past 12 months (taken at 01:00 UTC).
+- **CDC on `users`**, turned on **5 weeks ago**.
+
+1. What can the nightly snapshots tell you about email changes, and what do they **miss**? Give a concrete fraud pattern that slips through.
+2. How would you build the 12-month training set? Which period comes from which source, and what **train-serve mismatch** does that create? (Serving will use CDC.) What would you do about it?
+3. On Monday, the database team reports that the Debezium replication slot grew to **400 GB** over the weekend while the connector was crashed. What is happening, what's the risk, and what are your immediate and long-term actions?
+
+</Callout>
+
+<details>
+<summary>Answer key 2.3</summary>
+
+1. **What snapshots show and miss:** the email at 01:00 each day. Diffing consecutive snapshots tells you *that* it changed, give or take 24h. They **miss** changes that get reverted within a day, and multiple changes collapse into one.
+   - **Fraud pattern that slips through:** the attacker changes the email at 10:00, drains the account by 11:00, and switches it back at 18:00. Snapshots never see it.
+2. **Building the 12-month set:**
+   - Last 5 weeks: use CDC (exact). The 11 months before: use snapshot diffs (day granularity, reverts missed).
+   - **Mismatch:** training undercounts the feature compared with serving, so the model gives it too little weight.
+   - **Options:**
+     - Set the feature to missing, plus a `source_unknown` flag, for the old period.
+     - Look for **another exact source**. The "your email was changed" notification events in the event log, or auth audit logs, may have exact history.
+     - Retrain once CDC history builds up.
+3. **Replication slot:** the slot keeps WAL because nothing is consuming it. The risk is the **payments database's disk filling up and the database going down**.
+   - **Immediate:** restore the connector. If you can't, drop the slot to protect the primary, accept the gap, and re-snapshot.
+   - **Long-term:**
+     - Alert on slot lag and connector health; page on downtime.
+     - Set `max_slot_wal_keep_size`.
+     - Write a runbook.
+     - Mark the gap in the SCD2 history.
+
+</details>
+
+## 2.4 Late, out-of-order, and duplicate events; idempotency
+
+### The first principle
+
+> **In a distributed system, events arrive late, out of order, and more than once. This is normal behavior, not a bug.**
+
+Why:
+- Networks fail, so senders **retry**. A retry after a lost acknowledgement creates a duplicate.
+- Mobile phones go offline and upload a **buffered batch** later.
+- Partitions are processed in parallel at different speeds.
+- Consumers crash and **replay** from their last committed offset.
+
+Delivery guarantees come in three kinds. The third is the one you want, and it has to be *built*:
+
+| Guarantee | Meaning | Consequence |
+|---|---|---|
+| At-most-once | Send once, no retry | **Lost** events |
+| At-least-once | Retry until acknowledged | **Duplicates** |
+| Exactly-once *effect* | At-least-once + **deduplication or idempotent writes** | Correct result, but you have to design for it |
+
+"Exactly-once delivery" over a network isn't achievable. **Exactly-once effect** is.
+
+### What it looks like
+
+<Diagram src="data/event-time-vs-arrival-late-and-duplicate-events.svg" />
+
+Three problems in one picture: **reordering** (e3 and e4 arrive before e2), a **duplicate** (e3 twice), and a **late** event (e2 arrives after the watermark).
+
+### 1. Out-of-order and late events: watermarks
+
+**The problem:** a windowed feature ("card transactions between 14:00 and 14:05") needs to know when the window is *complete*. With out-of-order arrival, you can never be sure.
+
+**How it works:** the stream processor keeps a **watermark**, meaning "I assume no more events older than W will arrive." A common rule is `W = max event time seen − allowed lateness` (say, 30 s). When the watermark passes a window's end, the window is finalized. An event older than the watermark is **late**, and you choose what to do with it:
+- **Drop it:** simple, but you lose data silently.
+- **Send it to a side output:** store it, count it, alert on the volume.
+- **Update the result** within an extra allowed-lateness period, which requires downstream to accept corrections.
+
+**The trade-off:** waiting longer gives more complete windows but **more latency**. Fraud can't wait.
+
+**The important consequence for ML:** online scoring reads the feature *as it stands right now*, which is **inherently computed from incomplete data**. A training pipeline that recomputes from the complete archive gives values that serving never saw. That's train-serve skew again. The fix, again, is to **log served feature values** (1.3), or have training simulate arrival time by only counting events with `ingest_time ≤ T`.
+
+**Late data in batch:** events for Mar 14 keep arriving on Mar 15 and 16. Two options:
+- **Lookback reprocessing:** recompute the last N daily partitions every day. That requires idempotent overwrites (2.2).
+- **Assign events to their arrival partition:** simpler, but the dates are wrong.
+
+Either way, **store the ingestion time** so availability (1.4) can be computed.
+
+### 2. Duplicates: deduplication
+
+**Where duplicates come from:**
+- a producer retries after a lost acknowledgement
+- a consumer replays after a crash (it processed events but hadn't committed its offset)
+- CDC snapshot/stream overlap (2.3)
+- a user double-clicks "pay"
+- a batch job is re-run (2.2)
+
+**Harm in PayFlow:**
+- `tx_count_card_5m` double-counts, so **legitimate customers get blocked** (false positives).
+- Training rows are duplicated, so some examples get double weight.
+- A duplicated chargeback event makes a label count twice.
+
+**Strategies:**
+
+| Strategy | How | Trade-off |
+|---|---|---|
+| **ID at the source** | `event_id` generated *by the producer* before the first send attempt, reused on every retry | **Required.** An ID generated at ingestion gives each retry a *new* ID, which makes dedup useless |
+| Stream dedup with state | Keep IDs seen in the last N hours; drop repeats | Memory cost; the TTL must be longer than the longest retry or replay period |
+| Probabilistic dedup | Bloom filter | Small memory, but rare false "duplicates" drop real events |
+| Batch dedup | In silver, keep one row per `event_id` or natural key | Exact, but only in batch |
+
+### 3. Idempotency: making repeats harmless
+
+**Definition:** applying an operation twice gives the same result as applying it once.
+
+| Non-idempotent | Idempotent |
+|---|---|
+| `count += 1` on each event | `count = COUNT(DISTINCT event_id) in window` |
+| `INSERT` / append a partition | `MERGE` on key / overwrite the partition |
+| "Send block webhook" | Webhook with an **idempotency key** that the receiver dedups |
+
+**About "exactly-once" in Kafka and Flink:** Flink checkpoints plus transactional (two-phase-commit) sinks give exactly-once for **state inside the pipeline and for transactional sinks**. **External side effects** (calling a vendor API, sending a webhook, emailing a customer) are still at-least-once after a replay. Make those idempotent with keys.
+
+### 4. Ordering guarantees
+- Kafka orders events **only within a partition**. **Partition by entity key** (`card_id`, `account_id`) so each entity's events stay in order.
+- There's **no global order** across entities. Don't write logic that assumes it.
+- For CDC, apply changes in `lsn` order per key (2.3).
+- For security-critical ordering, use the **server receive time**. Client timestamps can be faked.
+
+### Failure modes
+- **An overly aggressive watermark** drops mobile events from users with poor connectivity. Features undercount for those users, who are often in specific regions. That's a **bias and fairness** problem (branch 7), not just data loss.
+- **A skewed client clock** sends event time into the future. The watermark jumps ahead, and **everything else becomes "late"** and gets dropped. Fix: clamp event times to the server time plus a tolerance, and base the watermark on trusted time.
+- **An idle partition stalls the watermark,** and windows never close. Configure idle-source handling.
+- **Dedup TTL shorter than the replay period:** a long outage replay re-introduces duplicates.
+- **ID generated at ingestion instead of at the source:** dedup silently does nothing.
+- **Fraudsters exploiting ordering:** backdated client timestamps put their burst into an older window.
+
+### Trade-offs
+- **Latency vs completeness:** set the watermark delay per use case. Fraud velocity uses a short delay and accepts incompleteness, but logs what was served. Daily reporting uses a long delay.
+- **Dedup accuracy vs memory:** exact state vs Bloom filters.
+- **Exactly-once machinery vs simplicity:** Flink transactions add latency and complexity. Often **at-least-once plus idempotent sinks** is simpler and good enough.
+
+### Connections to the rest of the system
+- **1.3:** `event_id` and server timestamps from the logging design are what make this part solvable.
+- **1.4:** late arrival widens the gap between event time and availability time.
+- **2.1:** windows and state are where lateness and duplicates cause damage.
+- **2.2:** idempotent partition overwrites are the batch version of this part.
+- **2.3:** CDC ordering by `lsn` and snapshot overlap.
+- **2.5:** backfills are large, deliberate replays, so everything here must hold.
+- **Branch 4:** chargebacks are the most extreme late event.
+- **Branch 7:** skew and bias caused by late-event handling.
+
+<Callout title="Exercise 2.4">
+
+The PayFlow feature `tx_count_card_5m` runs in Flink.
+
+**Q1.** During a latency spike, the payment gateway **times out and retries** each authorization request up to 3 times. The original requests usually did succeed; only the responses were slow.
+- What happens to `tx_count_card_5m` and to fraud decisions for normal customers?
+- **Where** must the dedup ID be created, and how does Flink use it?
+
+**Q2.** The watermark is `max event time − 10 s`, using client timestamps. One merchant's POS terminals have clocks **2 hours fast**. What happens to *every other merchant's* events? Give **two** fixes.
+
+**Q3.** Flink is configured for exactly-once. After a crash and replay, the issuing bank reports receiving the **"block card" webhook twice** for 800 cards. Why didn't exactly-once prevent this, and what's the fix?
+
+</Callout>
+
+<details>
+<summary>Answer key 2.4</summary>
+
+**Q1:**
+- **Effect:** each retry is counted as a new transaction, so counts roughly triple. Normal customers look like card-testing bursts and **get blocked**. More latency causes more retries, which cause more blocks, a **positive feedback loop**.
+- **Dedup ID:** an idempotency key created **by the client or merchant when the payment request is created**, and reused on every retry. Flink keys by card, keeps seen IDs in state with a TTL longer than the retry period, and counts *distinct* IDs. Ideally the gateway also dedups authorizations by that key.
+
+**Q2:**
+- **Effect:** the watermark jumps 2h ahead, so every other merchant's events count as "late" and get **dropped**. Velocity features undercount everywhere, and fraud passes.
+- **Fixes:**
+  - Use the server receive time as event time for security-critical features.
+  - Clamp client timestamps to `server_time ± tolerance`.
+  - Alert on clock skew per source, and quarantine sources that are badly off.
+
+**Q3:**
+- **Why exactly-once didn't help:** it covers Flink's **internal state and transactional sinks**. An HTTP webhook is an external side effect, and it runs again during the replay from the last checkpoint.
+- **Fix:**
+  - A deterministic idempotency key per decision (`card_id + decision_id`) that the bank deduplicates.
+  - Or: write decisions to a transactional Kafka topic, and have an idempotent dispatcher (outbox pattern) record which IDs it has sent.
+
+</details>
+
+## 2.5 Backfills and reprocessing
+
+### The first principle
+
+> **Pipeline logic changes all the time, and the past has to be recomputed with the new logic, as if the new logic had been running back then.**
+
+**Backfill** means running a pipeline over historical partitions. **Reprocessing** means recomputing outputs that already exist, after a fix. ML teams do this constantly, because **every new feature needs months of history before a model can train on it.**
+
+When you need it:
+- **A new feature** needs 12 months of values for training.
+- **A bug fix** in feature logic means past values were wrong.
+- **Late or corrected source data** (2.4) means some partitions are stale.
+- **Recovery from a gap** (the CDC outage in 2.3).
+- **A schema migration** or a change of format.
+
+### How it works
+
+**Batch:** the orchestrator runs the job over a date range (Airflow backfill, Dagster partition ranges). This is safe *only because* tasks are **idempotent overwrites per partition** (2.2): reruns and partial failures don't do harm.
+
+**Streaming (Kappa, from 2.1):** start a **second instance** of the stream job reading archived history (Kafka tiered storage, or the lake in bounded mode), write to a **new versioned output**, and switch once it catches up.
+
+### The hard part: point-in-time fidelity
+
+A backfill must reproduce what serving **would have computed at time T**, not what's true now. Backfills are naturally *too good*:
+- They see **late events** that serving didn't have yet (2.4).
+- They see **corrected data** (refunds, fixed country codes).
+- They use **today's lookup tables** (FX rates, vendor scores). That's exercise 1.1B again.
+- They don't have serving's **staleness** (1.4).
+
+Result: the backfilled feature looks great offline, and the improvement never shows up online.
+
+**The key technique is a parity check.** For any period where you have both, compare **backfilled values against logged served values** (1.3). If they differ, the backfill logic is wrong. Check this before trusting the backfill.
+
+### A safe backfill workflow
+
+<Diagram src="data/safe-backfill-workflow.svg" />
+
+1. **Write to a new version** (`features_v2`). Never overwrite what production reads in place. Consumers stay pinned to v1 until you switch.
+2. **Throttle it.** Run a separate resource pool with limited parallelism, so 365 partitions don't starve production jobs (the 2.2 stampede).
+3. **Parity check** against logged values on the overlap period. If they don't match, fix the logic and rerun.
+4. **Retrain** on v2 values.
+5. **Switch the online feature and the model together.**
+6. **Monitor** the feature and score distributions after the switch.
+
+### The lesson most teams learn the hard way: fixing a feature can hurt the model
+
+The deployed model was **trained on the buggy values** and learned their distribution. Deploy the *fixed* feature to serving without retraining, and the model now gets inputs unlike anything it trained on. **Performance can drop even though the data is now more correct.**
+
+The rule: **a change to feature logic, the backfill, the retrain, and the deployment are one coordinated release.** Otherwise, keep the old logic available (a "bug-compatible" v1) for the old model until the new model ships.
+
+### New features: order of operations
+
+A new feature must exist in *both* stores before the model that uses it goes live:
+
+1. Backfill the **offline store**.
+2. Train and evaluate.
+3. **Load the online store** (bootstrap values for *all* active entities, not just new activity).
+4. **Check online coverage**: the null rate is near what training saw.
+5. **Deploy the model.**
+
+If you skip step 3 or 4, the model serves with nulls for most entities, giving train-serve skew on day one.
+
+### Assumptions
+- **Raw (bronze) data is kept and immutable** (2.2) for the whole backfill period.
+- **Source history exists**: CDC or snapshots or logs going back far enough (2.3).
+- Transforms are **deterministic**: no `now()`, no unseeded randomness, no "pick any row" dedup.
+- **Availability metadata** (ingest time, publish time) is stored, so staleness can be simulated.
+- Historical versions of **lookup data** (FX rates, vendor responses, reference tables) are kept.
+
+### Failure modes
+- **Backfill too good:** it uses complete or corrected data, so offline gains disappear online.
+- **In-place overwrite:** production reads half-backfilled tables, and training sets mix versions.
+- **Forgotten retrain cascade:** feature fixed, model not retrained, performance drops.
+- **External calls during backfill:** calling the vendor API today for 2025's IPs gives *today's* answers and leaks. Also expensive, and you'll hit rate limits.
+- **Silent partial backfill:** 12 of 365 partitions failed, nobody noticed, and training has holes. Check partition completeness before using the output.
+- **Retention got there first:** bronze older than 6 months was deleted, so the backfill can't reach 12 months.
+- **Cost blowout:** nobody estimated compute × partitions beforehand.
+- **Non-deterministic output:** two runs of the same backfill give different training sets, so results can't be reproduced.
+
+### Trade-offs
+- **Backfill depth vs cost vs relevance:** more history costs more, and fraud patterns drift, so old data is worth less. Often 6–12 months is enough.
+- **Log-and-wait vs backfill now:** logged features are exact but take months to build up; backfills are fast but risk skew. Common approach: backfill to start, and move to logged values as they accumulate.
+- **Exact reproduction vs simplicity:** fully simulating availability time is expensive. Decide per feature, based on how sensitive it is to lateness and staleness.
+
+### Connections to the rest of the system
+- **1.3:** logged served values are the reference for parity checks.
+- **1.4:** backfills must reproduce availability and staleness.
+- **2.2:** idempotent partitions, an immutable bronze layer, and throttling.
+- **2.3 / 2.4:** history sources, and replays that have to handle duplicates and late events.
+- **Branch 3:** versioned tables, time travel, retention policy.
+- **Stage 4 feature store:** backfill and materialization APIs.
+- **Stages 5 and 7:** the coordinated retrain-and-deploy release.
+
+<Callout title="Exercise 2.5">
+
+PayFlow discovers that `amount_usd` used **weekly FX rates instead of daily** for the last 6 months. The error is small for USD transactions and up to 8% for volatile currencies (TRY, ARS). On **Friday afternoon**, the engineer:
+- a) fixes the serving code and deploys it immediately,
+- b) re-runs the offline feature job **over the last 6 months, overwriting the production feature table in place**,
+- c) plans to retrain "next month."
+
+1. Name **at least three** things that go wrong, and who or what is affected.
+2. Write the correct sequence of steps.
+3. The daily FX rates for those 6 months: where must they come from, and why does it matter?
+
+</Callout>
+
+<details>
+<summary>Answer key 2.5</summary>
+
+1. **What goes wrong:**
+   - **(a)** The live model was trained on weekly-FX values and now receives daily-FX values. For TRY and ARS that's a distribution shift of up to 8%, so those customers get mis-scored: wrongly blocked, or fraud missed, for about a month. And it was deployed on a Friday, when nobody is watching.
+   - **(b)** Overwriting in place:
+     - Production readers see a half-rewritten table, so training sets mix versions.
+     - There's no rollback.
+     - The old values, needed for parity checks and for a bug-compatible v1, are gone.
+   - **(c)** The mismatch lasts until the retrain. On top of that, the monitoring baselines shift and fire noisy drift alerts.
+2. **Correct sequence:**
+   1. Keep serving on the old logic.
+   2. Backfill to `features_v2` (throttled), using point-in-time daily FX rates.
+   3. Parity check: run the new serving code in shadow and compare it with v2 on recent days.
+   4. Retrain on v2 and evaluate by currency slice.
+   5. Deploy the new feature logic and the new model **together**, early in the week, with a canary.
+   6. Monitor by currency, then retire v1.
+3. **FX rates:** they must come from a **versioned history of daily rates, as published at the time**, from the same provider serving uses. Not today's API, and not revised rates. Otherwise you get leakage and skew (1.1B, 1.4).
+
+</details>

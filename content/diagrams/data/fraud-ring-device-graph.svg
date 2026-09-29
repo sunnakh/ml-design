@@ -1,0 +1,21 @@
+<svg width="100%" viewBox="0 0 680 330" role="img"><title>Fraud ring as a graph</title><desc>Four accounts share one device and one card, forming a fraud ring inside a dashed boundary. A fifth, clean account uses its own device and is not connected to the ring.</desc>
+<rect x="50" y="36" width="430" height="240" rx="8" fill="none" stroke="var(--border-danger)" stroke-width="0.5" stroke-dasharray="4 3"/>
+<line x1="100" y1="122" x2="150" y2="198" stroke="var(--text-secondary)" stroke-width="0.8"/>
+<line x1="210" y1="122" x2="180" y2="198" stroke="var(--text-secondary)" stroke-width="0.8"/>
+<line x1="320" y1="122" x2="210" y2="198" stroke="var(--text-secondary)" stroke-width="0.8"/>
+<line x1="220" y1="122" x2="340" y2="198" stroke="var(--text-secondary)" stroke-width="0.8"/>
+<line x1="330" y1="122" x2="365" y2="198" stroke="var(--text-secondary)" stroke-width="0.8"/>
+<line x1="430" y1="122" x2="395" y2="198" stroke="var(--text-secondary)" stroke-width="0.8"/>
+<line x1="570" y1="122" x2="570" y2="198" stroke="var(--text-secondary)" stroke-width="0.8"/>
+<g class="c-purple"><circle cx="100" cy="90" r="32" stroke-width="0.5"/><text class="th" x="100" y="90" text-anchor="middle" dominant-baseline="central">Acct 1</text></g>
+<g class="c-purple"><circle cx="215" cy="90" r="32" stroke-width="0.5"/><text class="th" x="215" y="90" text-anchor="middle" dominant-baseline="central">Acct 2</text></g>
+<g class="c-purple"><circle cx="325" cy="90" r="32" stroke-width="0.5"/><text class="th" x="325" y="90" text-anchor="middle" dominant-baseline="central">Acct 3</text></g>
+<g class="c-purple"><circle cx="430" cy="90" r="32" stroke-width="0.5"/><text class="th" x="430" y="90" text-anchor="middle" dominant-baseline="central">Acct 4</text></g>
+<g class="c-purple"><circle cx="570" cy="90" r="32" stroke-width="0.5"/><text class="th" x="570" y="90" text-anchor="middle" dominant-baseline="central">Acct 5</text></g>
+<g class="c-teal"><rect x="100" y="200" width="130" height="44" rx="4" stroke-width="0.5"/><text class="th" x="165" y="222" text-anchor="middle" dominant-baseline="central">Device d-91</text></g>
+<g class="c-teal"><rect x="300" y="200" width="130" height="44" rx="4" stroke-width="0.5"/><text class="th" x="365" y="222" text-anchor="middle" dominant-baseline="central">Card ...4242</text></g>
+<g class="c-teal"><rect x="505" y="200" width="130" height="44" rx="4" stroke-width="0.5"/><text class="th" x="570" y="222" text-anchor="middle" dominant-baseline="central">Device d-17</text></g>
+<text class="ts" x="66" y="262" dominant-baseline="central">Fraud ring: connected component</text>
+<g class="c-purple"><circle cx="56" cy="304" r="6" stroke-width="0.5"/></g><text class="ts" x="70" y="304" dominant-baseline="central">Account</text>
+<g class="c-teal"><rect x="150" y="298" width="12" height="12" rx="2" stroke-width="0.5"/></g><text class="ts" x="170" y="304" dominant-baseline="central">Shared identifier</text>
+</svg>

@@ -1,0 +1,553 @@
+---
+title: 3. Storage & management
+description: Where data lives and how it stays reproducible.
+---
+
+## 3.1 Storage systems and their roles
+
+### The first principle
+
+> **Different consumers need contradictory guarantees, so an ML platform is several stores kept in sync, each with one job.**
+
+| Consumer | Needs |
+|---|---|
+| The product (payments) | Transactional correctness, many small reads and writes, current state |
+| Training and analytics | Cheap scans of billions of rows, full history |
+| Online scoring | Point lookups by key in **~1–5 ms at p99**, latest values only |
+
+No single system does all three well. For each store, ask: **who reads it, how, how fast, and how much?**
+
+### The systems
+
+| System | Examples | Layout / access | Strength | Weakness | PayFlow role |
+|---|---|---|---|---|---|
+| **OLTP database** | Postgres, MySQL, DynamoDB | Rows, transactions | Correct current state | Scans hurt production; mutable (1.1) | Source of truth for accounts, cards |
+| **Data warehouse** | Snowflake, BigQuery, Redshift | Columnar, SQL, managed | Easy, fast SQL analytics | Cost per scan; proprietary storage; awkward for Python/GPU training and images | Analytics, SQL features |
+| **Data lake** | S3/GCS + Parquet | Files in object storage | Cheapest; any format (images, logs) | No ACID, no schema, becomes a "swamp" | Raw archive |
+| **Lakehouse** | Iceberg/Delta/Hudi on S3, queried by Spark, Trino, Snowflake… | Lake + table format | ACID, time travel, open format, one copy for SQL *and* ML | More moving parts than a warehouse | **Main historical store: bronze/silver/gold + offline features** |
+| **Online store** | Redis, DynamoDB, Cassandra/Scylla, Bigtable | Key-value | Point reads in ms at high QPS | Latest values only; RAM cost; no scans | Features for scoring |
+| **Object store for blobs** | S3 + metadata table | Blobs addressed by key | Cheap, unlimited | Needs a separate index | KYC images |
+| **Vector DB** | pgvector, Milvus, Pinecone… | Approximate nearest-neighbor | "Find similar" at scale | Approximate; index build cost | Optional: similar devices or merchants |
+
+### How PayFlow's stores fit together
+
+<Diagram src="data/storage-systems-roles.svg" />
+
+The lakehouse is the **one historical source of truth**. Everything else is either a source that feeds it (Postgres, Kafka) or a copy derived from it for fast reads (the online store). Flink also writes velocity features into Redis directly (2.1), which the diagram leaves out for clarity.
+
+### The online store: where latency is decided
+
+**Request path:** each scoring call needs features for about 5 entities: card, user, device, merchant, IP. That's **5 parallel lookups within about 10 ms**. At 5,000 tx/s, it's **~25,000 reads/s**, and the **p99** matters, not the average.
+
+**Key design:** one key per entity, with that entity's features stored together in one value:
+```
+key:   card:4f9a...            (tokenized: never a raw card number, branch 8)
+value: {tx_count_5m: 3, amount_mean_30d: 84.2, ..., _updated_at: 1773652320}
+TTL:   deliberate choice (see failure modes)
+```
+- One read per entity, instead of one per feature.
+- Store `_updated_at` so scoring can **detect stale values** and log that fact (1.3).
+
+**Main choice: Redis vs a disk-based key-value store:**
+
+| | Redis (in memory) | DynamoDB / Cassandra / Scylla |
+|---|---|---|
+| p99 latency | Sub-ms to ~1 ms | ~2–10 ms |
+| Cost | **RAM** (expensive at hundreds of GB) | Disk (much cheaper per GB) |
+| Durability | Needs replication/persistence configured | Durable by default |
+| Behavior when memory runs out | **Evicts keys** (dangerous, see below) | Grows onto disk |
+
+**Rule of thumb:** size it first: entities × features × bytes × overhead. If it fits in RAM at a reasonable cost and you need sub-ms reads, use Redis. Otherwise use a disk-based key-value store.
+
+### The offline store
+
+This is the lakehouse table of **every feature value over time**, keyed by `(entity_id, available_at)`, and used for point-in-time joins (1.4). The online store holds only the **latest** row per entity; the offline store holds **all** of them.
+
+They're written by the same pipelines. **When online and offline disagree, you get train-serve skew.** That's why a feature store writes to both from one definition.
+
+### Assumptions
+- Online values are *eventually consistent* with offline ones, and the lag is known and small.
+- The online store has capacity for **peak** load (Black Friday), not the average.
+- Every entity scoring might ask about is present, or its absence is handled explicitly.
+
+### Failure modes
+- **Eviction turns into silent nulls.** Redis hits its memory limit and, with an `allkeys-lru` policy, drops the least-recently-used keys. Scoring gets "not found" for those entities, fills in defaults, and the model sees a "new, clean" entity.
+- **TTL expiry on dormant entities.** Features expire after 30 days of inactivity. A **stolen card that's been dormant** comes back with no history, which is exactly the fraud pattern you most need history for.
+- **Online/offline divergence:** separate write paths (Flink writes online, Spark writes offline) with slightly different logic.
+- **Hot keys:** a giant merchant's key gets read thousands of times per second and overloads one shard. Fix: replicate it, or cache it locally in the scoring service.
+- **Cross-region lag:** scoring in the EU reads a replica that's minutes behind the US writer.
+- **Training directly on the OLTP replica:** load on production, plus mutable-state leakage (1.1).
+- **Warehouse cost blowout:** training jobs run `SELECT *` with no partition filter, scanning petabytes every night (3.2).
+- **Data swamp:** an unmanaged lake where nobody knows which table is correct (3.3).
+
+### Trade-offs
+- **Warehouse vs lakehouse:** managed simplicity vs openness, cost, and ML-friendliness. Common now: a lakehouse in open formats, *read* by the warehouse engine.
+- **Redis vs disk-based key-value:** latency vs cost and durability.
+- **One copy vs derived copies:** every copy (online store, caches, exports) is a sync problem. Derive copies only for a real access-pattern need, and always **one way**, from the source of truth.
+
+### Connections to the rest of the system
+- **1.1 / 2.3:** OLTP is a source, reached through CDC, not a training store.
+- **2.1:** online/offline split; Flink and batch both write online.
+- **2.2:** the lakehouse is built from table formats and medallion layers.
+- **3.2 / 3.3:** partitioning and cost; versioning and time travel.
+- **Stage 4 feature store:** manages both stores from one definition.
+- **Stage 7 serving:** the online store's p99 is part of the 100 ms budget.
+- **Branch 8:** keys are tokenized, and access to the stores is controlled.
+
+<Callout title="Exercise 3.1">
+
+**Q1 (sizing).** PayFlow wants card-level features in the online store:
+- **300M cards**, **60 features** each, about **8 bytes** per feature.
+- Key plus data-structure overhead is about **×3** the raw size.
+- Traffic: **25,000 reads/s at peak**, p99 budget **10 ms** for all lookups.
+
+a) Estimate the memory needed. Show the math.
+b) Redis or DynamoDB/Cassandra? Justify with your number and the latency budget.
+
+**Q2 (incident).** Redis ran out of memory during a traffic spike. With `allkeys-lru`, it evicted features for cards **inactive for 2+ weeks**.
+- a) What does the fraud model see for those cards?
+- b) Why do fraudsters benefit specifically?
+- c) Give **two** fixes: one for the store, one for the scoring logic.
+
+</Callout>
+
+<details>
+<summary>Answer key 3.1</summary>
+
+**Q1:**
+- **a)** 300M × 60 × 8 B = **144 GB** raw. × 3 overhead ≈ **~430 GB**, or **~860 GB** with a replica.
+- **b)** Both options meet the budget, since the 5 parallel lookups run concurrently and fit well inside 10 ms either way. Redis costs a lot of RAM here; a disk-based key-value store (Scylla, DynamoDB) is much cheaper and still makes the budget. Good answers either justify disk-based on cost, or propose **tiering**: Redis for hot, active cards, and a disk store for the rest.
+- **Size reduction** also counts: smaller types, dropping unused features. But *not* dropping inactive cards; see Q2.
+
+**Q2:**
+- **a)** "Key missing" → defaults. The card looks brand new and clean: zero velocity, no history.
+- **b)** Stolen cards are often dormant before they're used. Eviction erases exactly the "dormant card suddenly active, unusual amount" signal.
+- **c) Fixes:**
+  - **Store:** a `noeviction` policy plus capacity alerts and headroom for peak, or a disk-backed tier for cold entities. No short TTLs on card features.
+  - **Scoring:** tell *missing* apart from *new* (check the card's creation date), log a `feature_missing` flag, fall back to the cold store, and alert on the miss rate.
+
+</details>
+
+## 3.2 Partitioning, layout, compaction, retention and cost
+
+### The first principle
+
+> **At scale, speed and cost are set by how many bytes you touch. Layout decides how many bytes a query touches.**
+
+Two goals: **read only what you need**, and **keep only what you need**.
+
+Cost reality for PayFlow (rough numbers):
+- About 432M transactions/day at ~500 B compressed per row ≈ **~215 GB/day ≈ ~80 TB/year**.
+- **Storage** of that year on S3: roughly $1.8k/month. Cheap.
+- A training job **scanning the full year** at ~$5/TB: about $400 per run. Run daily, that's **~$12k/month**. With column pruning (13%) and partition pruning, it's a small fraction of that.
+
+**Storage is cheap; scans are expensive.** Layout is how you control what gets scanned.
+
+### How pruning works
+
+<Diagram src="data/partition-and-file-pruning-illustration.svg" />
+
+Query: *"card X's transactions on Mar 12–13."* Pruning happens at two levels:
+1. **Partition pruning:** the date filter throws away 5 of the 7 partitions without opening them.
+2. **File skipping:** each file stores min/max statistics per column. Because the data is **clustered by `card_id`**, only one file per partition can contain card X.
+
+Result: 2 files read out of 21. Without clustering it would be 6; without partitioning, all 21.
+
+### 1. Partitioning
+
+**How it works:** the table is split physically into directories by a column: `transactions/dt=2026-03-14/…`. Queries that filter on that column skip the other directories.
+
+**Choosing the partition key:**
+- Use the **most common filter**. For ML that's almost always **time** (training windows, backfills, retention).
+- Aim for **moderate cardinality**: partitions of roughly 1 GB up to hundreds of GB. Daily is typical; hourly if volume is very high.
+- **Never partition by a high-cardinality key** (`merchant_id`, `card_id`). That gives millions of tiny partitions. Cluster by those keys instead (below).
+
+**Event time vs ingestion time** (links to 2.4):
+
+| Partition by | Pros | Cons |
+|---|---|---|
+| **Event date** | Queries by business time prune well | Late events force **rewrites of old partitions**; a partition is never really "done" |
+| **Ingestion date** | Append-only, easy idempotent overwrites, easy to reason about availability (1.4) | Queries by event time scan extra days |
+
+Common pattern: **partition by ingestion date**, keep `event_ts` as a clustered column, and filter with a small margin. Iceberg's *hidden partitioning* and *partition evolution* let you change this later without rewriting queries.
+
+### 2. Layout inside partitions
+
+- **File size:** target roughly **128 MB–1 GB**. Too small means metadata overhead and slow listing. Too large means poor parallelism and coarse skipping.
+- **Sorting / clustering (Z-order, Iceberg sort order):** sort by the columns you look up (`card_id`, `merchant_id`) so the min/max statistics become narrow and file skipping works.
+- **Bucketing by entity key:** hash-distribute by `card_id` into N buckets in both big tables. Joins then happen **bucket-to-bucket without a shuffle**, which is a big win for large point-in-time joins (1.4).
+
+### 3. Compaction
+
+**Problem:** streaming sinks and frequent `MERGE`s (2.3) create **many small files and delete files**. Reads slow down sharply.
+
+**How it works:** a scheduled job rewrites small files into large, sorted ones. Table formats offer two write modes:
+
+| Mode | Writes | Reads | Needs |
+|---|---|---|---|
+| **Copy-on-write (COW)** | Slow: rewrite whole files on update | Fast | Fine for batch, occasional updates |
+| **Merge-on-read (MOR)** | Fast: write small delta/delete files | Slower: merges deltas at read time | **Regular compaction**; good for CDC and streaming |
+
+Compaction also **reclaims space after deletes** (GDPR, branch 8). A delete in MOR mode isn't physically done until compaction and snapshot expiry both run.
+
+### 4. Retention and tiering
+
+**Storage tiers:**
+
+| Tier | Example | Cost | Access |
+|---|---|---|---|
+| Hot | S3 Standard / fast disk | $$ | Instant |
+| Warm | S3 Infrequent Access | $ | Instant, fee per read |
+| Cold | Glacier / archive | ¢ | **Minutes to hours, costly to retrieve** |
+
+**A retention policy is a system-wide constraint, not a storage setting.** It has to satisfy, all at once:
+- **Backfill depth** (2.5): how far back new features might need to go.
+- **Label delay** (1.4, branch 4): prediction logs must outlive the chargeback window, or labels can't join.
+- **Reproducibility** (3.3): training sets and time-travel snapshots have to live as long as you need to reproduce models.
+- **Law**: GDPR data minimization, PCI, and financial record-keeping (sometimes you're *required* to keep records for years). Branch 8.
+- **Cost.**
+
+**Rules by layer:**
+- **Bronze:** the longest retention the law allows. You can't rebuild it.
+- **Silver and gold:** can be shorter, since they're rebuildable from bronze. Weigh the savings against the cost of a rebuild.
+- **Prediction logs:** at least the training window **plus** the label maturity window, plus audit needs.
+- **Table snapshots (time travel):** expire old snapshots or storage keeps growing. But expiring too early breaks reproducibility (3.3).
+
+### Failure modes
+- **A query with no partition filter** does a full scan: a surprise $$$ bill, and slow training.
+- **A function on the partition column** (`WHERE DATE(ts) = ...` on a derived column) defeats pruning in some engines.
+- **Over-partitioning** (date × merchant) gives millions of tiny files, and the metastore struggles.
+- **Partition skew:** the Black Friday partition is 5× bigger. One task straggles and the job misses its SLA.
+- **Time-zone boundaries:** one pipeline partitions by UTC day, another by local day. Joins misalign at day edges.
+- **Retention shorter than the label delay:** prediction logs are deleted after 60 days, but chargebacks arrive up to 90 days later. **Those labels can't join**, and the fraud cases disappear from training.
+- **Automatic tiering hitting training:** a lifecycle rule moves month 4+ to Glacier. The next training job fails or runs up big retrieval costs.
+- **Snapshot expiry vs reproducibility:** "retrain the model from March" fails because the files are gone.
+
+### Trade-offs
+- **Partition granularity:** fine gives better pruning but more files; coarse is the reverse.
+- **COW vs MOR:** read speed vs write speed.
+- **Retention:** cost and privacy vs backfill ability, labels, and reproducibility.
+- **Clustering effort:** sorting costs compute when writing, and saves it on every read. Worth it for tables that get read often.
+
+### Connections to the rest of the system
+- **2.2:** columnar formats, the small-files problem, idempotent partition overwrites.
+- **2.3:** CDC `MERGE`s create delete files, so MOR tables need compaction.
+- **2.4:** late events push toward partitioning by ingestion date.
+- **2.5:** retention sets the maximum backfill depth.
+- **3.3:** snapshot retention decides how far back you can reproduce.
+- **3.4:** the layout decides how fast training reads data.
+- **Branch 4:** label delay sets a minimum retention.
+- **Branch 8:** data minimization and deletes vs keeping records.
+
+<Callout title="Exercise 3.2">
+
+**Q1.** An engineer sets up the new `prediction_logs` table **partitioned by `(event_date, merchant_id)`**. PayFlow has **2M merchants**, mostly small.
+a) What goes wrong?
+b) Propose a better layout (partitioning **and** clustering) for the two main queries: *"all predictions for training window X"* and *"all predictions for merchant M last week."*
+
+**Q2.** Finance proposes this retention policy to cut costs:
+- bronze: **60 days**
+- prediction_logs: **60 days**
+- gold features: **2 years**
+- lifecycle rule: anything older than **30 days** moves to Glacier
+
+Using what you know about **chargeback delay (30–90 days)**, **backfills (2.5)**, and **how training reads data**, find **at least three** conflicts, and propose a fixed policy.
+
+</Callout>
+
+<details>
+<summary>Answer key 3.2</summary>
+
+**Q1:**
+- **a)** 2M merchants × 365 days is up to **~730M partitions** a year, mostly tiny files. The metastore gets overloaded, query planning is slow, and listing takes forever.
+- **b)** Partition by **ingestion date** (or Iceberg `day(ts)`), and **cluster, sort, or bucket by `merchant_id`**.
+  - "Training window X" prunes by date.
+  - "Merchant M last week" prunes to 7 partitions, then file-skips by the sorted `merchant_id`.
+
+**Q2 conflicts:**
+1. Prediction logs kept 60 days, but chargebacks take up to 90: **labels can't join**.
+2. Bronze kept 60 days: backfills and gold rebuilds can only go back 60 days, even though gold is kept 2 years and can't be rebuilt if a bug is found (2.5).
+3. Glacier after 30 days: training reads 6–12 months, and with the 90-day label maturity window, *all* mature training data would be in Glacier. Result: failures or huge retrieval costs.
+4. Law: financial record-keeping may require *years*, while GDPR minimization pushes the other way.
+
+**Fixed policy:**
+- bronze (tokenized) ≥ maximum backfill depth, e.g. 18–24 months
+- prediction logs ≥ training window + 90-day maturity + audit, e.g. 24 months
+- gold around 13 months (rebuildable)
+- hot/warm tier ≥ training window + maturity, then cold
+- snapshot expiry matched to how long models must be reproducible
+
+</details>
+
+## 3.3 Versioning, lineage, reproducibility
+
+### The first principle
+
+> **model = f(code, data, config, environment, randomness)**
+
+To debug, roll back, audit, or compare a model, you must be able to **pin every one of those inputs**. Git versions code automatically. **Data isn't versioned by default**: it changes, grows, gets corrected, and gets deleted. So the question a production ML system has to answer is:
+
+> *"Can I rebuild model v42's exact training set, and explain any decision it made?"*
+
+In fintech this isn't optional. Model-risk regulation (e.g. US SR 11-7 for banks) and dispute handling require an audit trail.
+
+### Problems this solves
+- **Debugging regressions:** v43 is worse than v42. Was it the data, the code, the config, or the environment?
+- **Rollback:** go back to v42 *and* the exact features it expects (2.5).
+- **Audit and disputes:** "Why was customer C declined on Mar 14 at 14:03?"
+- **Fair experiments:** comparing two models only means something if they trained on the same data.
+- **Incident blast radius:** "The FX bug: which features, models, and decisions did it touch?"
+- **Deletion requests:** "Which datasets and models contain user X?" (branch 8)
+
+### What to version
+
+| Artifact | How it's versioned | PayFlow |
+|---|---|---|
+| Source data | Immutable bronze + **table snapshots** (Iceberg snapshot ID, Delta version) | `silver.transactions@snapshot 8812934` |
+| Feature definitions | Git + feature registry version | `fraud_features_v7` |
+| **Training sets** | A **manifest** (below), optionally materialized | `fraud_ts_2026_03_14` |
+| Models | Model registry (MLflow, etc.) linked to the manifest, commit, container digest, hyperparameters, seed | `fraud-gbt-v42` |
+| Predictions | Prediction logs with `model_version` (1.3) | per decision |
+
+### The training-set manifest
+
+This is the core artifact of reproducibility. Everything needed to rebuild the dataset exactly:
+
+```yaml
+training_set: fraud_ts_2026_03_14
+pipeline_commit: a1b2c3d
+sources:                              # pinned snapshots, never "latest"
+  silver.transactions: iceberg_snapshot 8812934
+  gold.card_features:  iceberg_snapshot 8812990
+  labels.chargebacks:  iceberg_snapshot 8813001
+  ref.fx_rates_daily:  iceberg_snapshot 8790112   # lookup tables too
+time_range: [2025-03-01, 2025-12-01)  # event time
+label_cutoff: 2026-03-01              # only labels known by this date (maturity)
+feature_set: fraud_features_v7
+split: {method: temporal, valid_from: 2025-10-01, test_from: 2025-11-01}
+sampling: {negatives_rate: 0.05, seed: 17, weight_column: w}
+row_count: 41203551
+content_hash: sha256:9c1e...
+```
+
+The model registry entry points to this manifest, plus the container image digest, hyperparameters, random seed, and evaluation metrics.
+
+### Two ways to make a training set reproducible
+
+| Approach | How | Pros | Cons |
+|---|---|---|---|
+| **Materialize** | Save the exact training set (Parquet) under an ID | Exact, fast to reload, doesn't depend on snapshots | Storage cost; **every copy is a PII copy that deletion requests must reach** |
+| **Reference** | Store the manifest; rebuild via time travel | Cheap; one copy of the data | Depends on snapshot retention (3.2) and **deterministic pipelines** |
+| **Hybrid** (common) | Materialize for production models (kept while live + audit period); reference for experiments | Balanced | Two mechanisms to maintain |
+
+Tools: Iceberg/Delta time travel and tags, lakeFS or DVC (git-like branches and commits over data), MLflow or W&B, feature registries.
+
+### Lineage: the graph that connects it all
+
+Lineage records **which job read which datasets and wrote which outputs**, all the way to models and decisions. Here's the FX bug from exercise 2.5 as a lineage query:
+
+<Diagram src="data/lineage-fx-bug-blast-radius.svg" />
+
+Lineage lets you move in both directions:
+- **Downstream (impact analysis):** a bug in `fx_rates` → which features, training sets, models, and **which customer decisions** it affected.
+- **Upstream (root cause):** v43 got worse → which inputs changed compared with v42?
+
+Tools: OpenLineage/Marquez, DataHub, Unity Catalog. Orchestrators and Spark can emit lineage automatically. **Column-level** lineage (`amount_usd` ← `amount`, `currency`, `fx_rate`) is much more useful than table-level, but costs more to capture.
+
+Lineage also answers the "undeclared consumers" problem from 1.5: producers can see who depends on them.
+
+### Assumptions
+- **Pipelines are deterministic** (2.5): same inputs, same outputs.
+- **Snapshot retention ≥ how far back you need to reproduce** (3.2).
+- **All inputs are versioned**, including lookup tables (FX rates) and vendor responses (logged, per 1.3).
+- **The environment is pinned:** a container digest and library versions. An XGBoost upgrade can change results.
+- **Lineage covers every job.** Ad-hoc scripts and notebooks are the usual gaps.
+
+### Failure modes
+- **References to "latest":** the training query reads the *current* table, so it can never be reproduced. The most common failure.
+- **Expired snapshots:** the manifest points to snapshot 8812934, and it's gone.
+- **Non-determinism:**
+  - unordered dedup ("keep any one row")
+  - unseeded sampling
+  - GPU floating-point non-determinism
+  - silent library upgrades
+- **Unversioned external inputs:** a vendor API or a hand-edited CSV.
+- **Manual notebook steps:** "then I filtered out some weird rows."
+- **Lineage gaps:** the blast-radius analysis misses whatever a script without lineage produced.
+- **Deletion vs exact reproduction:** after a GDPR deletion, the training set **can't** be rebuilt exactly, **and it shouldn't be.** Document "reproducible up to deletions."
+- **Materialized copies multiplying PII:** 40 old training-set copies, each one reachable by a deletion request.
+
+### Trade-offs
+- **Materialize vs reference:** exactness and speed vs storage and privacy exposure.
+- **Exact reproducibility vs cost:** full determinism needs discipline everywhere. Target it for **production models and audits**, not every experiment.
+- **Lineage granularity:** column-level answers more questions but costs more to capture and store.
+
+### Connections to the rest of the system
+- **1.3:** `model_version` in prediction logs links decisions to models.
+- **1.5:** lineage reveals consumers, which makes contracts enforceable.
+- **2.2 / 3.2:** table-format time travel, and snapshot retention.
+- **2.5:** versioned outputs (v1/v2) and coordinated releases.
+- **Branch 4:** `label_cutoff` records label maturity.
+- **Branch 6:** the split and sampling strategy are recorded in the manifest.
+- **Stages 5–8:** experiment tracking, the model registry, rollback.
+- **Branch 8:** deletion propagation and audit.
+
+<Callout title="Exercise 3.3">
+
+**Q1 (audit).** A regulator asks: *"Customer C was declined on 2026-03-14 at 14:03:07. Explain why, and show that the model was trained on appropriate data."*
+List the **chain of artifacts** you'd pull, in order, from the decision back to the raw data. What must each one contain?
+
+**Q2 (debugging).** Model v43's AUC is **0.03 lower** than v42. Using versioning, how do you isolate the cause? Describe the experiments: which factor you change, and which you hold fixed.
+
+**Q3 (deletion).** A GDPR deletion request comes in for a user whose rows are in v42's training set. What happens to reproducibility, and what exactly do you do?
+
+</Callout>
+
+<details>
+<summary>Answer key 3.3</summary>
+
+**Q1: the artifact chain, from decision back to raw data**
+1. **Prediction log record:** transaction ID, timestamp, the **feature values served**, score, threshold, decision, `decision_source`, `model_version`, experiment arm. Plus the policy/rules config version in effect at the time.
+2. **Model registry entry for v42:** the artifact, the manifest reference, code commit, container digest, hyperparameters, evaluation metrics including per-slice metrics, and the approval record.
+3. **Training manifest:** source snapshots, time range, `label_cutoff`, feature-set version, split, sampling.
+4. **Feature definitions** (git commit) and the **source snapshots** (time travel).
+5. **Raw bronze data and labels.**
+
+"Why was C declined" is answered from the **logged features** plus attributions (e.g. SHAP) for model v42.
+
+**Q2: isolating the cause.** The four factors are data (the manifest), code, config/seed, and environment. Change one at a time:
+- Train **v43 code on v42's manifest**. If it's still worse, the cause is code or config.
+- Train **v42 code on v43's data**. If that drops, the cause is data.
+- Check the **seed variance**: is 0.03 more than noise?
+- Evaluate both models on the **same test set**. A different, harder test period is a common hidden cause.
+- Then bisect the data differences: time range, `label_cutoff` (less mature labels are noisier), feature-set version.
+
+**Q3: the deletion request.**
+- Delete from every store: bronze, silver, and gold; prediction logs; **materialized training sets**. Physical removal takes compaction plus snapshot expiry.
+- Check the legal basis first. Fraud prevention may justify keeping some data; that's legal's call.
+- Exact reproduction of v42 is now **impossible, correctly so**. Record "reproducible up to deletions," with a deletion log (counts, no identities).
+- The model is usually retrained on the next regular cycle. Immediate "unlearning" is rarely required.
+
+</details>
+
+## 3.4 Training data access (sharding, shuffling, loaders)
+
+### The first principle
+
+Training reads data **many times** (epochs), **in random order**, **as fast as the processors can use it**. Two things follow:
+1. **The bottleneck is often I/O, not compute.** Expensive GPUs sit idle waiting for data.
+2. **The order of data affects learning.** Stochastic gradient descent assumes each mini-batch is a roughly random sample of the data.
+
+### First question: does it fit in memory?
+
+PayFlow's main fraud model is a GBDT (XGBoost or LightGBM). After negative downsampling (branch 6):
+- **40M rows × 300 features × 4 bytes (float32) ≈ 48 GB.**
+- That fits on one large machine. Load Parquet → Arrow → DMatrix, and train.
+- **No distributed data loading needed.** Don't over-engineer.
+
+The rest of this part matters when it **doesn't fit**. PayFlow's planned **sequence model** over raw event histories uses about **2 billion rows**, trained on GPUs across several workers.
+
+### The loader pipeline
+
+<Diagram src="data/training-data-loader-pipeline.svg" />
+
+### 1. Sharding: parallel reads without overlap
+
+**The problem:** N workers must read the dataset **in parallel**, each example **exactly once per epoch**, with no worker left idle.
+
+**How it works:**
+- Write the training set as **many shard files** (e.g. 512–2,048 files of ~100–500 MB).
+- Each worker (rank) gets its own subset of shards.
+- Keep the **number of shards much larger than the number of workers**, so the load balances even when shard sizes vary.
+
+**Design choices:**
+- **Shard size:** too small hits the small-files problem (2.2) and per-request latency on S3. Too big gives coarse balancing and slow startup.
+- **Equal row counts per shard** avoid stragglers. In synchronous distributed training, every step waits for the slowest worker.
+
+### 2. Shuffling: the conflict with query layout
+
+**Why it matters:** in 3.2, you **sorted data by `card_id` and time** so queries could skip files. Read in that order, a batch of 1,024 rows is **one card's history**, or one day. Gradients from such batches are highly correlated:
+- training becomes unstable or converges slowly
+- the model drifts toward whatever came last
+- if the positive examples are clustered, whole stretches of batches contain no fraud at all
+
+> **The layout that's best for queries (sorted) is the worst layout for training (which needs randomness).** So **training sets are materialized separately**, with their own layout.
+
+**The practical recipe (full global shuffling of billions of rows is expensive):**
+1. **Pre-shuffle once** when writing the training set: rows are written to shards in random order. This is the main mixing step.
+2. **Shuffle the shard order** every epoch, with a seed.
+3. **Shuffle buffer:** the loader holds a window of K rows and samples from it at random. It's cheap, but **only approximate**: randomness is limited to the window size. On sorted input, a buffer of 10k rows still gives batches from just a few cards.
+
+**Split first, then shuffle.** The temporal split (branch 6) happens *first*. Shuffling happens *inside* the training split. Shuffling across the split boundary is leakage.
+
+For **sequence models**, the order *inside* an example (a card's event history) must be preserved. Shuffle **across** examples, never within one.
+
+### 3. Readers and formats: keeping the GPUs busy
+
+**How it works:**
+- Many parallel readers fetch from object storage. A single S3 connection is slow; many concurrent range requests are fast.
+- **Prefetch** the next batches while the current one trains, so I/O overlaps with compute.
+- **Cache** hot shards on local NVMe for multi-epoch jobs.
+
+**Format choices:**
+- **Parquet:** reads by row group; good for tabular data.
+- **WebDataset / TFRecord / Mosaic Streaming:** sequential tar or record shards; great for images and very large streaming datasets.
+- **Lance and other random-access formats:** for sampling-heavy workloads.
+- **Ray Data / Petastorm:** distributed loading from Parquet.
+
+**Diagnosing it:** watch **GPU utilization**. Persistently low utilization with healthy compute usually means the loader can't keep up.
+
+### 4. Transforms at load time: another source of skew
+
+- Do **heavy feature computation offline** (gold, feature store). The loader should only do light work: normalization, encoding, batching.
+- **Normalization statistics** (mean, std, vocabularies) must be:
+  - computed on the **training split only** (otherwise the validation and test sets leak into training)
+  - **saved as an artifact with the model**, so serving applies the *exact same* transform (stage 7). A different normalization at serving time is **train-serve skew**.
+
+### 5. Sampling, determinism, and resuming
+
+- **Negative downsampling with weights** (branch 6) can happen when writing the training set (it's recorded in the manifest, 3.3) or at load time with a **fixed seed**.
+- **Resuming after preemption:** checkpoint the **loader state** (which shards, which offsets) together with the model. Otherwise a resumed job **re-reads the first shards**, over-representing early data, or skips shards.
+- Fix seeds for shard order, the buffer, and sampling, so runs are reproducible (3.3).
+
+### Assumptions
+- The training set is materialized with a training-friendly layout (pre-shuffled, evenly sharded).
+- The data sits in a **hot or warm** tier (3.2), not Glacier.
+- The loader's transforms exactly match serving's.
+
+### Failure modes
+- **GPU starvation:** 80,000 tiny files, one reader thread, no prefetch. Utilization sits at 25%.
+- **Training on sorted data** with a small shuffle buffer: unstable training, poor model, positives bunched together.
+- **Shuffle before split:** leakage across time (branch 6).
+- **Normalization stats computed on all the data**, validation and test included: leakage and optimistic metrics.
+- **Duplicated or skipped examples** across ranks, from bad shard assignment or resuming without loader state.
+- **Uneven shards:** stragglers in synchronous training.
+- **float64 everywhere:** double the memory, plus slower transfers.
+- **Loader transforms ≠ serving transforms:** skew that offline metrics won't show.
+- **Reading from cold storage:** job failures or retrieval bills (3.2).
+
+### Trade-offs
+- **In memory vs streaming:** in memory is simple and fast, and it's the right choice for GBDT at PayFlow's scale. Streaming is needed for billions of rows or images.
+- **Global shuffle quality vs cost:** pre-shuffling costs a write pass; a buffer is cheap but approximate.
+- **Materialized training sets vs reading from the feature store on the fly:** materialized is fast, reproducible, and training-friendly, but each copy holds PII (3.3, branch 8). On the fly is flexible but slower, and read patterns clash with the query-optimized layout.
+- **Shard size and count:** throughput vs balance vs overhead.
+
+### Connections to the rest of the system
+- **2.2:** formats and the small-files problem.
+- **3.2:** query layout vs training layout; storage tiers.
+- **3.3:** determinism, manifests, materialized copies.
+- **Branch 6:** split before shuffling; sampling weights.
+- **Stage 5 (training):** distributed training, preemption.
+- **Stage 7 (serving):** transform artifacts shipped with the model.
+
+<Callout title="Exercise 3.4">
+
+**Q1.** The new sequence model trains on **2B rows** stored **sorted by `(card_id, event_ts)`**, the layout chosen for queries in 3.2. The engineer streams it with a **shuffle buffer of 10,000 rows**, batch size 1,024.
+a) What does a typical batch contain, and why does it hurt training?
+b) What would you change?
+
+**Q2.** A 4-GPU training job shows **~25% GPU utilization**. The data is **80,000 Parquet files of ~2 MB each** in **S3 Infrequent Access**, read by a PyTorch DataLoader with `num_workers=0`. Give **at least three** causes and a fix for each.
+
+**Q3.** The engineer computes feature mean and std over the **entire 12-month dataset**, and then does the temporal train/validation/test split. What's wrong, and what else must happen to those statistics for serving?
+
+</Callout>

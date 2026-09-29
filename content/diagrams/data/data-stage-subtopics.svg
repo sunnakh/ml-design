@@ -1,0 +1,19 @@
+<svg width="100%" viewBox="0 0 680 400" role="img"><title>Data stage subtopics</title><desc>Six-step data pipeline: sources, ingestion, labeling, cleaning, sampling and splits, storage. Below, cross-cutting risks: data leakage, train-serve skew, bias, privacy.</desc><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<g class="node c-teal"><rect x="40" y="40" width="170" height="60" rx="4" stroke-width="0.5"/><text class="th" x="125" y="60" text-anchor="middle" dominant-baseline="central">Sources</text><text class="ts" x="125" y="82" text-anchor="middle" dominant-baseline="central">Logs, DBs, 3rd party</text></g>
+<g class="node c-teal"><rect x="255" y="40" width="170" height="60" rx="4" stroke-width="0.5"/><text class="th" x="340" y="60" text-anchor="middle" dominant-baseline="central">Ingestion</text><text class="ts" x="340" y="82" text-anchor="middle" dominant-baseline="central">Batch vs streaming</text></g>
+<g class="node c-teal"><rect x="470" y="40" width="170" height="60" rx="4" stroke-width="0.5"/><text class="th" x="555" y="60" text-anchor="middle" dominant-baseline="central">Labeling</text><text class="ts" x="555" y="82" text-anchor="middle" dominant-baseline="central">Human, implicit, weak</text></g>
+<g class="node c-teal"><rect x="470" y="160" width="170" height="60" rx="4" stroke-width="0.5"/><text class="th" x="555" y="180" text-anchor="middle" dominant-baseline="central">Cleaning</text><text class="ts" x="555" y="202" text-anchor="middle" dominant-baseline="central">Validate, dedupe</text></g>
+<g class="node c-teal"><rect x="255" y="160" width="170" height="60" rx="4" stroke-width="0.5"/><text class="th" x="340" y="180" text-anchor="middle" dominant-baseline="central">Sampling and splits</text><text class="ts" x="340" y="202" text-anchor="middle" dominant-baseline="central">Imbalance, time split</text></g>
+<g class="node c-teal"><rect x="40" y="160" width="170" height="60" rx="4" stroke-width="0.5"/><text class="th" x="125" y="180" text-anchor="middle" dominant-baseline="central">Storage</text><text class="ts" x="125" y="202" text-anchor="middle" dominant-baseline="central">Versioning, lineage</text></g>
+<line class="arr" x1="212" y1="70" x2="251" y2="70" marker-end="url(#arrow)"/>
+<line class="arr" x1="427" y1="70" x2="466" y2="70" marker-end="url(#arrow)"/>
+<line class="arr" x1="555" y1="102" x2="555" y2="156" marker-end="url(#arrow)"/>
+<line class="arr" x1="468" y1="190" x2="429" y2="190" marker-end="url(#arrow)"/>
+<line class="arr" x1="253" y1="190" x2="214" y2="190" marker-end="url(#arrow)"/>
+<rect x="40" y="258" width="600" height="112" rx="8" fill="none" stroke="var(--border-strong)" stroke-width="0.5" stroke-dasharray="4 3"/>
+<text class="th" x="56" y="280" dominant-baseline="central">Cross-cutting risks</text>
+<g class="node c-coral"><rect x="52" y="302" width="135" height="44" rx="4" stroke-width="0.5"/><text class="th" x="119.5" y="324" text-anchor="middle" dominant-baseline="central">Data leakage</text></g>
+<g class="node c-coral"><rect x="198" y="302" width="135" height="44" rx="4" stroke-width="0.5"/><text class="th" x="265.5" y="324" text-anchor="middle" dominant-baseline="central">Train-serve skew</text></g>
+<g class="node c-coral"><rect x="344" y="302" width="135" height="44" rx="4" stroke-width="0.5"/><text class="th" x="411.5" y="324" text-anchor="middle" dominant-baseline="central">Bias</text></g>
+<g class="node c-coral"><rect x="490" y="302" width="135" height="44" rx="4" stroke-width="0.5"/><text class="th" x="557.5" y="324" text-anchor="middle" dominant-baseline="central">Privacy</text></g>
+</svg>

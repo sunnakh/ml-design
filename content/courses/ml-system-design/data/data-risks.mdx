@@ -1,0 +1,20 @@
+---
+title: 7. Data risks
+description: The failures interviewers look for.
+---
+
+## 7.1 Leakage
+
+A feature contains information about the label that won't exist when the model predicts. The classic cause is a split that isn't time-based.
+
+## 7.2 Train-serve skew
+
+Features are computed one way in training and another in serving. A feature store fixes this.
+
+## 7.3 Bias & feedback loops
+
+Selection bias, and loops where the model only learns from items it chose to show.
+
+## 7.4 Distribution shift
+
+Inputs (covariate shift), label rates (label shift) or the input–label relationship (concept shift) change over time.

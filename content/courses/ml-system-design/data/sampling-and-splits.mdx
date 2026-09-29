@@ -1,0 +1,16 @@
+---
+title: 6. Sampling, imbalance & splits
+description: Choosing which examples to train and test on.
+---
+
+## 6.1 Sampling methods
+
+Stratified, reservoir, importance and negative sampling each control which examples end up in the dataset.
+
+## 6.2 Class imbalance
+
+With 0.1% fraud, downsample the majority class, upweight the minority, or use focal loss, and pick metrics that reflect imbalance.
+
+## 6.3 Temporal & entity-based splits
+
+Split by time when data is time-ordered, and by entity (user, merchant) when examples from one entity are related. Random splits leak information.

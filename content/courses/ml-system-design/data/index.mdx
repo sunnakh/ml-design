@@ -1,0 +1,41 @@
+---
+title: Data
+description: Where the data comes from, how labels are made, and what can go wrong.
+icon: Database
+---
+
+The data stage is a pipeline of 6 steps, with 4 risks that can break any of them.
+
+<Diagram src="data/data-stage-subtopics.svg" />
+
+1. **Sources**: user interaction logs, application databases, third-party data, and labels from people. Ask where each comes from, how fresh it is, and who owns it.
+2. **Ingestion**: batch jobs (daily ETL into a warehouse) or streaming (Kafka → Flink). Use streaming only when features must be fresh within seconds.
+3. **Labeling**: often the hardest step. Human labels are accurate but slow and expensive. Implicit labels (clicks, purchases) are cheap but noisy and biased toward what was shown. Weak supervision uses rules or an LLM. Watch for delayed labels.
+4. **Cleaning**: deduplicate, handle missing values and outliers, validate the schema (Great Expectations, TFDV).
+5. **Sampling and splits**: handle class imbalance (downsample, upweight, focal loss). Split by time, not randomly, whenever the data has a time order.
+6. **Storage**: a lake or warehouse with dataset versioning (DVC, Delta Lake) and lineage, so any training run can be reproduced.
+
+## Running example: PayFlow
+
+PayFlow processes card payments for online merchants. For every payment it has **under 100 ms** to score the transaction for fraud and approve, block, or send it to manual review.
+
+- about 5,000 transactions per second
+- a fraud rate of about 0.1%
+- confirmed fraud arrives as a **chargeback** 30 to 90 days later
+
+## Topic map
+
+<Cards>
+  <Card title="1. Sources & collection" href="/courses/ml-system-design/data/sources-and-collection">Source types · Data types · Instrumentation · Point-in-time availability · Data contracts</Card>
+  <Card title="2. Ingestion & processing" href="/courses/ml-system-design/data/ingestion-and-processing">Batch vs streaming · Formats and ETL · CDC · Late and duplicate events</Card>
+  <Card title="3. Storage & management" href="/courses/ml-system-design/data/storage-and-management">OLTP vs OLAP · Partitioning and retention · Versioning and lineage</Card>
+  <Card title="4. Labeling" href="/courses/ml-system-design/data/labeling">Natural labels · Human annotation · Weak supervision · Noise · Selective labels</Card>
+  <Card title="5. Quality & validation" href="/courses/ml-system-design/data/quality-and-validation">Data checks · Missing values, outliers, dedup</Card>
+  <Card title="6. Sampling, imbalance & splits" href="/courses/ml-system-design/data/sampling-and-splits">Sampling methods · Class imbalance · Temporal splits</Card>
+  <Card title="7. Data risks" href="/courses/ml-system-design/data/data-risks">Leakage · Train-serve skew · Bias · Distribution shift</Card>
+  <Card title="8. Privacy, security & governance" href="/courses/ml-system-design/data/privacy-and-governance">PII and GDPR · Access control · Data poisoning</Card>
+</Cards>
+
+<Callout title="Interview tip">
+  Spend most of your time on **labeling** and **leakage**. That's what separates senior answers.
+</Callout>
