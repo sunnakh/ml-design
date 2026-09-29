@@ -99,6 +99,11 @@ html > body[data-scroll-locked] {
   fill: var(--text-secondary);
 }
 
+.ml-diagram .box {
+  fill: var(--surface-1);
+  stroke: var(--border-strong);
+}
+
 .ml-diagram .arr,
 .ml-diagram .leader {
   fill: none;
