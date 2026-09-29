@@ -1,0 +1,701 @@
+---
+title: 2. Transformations and encoding
+description: Turning raw values into model inputs.
+---
+
+## 2.1 Numeric transformations
+
+### What problem it solves
+
+Raw numbers arrive with shapes that confuse models:
+
+- **Heavy tails.** `amount` runs from $0.50 to $50,000, and most transactions sit under $50. Counts are the same: `txn_count_1h` is mostly 0–2, occasionally 200.
+- **Mismatched scales.** Dollars, days and counts all live on different ranges.
+- **Non-linear or cyclical relationships.** Risk isn't linear in amount. Hour 23 sits next to hour 0.
+- **Outliers**, which in fraud *might be the signal*.
+
+### The first question: which model family?
+
+This decides whether most numeric transforms matter at all.
+
+| Model | Cares about scale? | Why |
+|---|---|---|
+| **Tree ensembles** (GBDT, random forest) | **No**, for monotonic transforms | Trees split on thresholds, and only *order* matters. `log(amount)` gives the same splits as `amount`. |
+| **Linear / logistic** | Yes | The coefficient is per unit, and a heavy tail dominates the fit |
+| **Neural networks** | Yes, a lot | Gradient scale, activation saturation, and optimization stability all depend on input scale |
+| **Distance-based** (kNN, clustering) | Yes | The largest-range feature dominates the distance |
+
+People often add `StandardScaler` to a GBDT pipeline out of habit. It changes nothing except adding one more artifact that can skew. With trees, the transforms worth doing are the ones that **add information**: ratios, per-entity normalization (1.2), cyclical time for adjacency. Pure rescaling adds nothing.
+
+### The core transforms
+
+This is what a log transform does to a heavy tail, and where clipping bites:
+
+<Diagram src="features/amount-heavy-tail-log-transform-clipping.svg" />
+
+In the raw distribution, the tail is squeezed into a few pixels, and a p99 clip would **delete the fraud cases** there. After the log transform, the tail is spread into a usable range.
+
+| Transform | Formula / idea | Use when | Watch out |
+|---|---|---|---|
+| **Standardize** | `(x − μ) / σ` | Linear models, NNs | μ and σ are *fitted artifacts*. Ship them with the model, never refit them online. |
+| **Min-max** | `(x − min) / (max − min)` | Bounded inputs | One outlier squashes everything else |
+| **Log** | `log1p(x)` | Heavy tails: amounts, counts | Negative values (refunds) → use a signed log, `sign(x)·log1p(|x|)`. Zero is fine with `log1p`. |
+| **Clip / winsorize** | Cap at p1 / p99 | NN stability | **Fraud may *be* the outlier.** If you clip, keep an `is_extreme` flag or a top bucket. |
+| **Bucketize** | Quantile or domain bins: &lt;$1, $1–10, … | Linear models needing nonlinearity, robustness, explainability | Loses resolution. Boundaries are fitted artifacts, so freeze them. |
+| **Quantile / rank** | Map to uniform or normal | NNs with messy distributions | Needs the fitted quantile table at serving |
+| **Cyclical** | `sin(2πh/24)`, `cos(2πh/24)` | Hour, weekday, month for NNs and linear models | Trees handle raw hour fine, but lose the 23↔0 adjacency |
+| **Per-entity normalization** | `(amount − card_mean) / card_std` | **Every model family.** This adds information. | Needs the entity aggregates (1.2) and backoff for new entities |
+
+Domain bins beat quantile bins when the domain has natural thresholds. `amount < $2` is a card-testing band (1.2 key). A quantile bin wouldn't necessarily put a boundary there.
+
+### Assumptions
+
+- The fitted statistics (μ, σ, quantiles, bin edges) stay representative of serving data. Inflation, a new market or a new currency break this.
+- Units and semantics are fixed: dollars stay dollars, not cents.
+- The transform is **deterministic and identical** offline and online, down to float precision at tree split boundaries.
+
+### Design choices
+
+1. **Transform per model family, not by habit.** For a GBDT, skip scaling and invest in ratios and per-entity normalization. For an NN: log, then standardize, cyclical time, and careful clipping with flags.
+2. **Fit on training data only.** Fit μ, σ, bins and quantiles on the training split. Fitting on train+validation is mild leakage, and the validation score becomes optimistic.
+3. **Transform parameters are part of the model artifact.** Version them together. The serving code loads the *same file*.
+4. **Global vs per-entity scaling.** A global z-score says "large for everyone". A per-entity z-score says "large *for this card*". Fraud needs the second.
+
+### Trade-offs
+
+| Choice | Gain | Cost |
+|---|---|---|
+| Log / quantile | Tame tails, stable NN training | Less interpretable, needs care with negatives |
+| Clipping | Stability | Can erase fraud signal |
+| Bucketizing | Robust, explainable, nonlinear for linear models | Resolution loss, boundary effects, frozen edges go stale |
+| Per-entity normalization | Much stronger signal | Needs aggregates, cold-start handling |
+| Any fitted transform | Better model fit | One more artifact to version and keep in sync |
+
+### Failure modes
+
+| Failure | What happens | Fix |
+|---|---|---|
+| Scaler refit online on recent data | Same raw input, different transformed value than in training. That's skew. | Freeze parameters in the model artifact |
+| Clip at p99 | Largest fraud amounts become indistinguishable from the cap | Flag or bucket extremes, or don't clip for trees |
+| Units change (cents) | Values off by 100×. Trees' thresholds are all wrong, NN inputs explode. | Schema contracts, range monitoring (branch 7) |
+| `log` of a negative or zero | NaN. XGBoost silently routes it down the "missing" branch, and NNs output garbage. | `log1p`, signed log, input validation |
+| Bin edges recomputed each retrain | "Bucket 3" means something different per model version. Logged features become incomparable. | Freeze domain bins, or version them with the model |
+| float32 serving vs float64 training | Values right at a split threshold go down the other branch | Same dtype on both sides, and test on boundary values |
+| Stale fitted statistics | Inflation or a new market shifts everything into the top bins | Monitor transformed distributions, refit on retrain |
+
+### Connections
+
+- **1.2:** aggregates are the heaviest-tailed features. Log them for NNs, and add per-entity normalization everywhere.
+- **2.4:** NaN from bad transforms ends up in missing-value handling.
+- **2.5:** fitted parameters have to live *somewhere* that both training and serving read.
+- **Modeling stage:** the model family determines which transforms matter.
+- **Branch 5:** refitting and dtype differences are skew sources.
+- **Branch 7:** monitor raw *and* transformed ranges.
+
+<Callout title="Exercise 2.1">
+
+Features:
+
+- `amount`: USD, $0.50 to $50k, with some **negatives** (refunds)
+- `txn_count_1h`: 0–200, mostly 0–2
+- `hour_of_day`: cardholder local time
+- `account_age_days`
+
+You're building **Model A: LightGBM** and **Model B: a neural network**.
+
+1. For each feature, what transform (if any) would you use in **A** and in **B**? Give one line of reasoning each.
+2. Which feature would be **dangerous to clip** for fraud, and what would you do instead?
+3. Name one fitted artifact from your answer to Q1 and say where it must live so training and serving stay identical.
+
+</Callout>
+
+<details>
+<summary>Answer key 2.1</summary>
+
+| Feature | A: LightGBM | B: Neural net |
+|---|---|---|
+| `amount` | Raw is fine, since trees only care about order. Add a per-card ratio or z-score. | Signed `log1p` (to handle refunds), then standardize with frozen parameters |
+| `txn_count_1h` | Raw | `log1p` → standardize. Don't clip. |
+| `hour_of_day` | Raw integer | `sin`/`cos` pair |
+| `account_age_days` | Raw, computed at `t` | `log1p` (the first few days matter most) → standardize |
+
+2. **`amount`, and the counts too.** Clipping them merges the largest frauds into the cap. For trees, don't clip at all. For a neural net, apply `log` instead of clipping. If you must clip, add an `is_extreme` flag.
+3. The μ and σ of `log1p(amount)` (or the quantile edges). They get saved in the model artifact bundle and loaded by a shared transform library that both training and serving call. Alternatively, bake them into the model graph, which is what 2.5 covers.
+
+</details>
+
+## 2.2 Categorical encoding
+
+### What problem it solves
+
+Many strong fraud signals are categories:
+
+| Feature | Cardinality |
+|---|---|
+| `channel`, `entry_mode` | ~5 |
+| `country` | ~200 |
+| `MCC` (merchant category code) | ~800 |
+| `BIN` (issuer prefix) | ~400k |
+| `email_domain` | Long tail: gmail plus 100k rare domains, including disposable ones |
+| `merchant_id` | ~10M, with ~50k new each month |
+
+Models need numbers. But category IDs are *arbitrary labels*. MCC 5411 isn't "less than" MCC 5999. Feed a raw ID in as a number and linear models and neural nets learn a fake ordering. Trees partially survive it, but split along meaningless boundaries.
+
+**Cardinality drives the choice of method:**
+
+<Diagram src="features/categorical-encoding-choice-by-cardinality.svg" />
+
+### The methods
+
+| Method | How | Good for | Watch out |
+|---|---|---|---|
+| **One-hot** | One binary column per value | Low cardinality | Width grows with the number of values. An unseen value becomes all zeros, silently. |
+| **Label / native categorical** | Integer IDs. LightGBM and CatBoost handle categories natively. | Trees with medium cardinality | A neural net or linear model reads fake order into the integers. Native handling **overfits at high cardinality**. |
+| **Frequency / count** | Replace the value with how often it occurs, **as of `t`** | Popularity signal ("obscure merchant") | Different values with equal counts collapse together. The count must be point-in-time. |
+| **Hashing trick** | `hash(value) mod B` buckets | Huge or open-ended vocabularies | Collisions. **The hash function and seed must be identical offline and online.** Not interpretable. |
+| **Target encoding** | Replace the value with that category's fraud rate | Medium to high cardinality with trees | **Leakage machine** if done naively. See below. |
+| **Learned embeddings** | Neural net lookup table, one dense vector per value | High cardinality with neural nets | Needs data per value. Versioning traps (1.5). |
+| **Hierarchy backoff** | merchant → MCC → MCC group. BIN → issuer → country. | Rare and new values | Needs maintained hierarchy tables (0.2 backoff) |
+
+### Deep dive: target encoding done right
+
+Replacing `merchant_id` with "this merchant's fraud rate" is very powerful, and it's the easiest encoding to get wrong. Consider merchant M5 with **2 training transactions, both fraud**:
+
+- **Naive:** TE = 2/2 = **1.0**. The model learns "TE = 1.0 → fraud" perfectly, because the feature *is* those rows' labels. Live, a new M5 transaction arrives with TE = 1.0, and that value came from only 2 examples.
+
+The fix has three parts:
+
+1. **Smoothing toward a prior.** Rare categories shouldn't claim certainty:
+   ```
+   TE = (fraud_count + m · prior) / (txn_count + m)
+      = (2 + 20 · 0.001) / (2 + 20) ≈ 0.092      ← instead of 1.0
+   ```
+   `m` controls how many examples a category needs before its own rate is trusted.
+2. **Exclude the row's own label.** Use out-of-fold encoding, or, better for fraud, point-in-time encoding.
+3. **Point-in-time, as of `t`.** Count only chargebacks **reported before `t`** (label delay, 0.3), excluding the current transaction.
+
+**Point-in-time target encoding is exactly `merchant_fraud_rate_90d` from 1.2.** "Target encoding" and "label aggregate" are the same feature viewed from two angles. The same time rules apply, and so does the same label-maturity lag.
+
+### Vocabulary management (the operational half)
+
+A vocabulary is the mapping from value to index or vector. It's a **fitted artifact**, just like a scaler's μ and σ:
+
+- **Unknown bucket.** New merchants arrive every day. Serving must map unseen values to a reserved "unknown" index. Otherwise it crashes, or worse, silently maps them to index 0, which is a real merchant.
+- **Rare → "other".** Values with fewer than `k` training occurrences share one bucket, which prevents memorization.
+- **Versioned with the model.** If you rebuild the vocabulary, index 37 may now point to a different merchant. Every logged feature and embedding row from the old version becomes meaningless under the new one.
+- **Normalize first.** `"US"` / `"USA"` / `"us"` and `Gmail.com` / `gmail.com` should be one value (0.2).
+
+### Assumptions
+
+- Category meaning is stable over time. MCCs get reassigned and merchants get re-categorized, so this doesn't always hold.
+- There's enough data per value for target encoding or embeddings to be meaningful. The long tail breaks this, which is why smoothing and backoff exist.
+- The vocabulary or hash is identical offline and online.
+
+### Trade-offs
+
+| Method | Width | Handles unseen | Leakage risk | Interpretable | Artifact to version |
+|---|---|---|---|---|---|
+| One-hot | High | Poorly | None | Yes | Vocabulary |
+| Native categorical | Low | Varies | None (but overfits) | Some | Vocabulary |
+| Frequency | 1 | Yes (count 0) | Low, if as of `t` | Yes | Counts table |
+| Hashing | Fixed B | **Yes** | None | No | Hash function + B |
+| Target encoding | 1 | Yes (falls back to the prior) | **High** | Yes | Rate table + `m` + prior |
+| Embeddings | d | Unknown vector | Medium (1.5) | No | Vocabulary + weights |
+
+### Failure modes
+
+| Failure | What happens | Fix |
+|---|---|---|
+| **Vocabulary rebuilt, indices shift** | Model reads merchant A's vector for merchant B. No errors are raised. | Version the vocabulary with the model, and never reuse indices |
+| **Unstable hash** | Python's `hash()` is randomized per process (`PYTHONHASHSEED`), so training and serving hash differently | Use a stable hash (MurmurHash3 or xxHash) with a fixed seed, in one shared library |
+| Unseen value → index 0 | New merchants treated as one specific real merchant | Reserved unknown index. Alert on the unknown rate. |
+| Naive target encoding | Perfect offline, disappointing live | Smoothing + point-in-time + excluding self |
+| High-cardinality native categorical in LightGBM | Overfits rare values | Group rare values, or target-encode, or `min_data_per_group` |
+| Label IDs fed to a linear model or neural net | Fake ordering learned | One-hot, embeddings or target encoding instead |
+| Category drift | New merchants pile into the unknown bucket, and its meaning shifts | Monitor the unknown rate. Refresh the vocabulary on retrain. |
+
+### Connections
+
+- **0.2:** key normalization comes before encoding.
+- **0.3 / 1.2:** time-safe target encoding *is* a label aggregate, with the same label-delay rules.
+- **1.1:** most attributes (MCC, BIN, country) are categorical.
+- **1.4:** categorical crosses (`country × MCC`) are usually hashed or target-encoded.
+- **1.5:** embeddings are model-derived and inherit the versioning traps.
+- **2.4:** "unknown category" and "missing value" are *different* states. Keep both.
+- **2.5:** vocabularies and hash settings must live where training and serving share them.
+- **Branch 7:** monitor the unknown rate and category drift.
+
+<Callout title="Exercise 2.2">
+
+The model is a **GBDT**, with these features:
+
+- `channel`: 4 values
+- `MCC`: 800 values
+- `merchant_id`: 10M values, about 50k new per month
+- `email_domain`: gmail, yahoo and so on, plus about 100k rare domains, including disposable ones
+
+1. Pick an encoding for each feature and justify it in one line.
+2. A merchant has **3 transactions, 1 of them fraud**. The prior is 0.002 and `m = 50`. Compute the smoothed target encoding. How does it compare with the naive value?
+3. Name **two conditions** that must hold for `merchant_id` target encoding to be leakage-free.
+4. A merchant onboarded **yesterday** transacts. What does each of your encodings from Q1 give the model?
+
+</Callout>
+
+<details>
+<summary>Answer key 2.2</summary>
+
+**1. Encoding each feature**
+
+| Feature | Encoding |
+|---|---|
+| `channel` | One-hot, or native categorical |
+| `MCC` | Native categorical, or time-safe target encoding, plus an MCC-group backoff |
+| `merchant_id` | Time-safe smoothed target encoding, plus `merchant_txn_count` as of `t`, plus MCC backoff. Native categorical would overfit at 10M values. |
+| `email_domain` | Keep the top N domains, group the rest as "other". Add flags: `is_disposable` (from a list), `is_free_provider`, domain age. Add frequency as of `t`. |
+
+**2. Smoothed target encoding:** (1 + 50 × 0.002) / (3 + 50) = 1.1 / 53 ≈ **0.021**.
+
+- The naive value is **0.333**, about 16× higher.
+- The smoothed value is still about 10× the prior, so the signal survives, it just stops claiming certainty.
+
+**3. Conditions for leakage-free target encoding:**
+
+- Count only chargebacks **reported before `t`**.
+- **Exclude the current transaction's own label.** For a static batch version, use out-of-fold values.
+
+**4. A merchant onboarded yesterday:**
+
+- `channel` and `MCC` are normal, since the MCC comes from onboarding.
+- Target encoding falls back to the **prior**, and the frequency is 0.
+- The model must also see `merchant_txn_count = 0` or `merchant_age`. Otherwise it can't tell "average merchant" from "unknown merchant".
+- The MCC-level target encoding carries the signal instead.
+
+</details>
+
+## 2.3 Unstructured data → vectors
+
+### What problem it solves
+
+Some signal lives in *content*, not in columns:
+
+| Source | Fraud example |
+|---|---|
+| Merchant descriptor | `"AMZN MKTP US*2K4"`, `"PAYPAL *GIFTCRD99"` |
+| Email username | `john.smith84@` vs `xk7q9z2mbv@` |
+| Name vs email | Name "Maria Lopez", email `ttrader991@`: do they match? |
+| Order contents | Product titles: gift cards and electronics are high-risk |
+| KYC images | ID document photos, selfies |
+| Behavioral sequences | Keystroke timing, mouse paths, event sequences (0.4, 1.5) |
+
+None of these are fixed-length numbers. A string has no "value" a tree can split on. You need to extract a **vector**.
+
+### How it works: a ladder of approaches
+
+| Rung | Method | Cost | Fraud fit |
+|---|---|---|---|
+| 1 | **Hand-crafted string statistics**: length, digit ratio, character entropy, regex flags, edit distance between name and username | Microseconds | **Often the strongest**, because fraud cues are *structural* (random-looking strings) |
+| 2 | **Sparse n-grams**: TF-IDF or hashed character n-grams | Cheap | Good with linear models |
+| 3 | **Pretrained encoder, frozen**: sentence embeddings for text, CLIP-style for images | Model inference | General meaning. May miss fraud-specific structure. |
+| 4 | **Fine-tuned encoder** on your labels | Training + inference | Best fit, but label-hungry and leakage-prone (1.5) |
+| 5 | **Reduce before the GBDT**: similarity to reference sets, cluster ID, PCA | Cheap after the embedding | Turns 384 noisy dimensions into a few strong ones |
+
+Here's the practical architecture for merchant descriptors:
+
+<Diagram src="features/unstructured-text-to-features-pipeline.svg" />
+
+### Why reduce before the GBDT?
+
+Dumping 384 embedding dimensions into a tree model rarely works well:
+
+- Each dimension alone means little. Trees split one dimension at a time, so the signal spread across dimensions is hard for them to use.
+- It adds noise, training time and overfitting.
+- The dimensions change meaning with every encoder version (1.5).
+
+Compact derived features work better:
+
+- **Similarity to reference sets**: cosine similarity to known scam descriptors, or to this card's usual merchants. It's one number, it's interpretable, and it's recomputed per encoder version.
+- **Cluster ID**: which of K descriptor clusters this belongs to. Encode it as a category (2.2).
+- **PCA to a few dimensions**: keeps most of the variance.
+
+### Where to compute (serving design)
+
+| Text source | Changes | Where to compute |
+|---|---|---|
+| Merchant descriptor | Rarely | **Batch.** Embed once and cache keyed by `hash(normalized_text)`. Serving is a lookup. |
+| Email username | Per account, set once | At account creation, then store as an attribute (1.1) |
+| Order item titles | Every request | **Online.** Check the cache by content hash, and fall back to string statistics only on a cache miss under latency pressure. |
+| KYC images | Once per verification | Separate model outputs a score, and that score becomes a model-derived feature (1.5) |
+
+Caching by **content hash** matters because the same descriptors repeat millions of times. You pay for inference once per unique string, not once per transaction.
+
+### Assumptions
+
+- Pretrained semantics transfer. Merchant descriptors are truncated, abbreviated and full of codes, which is very different from the natural text encoders were trained on.
+- The text is available at serving time *and logged* (1.3).
+- Preprocessing is identical offline and online.
+
+### Design choices
+
+1. **Climb the ladder only as far as needed.** Start with string statistics and n-grams. Add a pretrained encoder when semantic similarity matters ("GIFTCRD" ≈ "gift card"). Fine-tune only with strong evidence and enough labels.
+2. **Frozen vs fine-tuned.** Frozen means no label leakage and stable versions. Fine-tuned fits better but inherits every trap from 1.5.
+3. **Self-hosted vs external embedding API.** An external API is fast to adopt, but it adds latency, cost and dependency risk, and it **sends PII** (names, emails, addresses) to a third party.
+4. **Pin the whole preprocessing chain**: Unicode normalization (NFKC), lowercasing, truncation length, tokenizer version.
+
+### Trade-offs
+
+| | Gain | Cost |
+|---|---|---|
+| String statistics | Fast, explainable, catch structural fraud | Miss meaning |
+| Pretrained embeddings | Semantic similarity, zero labels | Inference cost, domain mismatch, opaque |
+| Fine-tuned | Best fit | Labels, leakage risk, retraining |
+| Online inference | Fresh | Latency, GPU cost, failure dependency |
+| Batch + cache | Cheap serving | New text misses the cache, so you need a fallback |
+
+### Failure modes
+
+| Failure | What happens | Fix |
+|---|---|---|
+| **Preprocessing mismatch** | Training lowercases and applies NFKC, serving doesn't. Or the truncation lengths differ. Different vectors for the same text. | One shared preprocessing function. Test known strings end to end. |
+| Encoder version upgrade | Vector space shifts, downstream silently degrades (1.5) | Pin versions, recompute references, retrain together |
+| Text as of today | Merchant renamed its descriptor, and training embeds the new name for old transactions | Log the text at serve time, or version descriptors (0.3) |
+| **Adversarial text** | Homoglyphs (Cyrillic `а` for Latin `a`), mimicking legitimate descriptors | NFKC plus confusable-character mapping. Add a `has_mixed_scripts` flag. |
+| Cache miss under load | New strings trigger inference, and p99 spikes | Fall back to string statistics plus a `text_embedding_missing` flag |
+| PII sent externally | Compliance violation | Self-host, or hash / redact before sending (branch 7) |
+
+### Connections
+
+- **0.4 / 1.5:** encoders are learned, model-derived features, with the same versioning and leakage rules.
+- **1.1 / 1.3:** text arrives either as a stored attribute (email) or in the request (order items). That source determines where you compute.
+- **2.1:** similarity scores are numeric and may need scaling for neural nets.
+- **2.2:** cluster IDs become categories.
+- **2.5:** preprocessing and tokenizers are transforms that must be shared.
+- **Branches 3/4:** batch vs online computation, caching, fallbacks.
+- **Branch 7:** PII in text and images.
+
+<Callout title="Exercise 2.3">
+
+Two signups:
+
+- `john.smith84@gmail.com`, name "John Smith"
+- `xk7q9z2mbv@tempmail.io`, name "Maria Lopez"
+
+1. Design **three hand-crafted features** from the email and name that separate these two. Give a formula or description for each.
+2. Your teammate wants to run a pretrained text embedding on the username. Argue **for or against**, in terms of what signal actually matters here.
+3. **Where and when** would you compute these features, and what would you cache?
+4. Name **one preprocessing mismatch** that could make the online value differ from the offline one.
+
+</Callout>
+
+<details>
+<summary>Answer key 2.3</summary>
+
+**1. Three hand-crafted features**
+
+- **Randomness of the username.** Use one of: digit ratio, character entropy, longest consonant run, or the likelihood of the string under a character-bigram language model. `xk7q9z2mbv` scores as random. `john.smith84` doesn't.
+- **Name–email similarity.** Jaro-Winkler distance or token overlap between the normalized name and the username. "John Smith" vs `john.smith84` is high. "Maria Lopez" vs `xk7q9z2mbv` is about 0.
+- **Domain flags.** `is_disposable` from a list (`tempmail.io`), `is_free_provider`, and domain age.
+
+**2. Embedding the username: mostly against.** The signal here is *structural* (randomness, mismatch with the name), not *semantic*. Embeddings of random strings are meaningless and unstable. It also sends PII to a model. A character n-gram model or a small character-level model fits better, and only after the hand-crafted features are in place.
+
+**3. Where and when to compute.**
+- Compute these once, **at account creation**, and store them as account attributes (1.1) with a `computed_at` timestamp. Recompute and version them if the email changes.
+- Trap: the disposable-domain list gets updated daily. Offline features must use **the list version that existed at `t`** (0.3).
+
+**4. Preprocessing mismatch.** Normalization of case and Unicode, or Gmail-specific normalization. Gmail ignores dots and `+tag` suffixes, so `john.smith+x@` and `johnsmith@` are the same inbox, and one side may normalize while the other doesn't.
+
+</details>
+
+## 2.4 Missing values and defaults
+
+### What problem it solves
+
+Features go missing all the time, and for many different reasons:
+
+| Cause | Example |
+|---|---|
+| Null key | Guest checkout has no `account_id` (0.2) |
+| No history | New card: every aggregate is empty (1.2) |
+| Not applicable | In-store terminal: no user agent, no IP (1.3) |
+| Blocked | JavaScript disabled, so no device fingerprint |
+| Fetch failure | Feature store or upstream API timed out (1.5) |
+| Undefined math | Average of 0 transactions, division by zero |
+| Didn't exist yet | Feature added in June, so every older training row is null |
+
+The core insight: **in fraud, missingness is rarely random.** Fraudsters block fingerprinting scripts, use fresh cards, and check out as guests. The *fact* that something is missing is often a signal. The statistics term is "missing not at random". Replacing a missing value with a neutral-looking value throws that signal away, or worse, **makes the transaction look safe**.
+
+### How it works: keep the states distinct
+
+One feature can be absent in several different ways. The model, and your on-call engineer, need to tell them apart:
+
+<Diagram src="features/missing-value-states-representation.svg" />
+
+If you collapse all four states to `0`, a brand-new card and a timed-out lookup both look like "established card, quiet month". That's the safest-looking profile there is, and it's exactly what fraudsters would want.
+
+### Techniques
+
+| Technique | How | Best for | Watch out |
+|---|---|---|---|
+| **Native NaN handling** | XGBoost and LightGBM learn a *default direction* for NaN at every split | GBDTs | The learned direction is only meaningful if training **saw realistic missingness**. See below. |
+| **Missing-indicator flag** | `is_missing_X` alongside the imputed value | Every model, especially linear models and neural nets | Adds columns. Group the flags per source (`device_features_missing`). |
+| **Impute a constant or statistic** | 0, median, mean | Linear models and neural nets (they can't take NaN) | Median and mean are **fitted artifacts**: freeze and ship them (2.1). Always pair with a flag. |
+| **Sentinel** | `-1` for "no data" on counts | Trees | Linear models and neural nets read -1 as a real number |
+| **Backoff** | Fill from a coarser entity: account → BIN → global (0.2) | No-history cases | Keep a flag so the model knows it's a fallback |
+| **Drop rows** | Exclude rows with nulls | Almost never | **Selection bias**: the model never sees guests or new cards, exactly the risky population |
+
+### The biggest trap: training and serving see different missingness
+
+- The training set is built **offline from the warehouse**. That data is complete, lookups never time out, and the missing rate is about 2%.
+- **Online**, timeouts, cache misses, blocked scripts and upstream outages push the missing rate to around 10%.
+
+A GBDT that almost never saw NaN for a feature learned an **essentially arbitrary** default direction for it. The first real outage sends traffic down paths nobody tested.
+
+Fixes:
+1. **Train on logged served features** (log-and-wait, branch 5). They contain real-world missingness.
+2. **Inject missingness during training** at realistic rates, per source. It's dropout, applied to feature groups.
+3. **Monitor missing rates per feature, online vs offline.** A rising `fetch_failed` rate is an incident, not just noise.
+
+### Fail-open vs fail-closed: this is a policy decision
+
+When critical features are missing at serving time, *something* must happen:
+
+- **Fail-open** (approve, maybe with rules): lower customer friction, higher fraud loss.
+- **Fail-closed** (decline or step-up verification): lower fraud loss, more angry good customers.
+
+This is a **business decision**, not a modeling one. It also has a security side: **missingness must never make a transaction look safer.** Attackers can *cause* missingness by blocking scripts or loading your dependencies until they time out. If missing is treated as safe, they have an off switch for your fraud defense.
+
+### Assumptions
+
+- The missingness mechanism is stable. A new SDK version that drops a field changes it.
+- The flags capture *why* data is missing, not just *that* it's missing.
+- Imputation statistics are representative of serving traffic.
+
+### Design choices
+
+1. **Represent reasons, not just absence.** `no_history` vs `not_applicable` vs `fetch_failed` are different signals. Only the first two are *data*. The third is an *operational event*.
+2. **Per model family.** GBDT: native NaN plus flags. Neural nets and linear models: impute plus flags.
+3. **New features and historical nulls.** A feature added in June is null for every earlier row. The model learns "NaN = older period", which confounds the feature with time. Either backfill honestly (point in time, 0.3) or train only on rows after the feature existed.
+4. **Explicit serving defaults per feature**, reviewed like an API contract, never left to whatever `null` becomes in Java.
+
+### Trade-offs
+
+| Approach | Gain | Cost |
+|---|---|---|
+| Native NaN (trees) | Zero effort, learns informative missingness | Only as good as the missingness seen in training |
+| Impute + flag | Works in every model, explicit | More columns, a fitted artifact |
+| Backoff | Real signal for cold start | Hierarchy maintenance |
+| Fail-closed | Security | Customer friction |
+| Fail-open | Customer experience | Fraud loss, exploitable |
+
+### Failure modes
+
+| Failure | What happens | Fix |
+|---|---|---|
+| **0 used for "unknown"** | New cards and timeouts look like quiet, safe cards | NaN or sentinel, plus reason flags |
+| Train/serve missingness mismatch | Arbitrary behavior during outages | Logged features, missingness injection, monitoring |
+| **Null semantics differ across languages** | Python training uses NaN, and the Java serving layer maps null → 0.0 | One shared transform library (2.5). Test null inputs end to end. |
+| Dropping rows with nulls in training | The model is blind to guests and new cards | Keep them, flag them |
+| New feature, historical nulls | Missingness confounded with time | Honest backfill, or restrict the training window |
+| Divide-by-zero ratios | `inf` / NaN propagates | Guarded math plus smoothing (1.2 shrinkage) |
+| **Adversarial missingness** | Attacker blocks scripts or causes timeouts to look clean | Missingness is never neutral. Use a fail-closed or step-up policy for critical groups. |
+| Mean imputation refit online | Skew | Freeze in the model artifact |
+
+### Connections
+
+- **0.2:** null keys and backoff hierarchies.
+- **1.2:** zero vs missing on aggregates, and `has_history`.
+- **1.3:** missingness correlated with channel.
+- **1.5:** upstream timeouts, which were the 1.5 exercise's Q3.
+- **2.1:** bad transforms produce NaN.
+- **2.2:** "unknown category" (a new value) ≠ "missing category" (no value). Give them separate buckets.
+- **2.5:** imputation values and null handling must live in shared code.
+- **Branch 4:** serving-time defaults on a feature-store miss.
+- **Branch 5:** missingness mismatch is a form of skew.
+- **Branch 7:** alert on missing rates per feature.
+
+<Callout title="Exercise 2.4">
+
+The model is **LightGBM**. The device-fingerprint feature group (`device_distinct_cards_24h`, `device_age_days`, `is_emulator`) is:
+
+- missing in **2%** of training rows, which were built from the warehouse
+- missing in **11%** of live requests: JavaScript blocked on 6%, feature-store timeouts on 5%
+
+The serving code fills missing values with **0**.
+
+1. Name **two separate things** that go wrong.
+2. Redesign how these features are represented at serving time. What values and flags would you send?
+3. How do you fix the **training data** so the model learns correct behavior for missing device features?
+4. All device features are missing *and* the amount is above $500. Fail-open or fail-closed? Justify it, and say who should make that call.
+
+</Callout>
+
+<details>
+<summary>Answer key 2.4</summary>
+
+**1. Two things go wrong.**
+
+- **(a) 0 looks safe, and attackers can trigger it.** `distinct_cards_24h = 0` and `is_emulator = 0` read as a clean device. Blocking JavaScript makes a transaction look *safer*, which hands attackers a fail-open switch.
+- **(b) The model's missing path is never used.** Training saw 2% NaN, so LightGBM learned a default direction for NaN. Serving sends 0 instead of NaN, so that learned path is never taken. The model sees combinations of zeros it rarely saw in training.
+- **Bonus:** two different causes are merged. A blocked script is *signal*. A timeout is *your* outage.
+
+**2. Serving representation.** Send NaN for each device feature, plus a separate reason flag: `device_js_blocked` or `device_fetch_failed`. Never fill with 0.
+
+**3. Fixing the training data.**
+
+- Train on **logged served features**, which carry real missingness along with the reason for it.
+- If you inject missingness instead, inject **only timeouts** at random: they're your outage, unrelated to fraud.
+- Don't inject JavaScript blocking at random. It correlates with fraud, and random injection erases that correlation. Its real pattern has to come from logs. That means the warehouse must record JS-blocked status *at the time of the transaction*.
+
+**4. Missing device features and amount over $500.**
+
+- Lean **fail-closed, softly**: send it to step-up verification (3-D Secure or a one-time code) rather than declining outright. Attackers can induce missingness, so it must never mean a free pass.
+- A timeout is your fault, so it deserves a softer response than a blocked script.
+- Risk policy owners make the call, together with product and finance, using fraud-loss vs conversion numbers. It's not a decision for the ML engineer alone.
+
+</details>
+
+## 2.5 Where transforms live
+
+### What problem it solves
+
+By now you've accumulated a lot of transform logic:
+
+- log and scaling parameters (2.1)
+- vocabularies and hash settings (2.2)
+- text normalization (2.3)
+- imputation values and reason flags (2.4)
+- key normalization (0.2)
+- time derivations (1.3)
+
+Every one of them has to run **identically** in two very different places:
+
+| | Training | Serving |
+|---|---|---|
+| Engine | Spark or pandas, batch, millions of rows | Service, one row per request |
+| Language | Often Python | Often Java or Go |
+| Time budget | Hours | A few milliseconds |
+| Failure cost | Rerun the job | Wrong decision on real money |
+
+**Where the transform code lives** determines the skew risk, latency and reuse for everything in branch 2.
+
+### The four options
+
+| Option | How | Consistency | Watch out |
+|---|---|---|---|
+| **A. Duplicate implementations** | Python for training, Java rewrite for serving | ❌ Worst | Someone fixes a bug in one copy only. This is how most skew is born. **Avoid.** |
+| **B. Shared library** | One transform package called by both paths | ✅ Good | Language barrier. Batch vs single-row engines still differ subtly. |
+| **C. Inside the model artifact / graph** | Preprocessing layers, pipeline objects or ONNX ops shipped with the model | ✅ Best for fitted transforms | Runs on the hot path. Can't handle cross-row state (aggregates). Not shareable across models. |
+| **D. In the feature pipeline / store** | Computed once, materialized, then read | ✅ Good for stateful work | Model-specific fitted parameters don't belong here. They couple the store to model versions. |
+
+### The rule of thumb: split by the *kind* of transform
+
+<Diagram src="features/where-transforms-live-three-layers.svg" />
+
+| Kind of transform | Home | Why |
+|---|---|---|
+| **Stateful across rows or time**: aggregates, time-safe target encoding, graph features | **Feature pipeline / store** | Needs history, so it can't be computed from one request. Expensive to compute, and shared by many models. |
+| **Stateless and model-agnostic**: key normalization, text cleanup, IP enrichment, local hour | **Shared library** (or on-demand definitions in the store) | Same meaning for every model. One implementation. |
+| **Fitted and model-specific**: μ/σ, bin edges, vocabularies, imputation values | **Model artifact** | Changes with every retrain. Must deploy in lockstep with the weights. |
+
+The arrows from *both* sides into the *same* boxes are the point of the design. There is no "training version" and "serving version" of anything.
+
+### Even shared code can diverge
+
+One library still runs on two engines. The subtle differences:
+
+- **Batch vs row semantics.** Vectorized pandas vs a per-row call: NaN propagation, dtype promotion (float32 vs float64), sort order within ties.
+- **Environment.** Executor timezone, locale (decimal commas), library versions.
+- **Hidden wall-clock calls.** A transform that calls `now()` returns *training time* during training and *request time* during serving. `account_age = now() − created_at` is wrong for every historical row. **Always pass `t` in explicitly.** This is 0.1, showing up in code.
+
+The defense is **parity testing**:
+
+1. Take a sample of logged live requests, including the served feature values.
+2. Replay the raw inputs through the *training* path.
+3. Compare feature by feature, within a tolerance. Any mismatch is a bug.
+4. Run this in CI on every change to transforms, *and* continuously in production.
+
+### Language boundary options
+
+The common problem: training runs in Python, serving runs on the JVM.
+
+- **Serve Python.** Simplest parity, but it costs latency and operational burden.
+- **Export model + preprocessing together** (ONNX and similar). Only works for transforms the format supports.
+- **Declarative feature definitions** compiled to both the batch and streaming engines. This is the feature-store approach, covered in branches 3 and 4.
+- **Compiled core library** (Rust or C++) with bindings for both languages. Highest effort, strongest guarantee.
+
+### Assumptions
+
+- Artifacts deploy **together**: model weights, vocabulary, scaler and library version as one unit.
+- Transforms are deterministic: no randomness, no wall clock, no dependence on the environment.
+- Hot-path transforms fit the latency budget.
+
+### Design choices
+
+1. **Bundle fitted artifacts with the model.** Use one versioned package, never separate files deployed independently.
+2. **Pin library versions** in both environments and upgrade them together.
+3. **Keep heavy transforms off the hot path.** Text embeddings and graph features get precomputed (2.3, 1.4). Only cheap arithmetic goes in the model graph.
+4. **Make `t` an explicit input** to every time-dependent transform.
+5. **Parity tests** as a release gate.
+
+### Trade-offs
+
+| Option | Consistency | Latency | Reuse across models | Flexibility |
+|---|---|---|---|---|
+| A. Duplicate | Poor | Best | – | High, and so is the drift |
+| B. Shared library | Good | Good | High | Language-bound |
+| C. Model graph | Best (fitted) | Adds hot-path compute | None | Limited to stateless per-row |
+| D. Feature store | Good (stateful) | Read-only at serve time | High | Couples to store release cycles |
+
+### Failure modes
+
+| Failure | What happens | Fix |
+|---|---|---|
+| Reimplementation drift | Python bug fixed, Java not. Skew for months. | Don't duplicate. Parity tests. |
+| **Artifact version mismatch** | Model v5 deployed with the v4 vocabulary or scaler | Single bundle, with a version check at load time |
+| Library version drift | Tokenizer or normalization changes between versions | Pin versions, upgrade together |
+| **Hidden `now()`** | Every time-derived feature is wrong in training | Pass `t` explicitly. Lint for wall-clock calls. |
+| Batch vs row semantics | dtype, NaN or tie-order differences | Parity tests on logged traffic |
+| Heavy transform in model graph | p99 latency blows the budget | Precompute and materialize |
+| Model-specific transforms in the store | Retraining one model forces a store backfill, and other models break | Keep fitted, model-specific transforms in the artifact |
+
+### Connections
+
+- **0.1:** hidden `now()` is the `f(e, t)` rule again.
+- **2.1–2.4:** every fitted parameter (scaler, vocabulary, bins, imputation) now has a home.
+- **Branch 3:** the feature pipeline's compute engines (batch, streaming) run the stateful transforms.
+- **Branch 4:** the store holds definitions and materialized values, including on-demand transforms.
+- **Branch 5:** parity testing and log-and-wait are the skew defenses.
+- **Branch 7:** versioning and lineage of artifacts.
+- **Deployment stage:** model and transforms ship as one unit.
+
+<Callout title="Exercise 2.5">
+
+For each transform, choose its home: **feature store**, **shared library** or **model artifact**. Give a one-line reason.
+
+| # | Transform |
+|---|---|
+| a | `log1p` then standardize `amount`, for a neural net |
+| b | Merchant target encoding as of `t` |
+| c | Gmail normalization (strip dots and `+tag`) |
+| d | MCC vocabulary for an embedding layer |
+| e | `hour_local_cardholder` from the timestamp and the cardholder's timezone |
+| f | Median imputation for `device_age_days` |
+| g | `distinct_cards_24h(device)` |
+
+Then:
+
+2. Describe a **parity test** for (e) in 3–4 steps.
+3. A teammate's transform computes `account_age = today() − created_at`. Offline AUC is 0.97 and online AUC is 0.88. Explain the gap, and give the fix.
+
+</Callout>
+
+<details>
+<summary>Answer key 2.5</summary>
+
+**1. Where each transform lives**
+
+| # | Home | Why |
+|---|---|---|
+| a | Model artifact | Fitted μ and σ, specific to this model |
+| b | Feature store | Stateful: it needs label history as of `t` |
+
+</details>

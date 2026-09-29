@@ -1,0 +1,42 @@
+---
+title: Features
+description: What to compute, and how to get it to the model reliably.
+icon: Layers
+---
+
+Features split into two concerns: **what you compute** and **how you serve it**.
+
+<Diagram src="features/features-stage-subtopics.svg" />
+
+**What to compute**
+
+1. **Feature types**: user features (age, history, preferences), item features (category, price, embeddings), context features (time, device, location), and cross features such as "clicked this category 5 times in 7 days". Cross features are often the strongest signal.
+2. **Transformations**: normalize, log-transform or bucketize numbers; one-hot encode small categoricals; use hashing or embeddings for large ones; use pretrained embeddings for text and images; impute missing values and add a missing-indicator flag.
+3. **Feature selection**: measure importance (SHAP, permutation), run ablations, drop features that are redundant or too costly.
+
+**How to serve it**
+
+4. **Freshness**: batch (daily, e.g. lifetime spend), streaming (seconds to minutes, e.g. clicks in the last 10 minutes), or request-time (e.g. the current search query). Fresher is more predictive but costs more.
+5. **Feature store**: the offline store keeps full history for training; the online store keeps latest values in a key-value store (e.g. Redis) for serving under 10 ms. Features are defined once and shared by both.
+6. **Skew and leakage**: the two most common bugs in production ML. Skew means a feature is computed differently in training and serving. Leakage means a feature uses information from after the prediction time; fix it with point-in-time joins.
+
+## Running example: card fraud detection
+
+A card transaction arrives and you have **under 100 ms** to approve it, decline it, or ask for extra verification. The label ("was it fraud?") comes from chargebacks, which arrive **30–90 days later**.
+
+## Topic map
+
+<Cards>
+  <Card title="0. Foundations" href="/courses/ml-system-design/features/foundations">Feature = f(entity, as-of time) · Entities · Time · Hand-crafted vs learned</Card>
+  <Card title="1. Feature types" href="/courses/ml-system-design/features/feature-types">Attributes · Aggregates · Context · Cross and graph · Model-derived</Card>
+  <Card title="2. Transformations and encoding" href="/courses/ml-system-design/features/transformations">Numeric · Categorical · Unstructured · Missing values · Where transforms live</Card>
+  <Card title="3. Computation and freshness" href="/courses/ml-system-design/features/computation-and-freshness">Batch vs streaming · Windows · Backfills · Freshness vs cost</Card>
+  <Card title="4. Storage and serving" href="/courses/ml-system-design/features/feature-store">Offline vs online store · Materialization · Point-in-time joins · Latency</Card>
+  <Card title="5. Correctness: leakage and skew" href="/courses/ml-system-design/features/leakage-and-skew">Time-travel leakage · Training-serving skew · Log-and-wait</Card>
+  <Card title="6. Selection and evaluation" href="/courses/ml-system-design/features/selection-and-evaluation">Importance and ablation · Redundancy · Cost-benefit</Card>
+  <Card title="7. Feature operations" href="/courses/ml-system-design/features/feature-operations">Monitoring · Versioning · Deprecation · Privacy</Card>
+</Cards>
+
+<Callout title="Interview tip">
+  Say "feature store with point-in-time correctness to prevent leakage and training-serving skew". That one line shows production experience.
+</Callout>

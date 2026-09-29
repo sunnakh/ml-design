@@ -1,0 +1,20 @@
+---
+title: 4. Storage and serving (feature store)
+description: Storing features once and serving them for both training and inference.
+---
+
+## 4.1 Offline store vs online store
+
+The offline store keeps full history for training; the online store keeps the latest values for low-latency serving.
+
+## 4.2 Materialization
+
+Compute features and load them into the online store on a schedule or from a stream.
+
+## 4.3 Point-in-time joins for training sets
+
+Join each training example to feature values as of its own timestamp, so no future data leaks in.
+
+## 4.4 Online latency budget, fan-out, cache, defaults on miss
+
+Fetching many features per request adds latency. Batch lookups, cache, and choose safe defaults when a value is missing.

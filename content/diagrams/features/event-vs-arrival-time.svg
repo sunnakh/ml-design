@@ -1,0 +1,20 @@
+<svg width="100%" viewBox="0 0 680 310" role="img"><title>Event time versus arrival time</title><desc>Two events both happened before decision time t. The streamed event arrives before t and is usable. The late event arrives after t via batch and must not be used, even though its event time is before t. The chargeback label arrives 45 days after t.</desc><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<text class="th" x="300" y="62" text-anchor="middle" dominant-baseline="central">t = 02:14, decision</text>
+<line x1="300" y1="78" x2="300" y2="232" stroke="var(--text-primary)" stroke-width="1"/>
+<text class="ts" x="40" y="110" dominant-baseline="central">Streamed: usable</text>
+<circle class="c-teal" cx="200" cy="110" r="6" stroke-width="0.5"/>
+<line class="arr" x1="208" y1="110" x2="236" y2="110" marker-end="url(#arrow)"/>
+<rect class="c-teal" x="240" y="104" width="12" height="12" rx="1" stroke-width="0.5"/>
+<text class="ts" x="40" y="165" dominant-baseline="central">Late: not usable</text>
+<circle class="c-coral" cx="230" cy="165" r="6" stroke-width="0.5"/>
+<line class="arr" x1="238" y1="165" x2="400" y2="165" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+<rect class="c-coral" x="404" y="159" width="12" height="12" rx="1" stroke-width="0.5"/>
+<text class="ts" x="426" y="165" dominant-baseline="central">Arrives 02:40 via batch</text>
+<line class="arr" x1="40" y1="232" x2="636" y2="232" marker-end="url(#arrow)"/>
+<circle class="c-coral" cx="580" cy="232" r="6" stroke-width="0.5"/>
+<text class="ts" x="580" y="254" text-anchor="middle" dominant-baseline="central">Label at t+45d</text>
+<circle cx="46" cy="286" r="5" fill="none" stroke="var(--text-secondary)" stroke-width="1"/>
+<text class="ts" x="58" y="286" dominant-baseline="central">Event time</text>
+<rect x="150" y="280" width="11" height="11" rx="1" fill="none" stroke="var(--text-secondary)" stroke-width="1"/>
+<text class="ts" x="168" y="286" dominant-baseline="central">Arrival time</text>
+</svg>

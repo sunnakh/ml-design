@@ -1,0 +1,5 @@
+{
+  "title": "Features",
+  "icon": "Layers",
+  "pages": ["index", "foundations", "feature-types", "transformations", "computation-and-freshness", "feature-store", "leakage-and-skew", "selection-and-evaluation", "feature-operations"]
+}

@@ -1,0 +1,16 @@
+---
+title: "5. Correctness: leakage and skew"
+description: The two most common feature bugs in production.
+---
+
+## 5.1 Target leakage / time-travel leakage
+
+A feature contains the label, or data from after the prediction time. The model looks great offline and fails live.
+
+## 5.2 Training-serving skew
+
+Code, data or timing differs between training and serving, so the model sees different inputs in production.
+
+## 5.3 Log-and-wait
+
+Log the exact feature values used at serving time and train on those logs, which removes skew by construction.

@@ -1,0 +1,16 @@
+<svg width="100%" viewBox="0 0 680 300" role="img"><title>Staleness over time: daily batch versus streaming</title><desc>A daily batch feature with a midnight data cutoff that lands at 03:30 has staleness rising from 3.5 hours to 27.5 hours each day, then dropping when the next run lands, forming a sawtooth. A streaming feature stays at a few seconds of staleness throughout.</desc>
+<line x1="80" y1="60" x2="80" y2="250" stroke="var(--border-stronger)" stroke-width="1"/>
+<line x1="80" y1="250" x2="630" y2="250" stroke="var(--border-stronger)" stroke-width="1"/>
+<text class="ts" x="72" y="250" text-anchor="end" dominant-baseline="central">0h</text>
+<text class="ts" x="72" y="178" text-anchor="end" dominant-baseline="central">12h</text>
+<text class="ts" x="72" y="106" text-anchor="end" dominant-baseline="central">24h</text>
+<line x1="80" y1="178" x2="630" y2="178" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="2 4"/>
+<line x1="80" y1="106" x2="630" y2="106" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="2 4"/>
+<path d="M80 106 L106 85 L106 229 L286 85 L286 229 L466 85 L466 229 L620 106" fill="none" stroke="#D85A30" stroke-width="2"/>
+<line x1="80" y1="247" x2="620" y2="247" stroke="#1D9E75" stroke-width="2"/>
+<text class="ts" x="110" y="62" dominant-baseline="central">Daily batch: 3.5h to 27.5h stale</text>
+<text class="ts" x="620" y="234" text-anchor="end" dominant-baseline="central">Streaming: seconds</text>
+<text class="ts" x="170" y="272" text-anchor="middle" dominant-baseline="central">Day 1</text>
+<text class="ts" x="350" y="272" text-anchor="middle" dominant-baseline="central">Day 2</text>
+<text class="ts" x="530" y="272" text-anchor="middle" dominant-baseline="central">Day 3</text>
+</svg>

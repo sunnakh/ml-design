@@ -1,0 +1,16 @@
+<svg width="100%" viewBox="0 0 680 300" role="img"><title>Request feature paths</title><desc>The request payload is logged for offline replay and split into three paths: pass-through fields like amount and channel, derived fields like local hour and weekday, and enriched fields via lookups like IP to geolocation and proxy flag. Enrichment outputs are also logged. All three feed the feature vector.</desc><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<g class="c-gray"><rect x="240" y="30" width="200" height="50" rx="4" stroke-width="0.5"/><text class="th" x="340" y="47" text-anchor="middle" dominant-baseline="central">Request payload</text><text class="ts" x="340" y="66" text-anchor="middle" dominant-baseline="central">Arrives at time t</text></g>
+<g class="c-coral"><rect x="500" y="30" width="140" height="50" rx="4" stroke-width="0.5"/><text class="th" x="570" y="47" text-anchor="middle" dominant-baseline="central">Request log</text><text class="ts" x="570" y="66" text-anchor="middle" dominant-baseline="central">Replay for training</text></g>
+<line class="arr" x1="442" y1="55" x2="496" y2="55" marker-end="url(#arrow)"/>
+<line class="arr" x1="280" y1="82" x2="160" y2="118" marker-end="url(#arrow)"/>
+<line class="arr" x1="340" y1="82" x2="340" y2="118" marker-end="url(#arrow)"/>
+<line class="arr" x1="400" y1="82" x2="510" y2="118" marker-end="url(#arrow)"/>
+<line class="arr" x1="600" y1="120" x2="600" y2="84" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+<g class="c-teal"><rect x="40" y="122" width="180" height="56" rx="4" stroke-width="0.5"/><text class="th" x="130" y="140" text-anchor="middle" dominant-baseline="central">Pass-through</text><text class="ts" x="130" y="162" text-anchor="middle" dominant-baseline="central">amount, channel, MCC</text></g>
+<g class="c-teal"><rect x="250" y="122" width="180" height="56" rx="4" stroke-width="0.5"/><text class="th" x="340" y="140" text-anchor="middle" dominant-baseline="central">Derived</text><text class="ts" x="340" y="162" text-anchor="middle" dominant-baseline="central">local hour, weekday</text></g>
+<g class="c-teal"><rect x="460" y="122" width="180" height="56" rx="4" stroke-width="0.5"/><text class="th" x="550" y="140" text-anchor="middle" dominant-baseline="central">Enriched</text><text class="ts" x="550" y="162" text-anchor="middle" dominant-baseline="central">IP to geo, proxy flag</text></g>
+<line class="arr" x1="130" y1="180" x2="290" y2="218" marker-end="url(#arrow)"/>
+<line class="arr" x1="340" y1="180" x2="340" y2="218" marker-end="url(#arrow)"/>
+<line class="arr" x1="550" y1="180" x2="390" y2="218" marker-end="url(#arrow)"/>
+<g class="c-gray"><rect x="250" y="222" width="180" height="50" rx="4" stroke-width="0.5"/><text class="th" x="340" y="239" text-anchor="middle" dominant-baseline="central">Feature vector</text><text class="ts" x="340" y="258" text-anchor="middle" dominant-baseline="central">To model, same request</text></g>
+</svg>

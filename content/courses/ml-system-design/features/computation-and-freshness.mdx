@@ -1,0 +1,133 @@
+---
+title: 3. Computation and freshness
+description: When and how feature values are computed.
+---
+
+## 3.1 Batch vs streaming vs on-demand
+
+### What problem it solves
+
+A feature value is always **as of some moment**. **Staleness** is the gap between `t` (when the model reads the value) and the newest data included in it:
+
+```
+staleness = t − (timestamp of newest data reflected in the value)
+```
+
+Different features tolerate very different staleness:
+
+- `account_age` is fine if it's a day old.
+- `count_10m(card)` computed nightly is *worse than useless*. It reports "0 transactions in the last 10 minutes" during the burst it was built to catch.
+
+The compute mode sets the staleness.
+
+### The three modes
+
+| Mode | How | Staleness | Example tech |
+|---|---|---|---|
+| **Batch** | Scheduled job over the warehouse (hourly or daily), writes to the offline store, then copies ("materializes") values to the online store | Hours to a day | SQL, Spark, scheduler |
+| **Streaming** | Consumes the event stream and updates per-key state incrementally, pushing to the online store | Seconds | Kafka + Flink / Spark Structured Streaming / Kafka Streams |
+| **On-demand** | Computed inside the scoring request, from the payload plus lookups (1.3) | Zero | Serving service code, shared library (2.5) |
+
+### What batch staleness actually looks like
+
+Suppose a daily job has a data cutoff of 00:00, runs at 02:00, takes an hour, and the online copy finishes at 03:30. The value served is *not* "yesterday's value". Its staleness follows a sawtooth:
+
+<Diagram src="features/batch-vs-streaming-staleness-sawtooth.svg" />
+
+Each drop is the moment a new job lands, at 03:30. Right before that, the value is **27.5 hours** old.
+
+**Training must reproduce this sawtooth.** A training row at 23:00 on day 2 must get the value computed with the day-2 00:00 cutoff, not an exact trailing 30-day window ending at 23:00. This is the trap from exercise 0.1(d), now with a mechanism. If you train on exact windows and serve stale ones, that's skew. There are two ways to do it:
+
+- Simulate the staleness offline: join to the value **that was available in the online store at `t`**.
+- Train on logged served values (branch 5).
+
+### Hybrid patterns (what production systems actually run)
+
+**1. Batch baseline + streaming delta.** Get a fresh long window without streaming 30 days of state:
+```
+count_30d(card, t) ≈ batch_count(up to 00:00) + stream_count(00:00 → t)
+```
+The batch part is cheap and exact. The stream only keeps today's state. The offline pipeline must compute the *same* combination. (Strictly, the batch window's start slides too, so the result is approximate. Pick a definition and replicate it.)
+
+**2. On-demand combination of precomputed parts.**
+```
+amount_ratio = request.amount / avg_amount_30d(card)   ← computed at request time
+```
+The heavy part (the average) is precomputed, and the cheap arithmetic happens on demand. The ratio is always fresh on the request side.
+
+**3. Tier by feature.** Each feature gets the cheapest mode that meets its freshness need. Most systems end up with most features in batch, a critical few in streaming, and request features on demand.
+
+### Assumptions
+
+- Batch jobs finish on schedule, and materialization completes.
+- The event stream is complete, and ordered enough for per-key state. Section 3.2 covers what happens when it isn't.
+- Streaming state survives restarts (checkpointing).
+- The offline pipeline can reproduce what the online path saw, *including its staleness*.
+
+### Design choices
+
+1. **Freshness requirement per feature**, derived from the attack timescale. Card testing takes minutes, so it needs streaming. A 30-day baseline tolerates hours, so batch is fine.
+2. **Materialization cadence.** Daily vs hourly batch cuts worst-case staleness from 27.5h to about 2h, at roughly 24× the job runs.
+3. **Hybrid splits.** Where the batch/stream seam falls, and replicating it offline.
+4. **Return a feature timestamp with every value.** The serving layer should know *how stale* each value is, and can then apply policy: ignore it, flag it, or fall back.
+
+### Trade-offs
+
+| | Batch | Streaming | On-demand |
+|---|---|---|---|
+| Freshness | Hours to a day | Seconds | Zero |
+| Infra cost / complexity | Low | **High**: state, ordering, exactly-once, on-call | Low infra, but uses latency budget |
+| Backfill / reproducibility | Easy: rerun | Hard: needs replay (3.3) | Easy only if inputs were logged (1.3) |
+| Stateful aggregates | Yes | Yes | No, only stateless or lookup-based |
+| Failure blast radius | Stale values | Stale *or wrong* values (state loss, double counting) | Request errors or latency |
+
+### Failure modes
+
+| Failure | What happens | Fix |
+|---|---|---|
+| **Batch job fails silently** | The online store keeps serving 2-day-old values, and nothing errors | Store `feature_ts` with every value. Alert on a freshness SLA breach. Serve a stale flag or fall back. |
+| **Streaming consumer lag at peak** | On Black Friday, lag grows to 20 minutes, so velocity features read low exactly when traffic and fraud peak | Lag alerts, autoscaling, and treat lagged values as stale |
+| State lost on restart | Counts reset to 0, so every card looks quiet | Checkpointing. Detect resets. Mark features as degraded until they've warmed up. |
+| **Double counting** | At-least-once delivery replays events, so counts inflate | Idempotent updates (dedupe by `txn_id`), exactly-once processing |
+| Training uses exact values, serving uses stale ones | Skew, and an optimistic offline AUC | Simulate the staleness point-in-time, or train on logged values |
+| Hybrid seam computed differently offline | Skew around midnight | One definition for both sides, plus parity tests (2.5) |
+
+### Connections
+
+- **0.1 / 0.3:** "available at `t`" includes *pipeline delay*, not just data arrival.
+- **1.2:** short windows force streaming. Long windows tolerate batch.
+- **1.3:** request features are the on-demand tier.
+- **1.4:** 1-hop degree can stream. Multi-hop is batch.
+- **2.5:** stateful transforms live in the pipeline these modes run.
+- **3.2:** streaming correctness in detail.
+- **Branch 4:** materialization into the online store, and returning timestamps.
+- **Branch 5:** staleness mismatch is skew.
+- **Branch 7:** freshness SLAs and alerts.
+
+<Callout title="Exercise 3.1">
+
+1. Assign each feature to **batch**, **streaming**, **on-demand** or **hybrid**, with a one-line reason:
+   - `count_10m(card)`
+   - `avg_amount_30d(card)`
+   - `account_age`
+   - `merchant_fraud_rate_90d`
+   - `hops_to_fraud(device)`
+   - `amount / avg_amount_30d(card)`
+   - `distinct_cards_24h(device)`
+   - `is_disposable_email`
+2. The nightly job for `avg_amount_30d` **fails silently for 2 days**. What does the model see? How would you *detect* it? What should serving *do*?
+3. For a training row at **day 5, 22:00**, exactly which value of `avg_amount_30d` should the training set use? Assume the job has a 00:00 data cutoff and lands at 03:30.
+
+</Callout>
+
+## 3.2 Windowed aggregation
+
+Aggregate over event-time windows, handling late data with watermarks.
+
+## 3.3 Backfills
+
+Recompute a new feature's historical values so you can train on it.
+
+## 3.4 Freshness vs cost trade-off
+
+Fresher features predict better but cost more to compute and serve. Pay for freshness only where it matters.

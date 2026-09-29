@@ -1,0 +1,13 @@
+<svg width="100%" viewBox="0 0 680 260" role="img"><title>Hand-crafted versus learned features spectrum</title><desc>Four points on a spectrum from human-defined to model-learned signal: raw fields, hand-crafted aggregates, ID embeddings, and sequence models. Left is cheap and explainable, right needs more data and compute but finds unknown patterns.</desc><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<g class="c-teal"><rect x="40" y="50" width="125" height="60" rx="4" stroke-width="0.5"/><text class="th" x="102.5" y="70" text-anchor="middle" dominant-baseline="central">Raw fields</text><text class="ts" x="102.5" y="92" text-anchor="middle" dominant-baseline="central">amount, country</text></g>
+<g class="c-teal"><rect x="195" y="50" width="125" height="60" rx="4" stroke-width="0.5"/><text class="th" x="257.5" y="70" text-anchor="middle" dominant-baseline="central">Hand-crafted</text><text class="ts" x="257.5" y="92" text-anchor="middle" dominant-baseline="central">count_1h, ratios</text></g>
+<g class="c-coral"><rect x="350" y="50" width="125" height="60" rx="4" stroke-width="0.5"/><text class="th" x="412.5" y="70" text-anchor="middle" dominant-baseline="central">ID embeddings</text><text class="ts" x="412.5" y="92" text-anchor="middle" dominant-baseline="central">merchant vector</text></g>
+<g class="c-coral"><rect x="505" y="50" width="125" height="60" rx="4" stroke-width="0.5"/><text class="th" x="567.5" y="70" text-anchor="middle" dominant-baseline="central">Sequence model</text><text class="ts" x="567.5" y="92" text-anchor="middle" dominant-baseline="central">last N events</text></g>
+<line class="arr" x1="44" y1="140" x2="626" y2="140" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+<text class="ts" x="40" y="164" dominant-baseline="central">Human finds signal</text>
+<text class="ts" x="630" y="164" text-anchor="end" dominant-baseline="central">Model finds signal</text>
+<text class="ts" x="40" y="186" dominant-baseline="central">Cheap, explainable, data-light</text>
+<text class="ts" x="630" y="186" text-anchor="end" dominant-baseline="central">Needs data, compute, finds new patterns</text>
+<g class="c-teal"><rect x="40" y="222" width="12" height="12" rx="2" stroke-width="0.5"/></g><text class="ts" x="60" y="228" dominant-baseline="central">Human-defined</text>
+<g class="c-coral"><rect x="180" y="222" width="12" height="12" rx="2" stroke-width="0.5"/></g><text class="ts" x="200" y="228" dominant-baseline="central">Model-learned</text>
+</svg>

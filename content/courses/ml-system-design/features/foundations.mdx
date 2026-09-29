@@ -1,0 +1,314 @@
+---
+title: 0. Foundations
+description: What a feature actually is.
+---
+
+## 0.1 A feature is f(entity, as-of time)
+
+### What problem it solves
+
+A model can only take a fixed-length vector of numbers. The world gives you raw, messy, ever-growing event logs and tables. A feature is the bridge between the two.
+
+A transaction arrives looking like this:
+
+```
+{txn_id: 9812, card_id: C77, merchant_id: M5, amount: 480.00,
+ time: 02:14, device_id: D3, country: "BR"}
+```
+
+On its own, `amount = 480` says little. What predicts fraud is the transaction **relative to history**:
+
+- `txn_count_1h(card C77)` = 6. A normal card makes about 0–1 transactions an hour.
+- `amount / avg_amount_30d(card C77)` = 480 / 35 = **13.7×**
+- `distinct_countries_24h(card C77)` = 3
+
+None of these values exist in the incoming event. You compute them from other data.
+
+### The core definition
+
+```
+feature  f(e, t)  =  g( all data about entity e with timestamp < t )
+```
+
+- **Entity `e`**: who the value is about (card, merchant, device). It becomes the **join key**.
+- **As-of time `t`**: the moment the value must be correct for. At prediction time, `t` is when the transaction arrives.
+- **Logic `g`**: the computation (count, average, ratio, lookup).
+
+You may use only data from before `t`. A chargeback that arrives at t + 45 days is in the future and forbidden.
+
+<Diagram src="features/as-of-time-timeline.svg" />
+
+The diagram uses a smaller case than the bullets above: 4 transactions fall inside the 1h window, so `txn_count_1h = 4`.
+
+### Why the as-of time matters so much
+
+| | Training | Serving |
+|---|---|---|
+| When it runs | Today, for a transaction from 6 months ago | Now, for a transaction that just arrived |
+| Correct `t` | That old transaction's timestamp | Now |
+| Temptation | Using today's warehouse table, which already contains "the future" | None. The future doesn't exist yet |
+
+At serving time, physics forbids leakage. At training time, nothing stops you. Writing every feature as `f(e, t)` forces you to state `t`, and that keeps training honest. Point-in-time joins (branch 4) and leakage and skew (branch 5) both follow from this one definition.
+
+### Assumptions
+
+1. **Stable patterns.** Past behavior predicts current behavior well enough. Fraudsters adapt, so this degrades (hence drift monitoring).
+2. **Availability.** Every input to `g` exists at serving time, within the latency budget.
+3. **Same semantics.** `g` means exactly the same thing in training and serving: units, timezone, filters, window boundaries.
+4. **Trustworthy timestamps.** Clock skew and late-logged events break "timestamp < t".
+
+### Design choices
+
+- **Entity choice.** Card, account, device, IP or merchant? Card features go blank when a card is reissued. Device features catch a fraudster cycling through stolen cards. Most fraud systems use several entities per transaction.
+- **Hand-crafted vs learned.** Gradient-boosted trees need engineered aggregates like `txn_count_1h`. A sequence model can learn its own from raw history: more expressive, but costlier to serve and harder to debug.
+- **Time precision.** "As of this exact millisecond" (streaming) vs "as of last night's batch" (cheap but stale). See branch 3.
+
+### Trade-offs
+
+Each feature adds predictive power, but also latency, compute cost, one more thing that can break, and one more thing to keep consistent. A model with 500 features is 500 contracts you have to honor, forever.
+
+### Failure modes
+
+| Failure | Symptom |
+|---|---|
+| Feature uses data after `t` | Amazing offline AUC, mediocre live performance |
+| Feature exists offline but not online | Serving fills in a default (0 or null), and the model sees garbage |
+| Semantics differ (cents vs dollars, UTC vs local) | Silent accuracy loss with no errors raised |
+| Entity key breaks (reissued card gets new `card_id`) | History disappears, and the card looks brand new |
+
+### Connections
+
+- **Problem framing** defines `t` (the decision moment) and the entity.
+- **Data** supplies raw events, each needing a trustworthy timestamp.
+- **Modeling**: the model family decides how much hand engineering you need.
+- **Deployment**: the latency budget caps which `g` you can afford online.
+- **Monitoring** watches `f` for nulls and drift.
+
+<Callout title="Exercise 0.1">
+  You're building training data from 6 months of transactions. For each proposed feature, is it valid as `f(e, t)`? If not, what's wrong and how would you fix it? **(a)** `amount` of the current transaction. **(b)** Transactions on the card in the 24h *after* this one. **(c)** Merchant chargeback rate from the *current* chargebacks table. **(d)** Card's 30-day average amount from a nightly job at 00:00. **(e)** `account_age_days` = today − account creation date. Hint: at least one is valid but has a subtle trap.
+</Callout>
+
+<details>
+<summary>Answer key 0.1</summary>
+
+| # | Verdict | Why |
+|---|---|---|
+| a | ✅ Valid | Part of the request, so known at `t`. |
+| b | ❌ Invalid | Uses data after `t`. Fix: 24h **before** `t`. |
+| c | ❌ Leaks | Today's table includes chargebacks filed *after* `t`, possibly this transaction's own (the label). Fix: count only chargebacks **reported** before `t`, excluding the current transaction. |
+| d | ⚠️ Valid, with a trap | Serving sees a value up to 24h stale; training must reproduce that staleness (as of the midnight before `t`), or you get skew. It also can't see today's bursts, so pair it with a streaming feature. |
+| e | ❌ Invalid as written | "Today" isn't `t`; old rows come out months too old. Fix: `t − creation_date`. |
+
+</details>
+
+## 0.2 Entities and join keys
+
+### What problem it solves
+
+`f(e, t)` needs an `e`. One transaction touches many entities: card, account, device, IP, merchant, email, shipping address. Which entities do features hang off, and how does each value find the row being scored? The **join key** answers the second: a SQL join column offline, a key-value lookup key online. A wrong key means a wrong feature, and nothing throws an error.
+
+### How it works
+
+Every prediction row carries several keys, each fanning out to that entity's features:
+
+<Diagram src="features/entity-key-fanout.svg" />
+
+- **Offline:** the transactions table joins each entity's feature table on `card_id`, `device_id` and so on, **as of `t`**.
+- **Online:** the same keys become parallel KV lookups: `get("card:C77")`, `get("device:D3")`, and so on.
+
+### Why multiple entities: each sees a different attack
+
+| Entity | What it catches | What it misses |
+|---|---|---|
+| Card | Stolen card used in a burst | Fraudster using each stolen card once |
+| Device | One phone cycling through many cards | Fraudster on a fresh device |
+| Account | Account takeover, new accounts | Guest checkout |
+| Merchant | Compromised or collusive merchant | Fraud spread across merchants |
+| Card × merchant | "Never shopped here before" | Needs storage for every pair |
+
+Fraud rings deliberately rotate the entity you watch, so defense means watching several.
+
+### Design choices
+
+1. **Granularity: specificity vs coverage.** A fine key (card) is sharp but empty for new cards; a coarse key (BIN, country) is always populated but blurry. Use **hierarchical backoff**: card → account → BIN → global prior, fed at several levels so the model learns which to trust.
+2. **Composite keys** like `(card, merchant)` capture relationships. The key space is the *product* of both, so store only pairs that occurred. An unseen pair means "first time", which is itself signal.
+3. **Key normalization.** `Bob@X.com` vs `bob@x.com`, IP vs /24 subnet, address formatting. Normalize **identically** in training and serving with one shared function, or lookups silently miss.
+4. **Identity mapping.** A reissued card gets a new `card_id`; link card → account so history survives. The **mapping table is time-varying** too: a link made in March must not be visible to January training rows.
+
+### Trade-offs
+
+- **More entities → more online lookups.** Six keys mean six parallel reads, and p99 is set by the slowest.
+- **Finer keys → better signal, worse cold start**, more storage.
+- **Composite keys → strong relationship signal**, storage grows with the product of key spaces.
+
+### Failure modes
+
+| Failure | What happens | Mitigation |
+|---|---|---|
+| Key format mismatch (`"C77"` vs `"c77"`, int vs string, different hash salt) | Every online lookup misses and defaults are served. Offline looks great, live sags. | One shared normalization library; alert on the online miss rate |
+| **Hot keys** (huge merchant, carrier NAT IP shared by 50k users) | Streaming aggregator overloaded; the feature becomes meaningless | Cap or flag shared keys; coarser key or `is_shared_ip`; salt hot keys in aggregation |
+| Null keys (guest checkout, blocked device JS) | Missing feature | Treat **missingness as signal** (`has_device_id`); don't silently impute 0 |
+| Reissued card | History resets; fraudsters exploit the "new card" window | Link card → account, backoff hierarchy |
+| Mapping table used as of today | Leakage through links made after `t` | Version the mapping table; join as of `t` |
+
+### Connections
+
+- **Branch 1:** graph features are entity relationships. **Branch 3:** hot keys dominate streaming cost. **Branch 4:** entities are first-class in the feature store; online fan-out sets latency. **Branch 5:** key mismatch is a top skew source. **Branch 7:** keys are often PII; hash consistently with one salt.
+
+<Callout title="Exercise 0.2">
+  A ring uses each stolen card **exactly once** (~$300 at electronics merchants), from about 5 devices, shipping to about 3 addresses. Card-level velocity features see nothing. (1) Why do card features miss this, in terms of entities? (2) Propose one new entity and two features keyed on it as `f(entity, t)`. (3) One failure mode of your key and its mitigation. (4) Investigators later label the 5 devices "known fraud". Can `is_known_fraud_device` be a feature, and what must training do to stay honest?
+</Callout>
+
+<details>
+<summary>Answer key 0.2</summary>
+
+1. Each card appears once, so there's no velocity on it. The repetition lives on the **device and address**.
+2. Entity: **device**. Features: `distinct_cards_24h(device, t)`, `txn_count_1h(device, t)`. Or address: `distinct_cards_7d(address, t)`.
+3. Fingerprint reset or spoofing (emulators, cleared storage), or legitimately shared devices (family tablet, kiosk). Combine device with IP subnet and address, add `is_shared_device`; normalize addresses (`Apt 4B` = `#4B`) and watch for freight forwarders.
+4. Yes, only as `is_known_fraud_device(d, t)` = flagged **before t**. Store `flagged_at` and join as of `t`. Today's flag list lets the ring's earlier transactions see a flag derived from their own labels: target leakage.
+
+</details>
+
+## 0.3 Time: event, arrival, prediction and label
+
+### What problem it solves
+
+0.1 said "use only data with timestamp < t". But *which* timestamp? Choosing the wrong one is the classic way leakage sneaks past careful engineers.
+
+| Time | Meaning | Fraud example |
+|---|---|---|
+| **Event time** | When it happened in the world | Card swiped at 02:10 |
+| **Arrival (ingestion) time** | When *your system* learned about it | Stream: 02:10:01. Settlement file: next day |
+| **Prediction time `t`** | When the decision happens | 02:14, the new transaction |
+| **Label time** | When the outcome became known | Chargeback at t + 45 days |
+
+**Refinement of 0.1:** the correct rule is "data whose **arrival time** < t". The model can't use what the system didn't yet know, even if the event happened earlier:
+
+<Diagram src="features/event-vs-arrival-time.svg" />
+
+Labels have the same problem. Recent rows haven't had time for their chargebacks to arrive, so training needs a **label maturity window**:
+
+<Diagram src="features/label-maturity-window.svg" />
+
+**The cost: the model is always stale.** With a 90-day window, the freshest pattern your model has seen is 3 months old, and fraudsters adapt in weeks. Mitigations:
+- **Early and proxy labels** ("cardholder reported fraud", issuer alerts) arrive within days. Noisier, faster.
+- **Pick the window from data.** Plot the **label arrival curve** (cumulative share of chargebacks arrived by day N) and choose N where it flattens.
+- **Weight or censor** partially mature rows instead of dropping them (survival-style methods).
+
+### Design choices
+
+1. **Store both timestamps on every record** (`event_time`, `ingested_at`) from day one. Arrival time can't be reconstructed later.
+2. **Point-in-time joins use `ingested_at` < t.** Use `event_time` for window semantics, `ingested_at` for availability.
+3. **Append-only history, not overwritten rows.** An `UPDATE`d table only knows today's value, a leakage machine. Keep snapshots or versioned rows with valid-from/valid-to (SCD Type 2). This is **bitemporal** data: *when it was true* vs *when we knew it*.
+4. **Trust server timestamps** over client ones.
+5. **Split train/validation by time**, never randomly.
+
+### Trade-offs
+
+| Choice | Gain | Cost |
+|---|---|---|
+| Longer label maturity window | More complete labels | Staler model |
+| Proxy labels | Freshness | Label noise, a different definition of "fraud" |
+| Bitemporal storage | Honest training sets, auditability | Storage, query complexity |
+
+### Failure modes
+
+| Failure | Symptom |
+|---|---|
+| Join on `event_time` instead of `ingested_at` | Late data leaks in; offline beats online |
+| Overwrite-in-place source tables | Every historical row sees today's values |
+| Immature labels treated as negatives | Model under-predicts new fraud; recent evaluation misleads |
+| Random train/test split | Inflated offline metrics |
+| Mixed timezones | Windows off by hours; "night-time" features meaningless |
+
+### Connections
+
+- **0.1:** availability, not occurrence. **Branch 3:** watermarks and late events are the online side. **Branch 4:** point-in-time joins implement these rules. **Branch 5:** most real leakage is a time bug. **Evaluation:** out-of-time validation; maturity windows apply to evaluation data too. **Monitoring:** live precision needs matured labels or proxies.
+
+<Callout title="Exercise 0.3">
+  On **March 31** a teammate builds training data: all transactions **Jan 1 – Mar 31**; `is_fraud = 1` if a chargeback exists in today's table, else 0; `merchant_risk_score` from a vendor feed landing **2 days late**, matched on `event_time < t`; random 80/20 split. Label arrival: **60%** of chargebacks by day 30, **90%** by day 60, **97%** by day 90. Find every time bug (at least 3), and choose a maturity window from the curve.
+</Callout>
+
+<details>
+<summary>Answer key 0.3</summary>
+
+**Time bugs:** (1) **immature labels**: Feb and March rows have had under 60 days, so pending chargebacks are labeled 0 and false negatives pile up in recent data; (2) **late feed joined on `event_time`**: serving only had the score from 2+ days earlier, so join on `ingested_at < t`; (3) **random split** leaks future patterns; use an out-of-time split; (4) bonus: is `merchant_risk_score` overwritten in place, or computed partly from chargebacks? Ask the vendor; either can leak the label.
+
+**Window:** 60 days ≈ 90% completeness, 90 days ≈ 97%: completeness vs freshness. Catch: from a March 31 build, a 60-day window leaves only January trainable, so you need longer history (e.g. 12 months to Jan 31) or proxy labels.
+
+</details>
+
+## 0.4 Who finds the signal, you or the model?
+
+### What problem it solves
+
+Someone has to turn raw events into something predictive: **you** (hand-crafted features like `txn_count_1h`) or **the model** (learned representations from raw history). This drives model family, storage, serving latency, debugging and hiring. It's a spectrum:
+
+<Diagram src="features/handcrafted-vs-learned-spectrum.svg" />
+
+### How each end works
+
+**Hand-crafted features + gradient-boosted trees** (XGBoost, LightGBM), the default for fraud and most tabular problems:
+- A tree sees **one row at a time** and *cannot* compute "transactions in the last hour"; that information is spread across rows, so aggregation must be done *for* it.
+- Trees split on thresholds and are bad at arithmetic. `amount / avg_amount_30d` takes many splits to approximate but one split once handed over.
+
+**Learned representations** move the work into the model:
+- **ID embeddings:** `merchant_id` with 10M values gets a dense vector; similar merchants end up close.
+- **Sequence models** (transformer or RNN over a card's last N events): the model learns "tiny test charge, then large purchase" without you naming it.
+
+**The hybrid production systems usually run:**
+
+```
+last N events ──► sequence model ──► 64-d embedding ─┐
+                                                     ├──► GBDT ──► fraud score
+hand-crafted aggregates (count_1h, ratios, ...) ─────┘
+```
+
+The learned embedding becomes *just another feature*, a **model-derived feature** (branch 1).
+
+### Assumptions
+
+- **Hand-crafted:** humans already know the pattern, which only holds for yesterday's fraud.
+- **Learned:** enough labeled data (hard at ~0.1% fraud), and raw history identical at training and serving.
+
+### Design choices and trade-offs
+
+| Dimension | Hand-crafted + GBDT | Learned (sequence / embedding) |
+|---|---|---|
+| Data needed | Moderate | Large; rare positives hurt |
+| Finds unknown patterns | No | Yes |
+| Serving cost | Cheap scalar lookups + tree inference | Fetch N events per entity + neural inference |
+| Online storage shape | Scalars per key | **Lists** of recent events per key |
+| Explainability | High: "declined: 6 txns in 1h" | Low |
+| Skew surface | Many pipelines, one per feature | Fewer pipelines; sequence construction must match exactly |
+| Maintenance | Feature sprawl (entities × windows × aggregations) | Retraining, embedding versioning |
+
+**Default path:** a GBDT on raw fields plus a few strong aggregates as the baseline. Add learned representations only with evidence: high-cardinality IDs, sequential patterns aggregates miss, enough data, and latency headroom.
+
+### Failure modes
+
+| Failure | Where | What happens |
+|---|---|---|
+| Feature explosion | Hand-crafted | 3,000 mostly redundant features, each a pipeline that can break or skew |
+| Stale human knowledge | Hand-crafted | Features encode last year's attacks |
+| Sequence mismatch | Learned | Training uses the last 50 events by `event_time`, serving the last 20 by arrival order |
+| ID memorization | Learned | Overfits training-period IDs; useless for new IDs |
+| Embedding version drift | Model-derived | Upstream embedding retrained; downstream GBDT reads garbage. Version and pin them together |
+| Hidden coupling | Model-derived | Changing one model changes another's inputs |
+
+### Connections
+
+- **0.1–0.3:** a sequence is still `f(e, t)`. **Branch 1:** model-derived features. **Branch 2:** embeddings encode categoricals. **Branch 4:** list-valued online storage. **Branch 6:** selection matters most at the hand-crafted end. **Modeling:** a joint decision about features and model family.
+
+<Callout title="Exercise 0.4">
+  New attack, **card testing**: 3–5 charges of ~$1 on a stolen card at *different* merchants within ~20 minutes, then a $900 purchase. Your GBDT with 200 hand-crafted features misses it. (1) Write two hand-crafted features that catch it, as `f(entity, t)` with windows. (2) A teammate says "build a sequence model": give one condition to agree and one to refuse. (3) Name one skew risk specific to the sequence option.
+</Callout>
+
+<details>
+<summary>Answer key 0.4</summary>
+
+1. `count_small_txns_30m(card, t)` (under $5) and `distinct_merchants_20m(card, t)`. Bonus: `amount / max_amount_1h(card, t)` flags the jump to $900; merchant side `small_txn_share_1h(merchant, t)` since testers reuse merchants.
+2. Agree if sequential attacks change faster than you can hand-write features *and* you have enough labels and latency headroom. Refuse if two features close the gap cheaply, labels are scarce, or every decline needs a reason.
+3. Sequence construction: offline built from settled transactions, online from authorization attempts *including declines*. Card-testing charges are often declined, so the model sees them live but never in training. Also: different N, or the offline sequence including the current transaction.
+
+</details>

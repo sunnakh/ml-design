@@ -1,0 +1,510 @@
+---
+title: 1. Feature types
+description: Where signal comes from; five families with their own storage, freshness and failure profile.
+---
+
+```
+1. Feature types
+   ├── 1.1 Entity attributes       what the entity IS          (account age, card type)
+   ├── 1.2 Behavioral aggregates   what it DID, over windows    (txn_count_1h)
+   ├── 1.3 Request / context       what's happening NOW         (amount, IP, time of day)
+   ├── 1.4 Cross and relational    how entities RELATE          (card×merchant, shared devices)
+   └── 1.5 Model-derived           what OTHER MODELS think      (embeddings, risk scores)
+```
+
+## 1.1 Entity attributes
+
+### What problem it solves
+
+Some signal comes from *what the entity is*:
+
+| Entity | Example attributes |
+|---|---|
+| Card | Type (credit / debit / **prepaid**), issuing bank and country (from the BIN), credit limit |
+| Account | Created date, KYC level, email domain, home country |
+| Merchant | Category code (MCC), country, onboarding date, risk tier |
+| Device | OS, model, emulator flag |
+
+These matter most when **behavior is missing**. A brand-new account has no history, so attributes are all you have: "prepaid card + free email domain + account created 4 minutes ago" is a strong prior before any transaction. This is the cold-start fallback from 0.2's backoff.
+
+### How it works
+
+Attributes come from **systems of record** (accounts DB, BIN tables, merchant onboarding), change rarely, and are copied into the feature store in **batch**: versioned tables offline, the KV store online. A live DB lookup couples fraud serving to that DB's load and uptime.
+
+| Flavor | Examples | Storage rule |
+|---|---|---|
+| **Immutable** | BIN, account `created_at`, merchant onboarding date | Store once. Overwriting is safe *only* here. |
+| **Slow-changing** | Address, KYC level, credit limit, merchant risk tier | **Keep history** (versioned rows, SCD Type 2) |
+| **Derived at t** | `account_age = t − created_at`, `days_since_address_change` | **Store the timestamp, compute at t.** Never store the derived number. |
+
+The slow-changing row is where attribute features go wrong most:
+
+<Diagram src="features/scd2-vs-overwrite.svg" />
+
+It's worse than a plain leak. The tier flipped to "high" *because of* fraud at M5, so the overwritten attribute has the label baked in. Offline the model learns `risk_tier = high` means fraud with near-perfect accuracy; live, the tier only flips *after* the fraud wave.
+
+### Assumptions
+
+- The value changes rarely, so daily batch is fresh enough (not always: a mid-session KYC upgrade).
+- The source of record is correct and filled in (optional onboarding fields are often blank).
+- The attribute means the same thing over time (remapped MCCs, new BIN ranges give "unknown").
+
+### Design choices
+
+1. **Verified vs self-reported.** Self-reported fields (name, stated country, phone) are fraudster-controlled and weak. Verified ones (BIN country, KYC result, IP geolocation) are harder to fake. Strongest: *compare* them, `billing_country ≠ BIN_country ≠ IP_country` (1.4).
+2. **Feature store vs live query.** Replicate by default (decoupled, predictable latency, hours of lag); query live only where lag really hurts.
+3. **Raw vs bucketed** (e.g. `credit_limit`), decided per attribute.
+
+### Trade-offs
+
+| Strength | Weakness |
+|---|---|
+| Cheap: batch, one lookup, stable | Weak alone; fraudsters use normal-looking accounts |
+| Available at cold start | Stolen *mature* accounts look perfect (account takeover) |
+| High coverage, low skew risk *if* versioned | Some are proxies for protected traits (zip, country, email domain) |
+
+### Failure modes
+
+| Failure | Cause | Fix |
+|---|---|---|
+| Label baked into attribute | Overwrite + investigation-driven update | Versioned rows joined as of `t`; ask *was this set because of fraud?* |
+| Stale derived value | `account_age_days` stored at signup | Store `created_at`, compute at `t` |
+| Future state leaks | `is_kyc_verified = true` today, txn before verification | Keep `verified_at`, check `verified_at < t` |
+| Unknown values | New BIN range or MCC missing from reference data | Refresh reference data; explicit "unknown" category |
+| Online/offline mismatch | Replica lags snapshot or vice versa | Monitor attribute freshness per source |
+
+### Connections
+
+- **0.2:** coarse fallback in the backoff. **0.3:** SCD2/bitemporal storage. **1.4:** attribute comparisons are cross features. **Branch 2:** categorical encoding. **Branch 3:** batch is fine here. **Branch 7:** PII and fairness proxies live here.
+
+<Callout title="Exercise 1.1">
+  For each attribute give its flavor (immutable / slow-changing / derived at t), how to store and join it honestly, and any trap: **(a)** `card_type`; **(b)** `account_age_days`, a column set at signup; **(c)** `is_kyc_verified` in today's users table; **(d)** `merchant_risk_tier`, updated by hand after investigations.
+</Callout>
+
+<details>
+<summary>Answer key 1.1</summary>
+
+| # | Flavor | Store and join | Trap |
+|---|---|---|---|
+| a | Immutable per card | Store once; BIN table as of `t` | Minor: BIN tables change; reissued cards get new IDs |
+| b | Derived at t, **stored as a number** | Store `created_at`, compute `t − created_at` | The stored value is wrong for every training row |
+| c | Slow-changing state | Keep `verified_at` / status history, check `verified_at < t` | Today's value leaks future verification; fraud accounts get *locked*, correlating status with the label |
+| d | Slow-changing, set after investigations | Versioned rows joined as of `t` | Label baked in (the diagram above) |
+
+</details>
+
+## 1.2 Behavioral aggregates
+
+### What problem it solves
+
+A single event carries no context; **history** does. But history varies in length (3 past transactions or 30,000), and models need fixed-length input. Aggregates compress history into fixed numbers. They're usually the **strongest features** in fraud, recommendations and ads, and the easiest to get subtly wrong.
+
+### How it works
+
+Every aggregate combines four choices:
+
+```
+agg_fn( filter( events of entity e in window [t − w, t) ) )
+   │       │                  │               │
+   │       │                  │               └─ window: 10m, 1h, 24h, 7d, 30d
+   │       │                  └─ entity (0.2): card, device, merchant...
+   │       └─ filter: only declined / only < $5 / only card-not-present
+   └─ count, sum, mean, max, distinct_count, std, time_since_last
+```
+
+`[t − w, t)` is closed left, open right: it **excludes the current transaction**. Pick the convention once and enforce it everywhere.
+
+**Multiple windows** are the key idea: short windows catch **bursts**, long windows give a **baseline**, and their ratio says "unusual *for this entity*":
+
+<Diagram src="features/multi-window-aggregates.svg" />
+
+40 transactions over 30 days is ~**0.009 per 10 minutes**; 4 in the last 10 minutes is **~430× the card's own normal rate**. A global "more than 3 in 10 minutes" rule would flag every busy business card. **Self-normalization** is what makes aggregates powerful.
+
+### Aggregation toolkit
+
+| Function | Fraud use | Compute note |
+|---|---|---|
+| count, sum | Velocity, spend | **Mergeable**: per-bucket partials added up |
+| mean, std | Baseline, spread | Mergeable via (count, sum, sum of squares) |
+| max, min | "Largest purchase ever" | Mergeable |
+| distinct_count | Distinct merchants or countries | **Not** cheaply mergeable; HyperLogLog sketches |
+| percentile | "Amount above this card's p95" | Sketches (t-digest) |
+| time_since_last | Dormant card suddenly active | O(1) state |
+| ratio / z-score | Current vs baseline | Derived from the above |
+
+### Window types
+
+| Type | How it works | Trade-off |
+|---|---|---|
+| **Sliding (exact)** | Exactly `[t − w, t)` for every `t` | Precise; must keep every event. Expensive online. |
+| **Hopping / bucketed** | Sum 1- or 5-minute pre-aggregated buckets | Cheap, mergeable; off by up to one bucket at the edges |
+| **Exponential decay** | `c ← c·e^(−Δt/τ) + 1` per event | O(1) state, no edges; less interpretable; needs exact replay offline |
+
+**The rule:** offline must compute *identically* to online, window type included.
+
+### Assumptions
+
+- The window has **every event that arrived before `t`** (late data breaks this).
+- The entity *has* history; for new entities 0 is ambiguous.
+- Past behavior is normal behavior; seasonality shifts every baseline at once.
+
+### Design choices
+
+1. **Which combinations.** 5 entities × 5 windows × 8 functions × 4 filters = **800 features**. Start from threat models, not the full grid.
+2. **Window lengths** matched to attack timescales: card testing in minutes, account takeover in hours, bust-out fraud in weeks.
+3. **Filters as attack detectors:** `count_declined_1h`, `count_small_amount_30m`, `count_card_not_present_24h`.
+4. **Include declined and attempted events.** Fraud shows up in *attempts*; aggregating only settled transactions erases it.
+
+### Trade-offs
+
+| More / longer / finer | Gain | Cost |
+|---|---|---|
+| More windows and functions | Richer signal | Sprawl, redundancy, skew surface |
+| Longer windows | Stable baseline | More state, slower to react |
+| Exact sliding windows | Precision | Online memory and CPU |
+| distinct_count / percentiles | Strong signal | Sketch error must match offline |
+
+### Failure modes
+
+| Failure | What happens | Fix |
+|---|---|---|
+| **Off-by-one: current event included** | Online the transaction hits the stream before scoring and counts itself; offline SQL excludes it. Every live count is +1. | Define `[t − w, t)` explicitly and test with the same events on both sides |
+| Window mismatch | Exact offline, bucketed online | One shared definition, ideally generated from one spec |
+| **Zero vs missing** | New card: `count_30d = 0` looks "quiet and trustworthy" but means "unknown" | Add `history_days` or `has_history` |
+| Noisy means on tiny counts | `avg_amount` from 1 transaction | Pass the count too, or shrink: `(sum + k·prior) / (count + k)` |
+| Late events | Present offline, missing online | Join on arrival time; measure lateness |
+| Hot keys | A giant merchant's aggregates overload state | Pre-aggregate, salt keys, cap |
+| Aggregating labels | `merchant_fraud_rate_90d` includes immature or future chargebacks | Count only chargebacks *reported* before `t` |
+
+### Connections
+
+- **0.1–0.3:** time rules apply hardest here. **0.4:** aggregates are the canonical hand-crafted features. **Branch 2:** heavy tails need logs or clipping. **Branch 3:** short windows force streaming. **Branch 4:** state size and bucket design. **Branch 5:** off-by-one and window mismatch are textbook skew.
+
+<Callout title="Exercise 1.2">
+  **Online** `count_1h(card)`: 1-minute tumbling buckets per card, summing the last 60; each transaction is **published as it arrives** and read ~5 ms later; only **approved** transactions are streamed. **Offline:** `COUNT(*) OVER (PARTITION BY card_id ORDER BY event_time RANGE BETWEEN INTERVAL '1 hour' PRECEDING AND CURRENT ROW)` from `settled_transactions`. List every mismatch (at least 3), say which side you'd change and why, and what a card opened 2 hours ago should receive for `count_30d` (and what else).
+</Callout>
+
+<details>
+<summary>Answer key 1.2</summary>
+
+**Mismatches:** (1) **current transaction**: online it's *sometimes* counted depending on stream lag (nondeterministic); offline `CURRENT ROW` always includes it, and `RANGE` pulls in rows with the same `event_time`; (2) **window shape**: 60 tumbling buckets give an effective 59–60 minutes vs an exact sliding hour; (3) **population**: approved vs settled (drops reversals, adds T+1 lag), and **neither counts declines**, where card testing shows up; (4) **time basis**: arrival/processing time online vs `event_time` offline.
+
+**Change:** one spec: `[t − 1h, t)`, excluding the current `txn_id`, over authorization *attempts*, by arrival time. Make **offline mimic online** (offline can replay any logic; online is latency-bound). Best: log served values and train on them (log-and-wait, branch 5).
+
+**New card:** `count_30d = 0` only with `history_days ≈ 0.08` or `has_history`, plus backoff features from account, device and BIN.
+
+</details>
+
+## 1.3 Request / context features
+
+### What problem it solves
+
+The **freshest information you'll ever have is the request itself**. For a first-ever transaction on a new card, it's nearly all you have.
+
+| Group | Examples |
+|---|---|
+| Payment | Amount, currency, merchant, MCC, channel, entry mode (chip, swipe, keyed-in) |
+| Network / device | IP, user agent, device fingerprint, SDK version |
+| Location | Shipping and billing address, IP geolocation, merchant location |
+| Time | Hour of day and day of week, *in the right timezone* |
+| Session behavior | Time on checkout page, typing cadence, card number pasted vs typed |
+
+### How it works
+
+Computed **on demand** inside the scoring request, with no precomputed state. Three paths:
+
+<Diagram src="features/request-feature-paths.svg" />
+
+- **Pass-through:** fields used as-is or lightly transformed.
+- **Derived:** pure functions of the payload. Local hour needs a timezone *decision*: 3 a.m. is suspicious in the cardholder's time, not the merchant's.
+- **Enriched:** lookups against reference data (IP → country, ASN, `is_proxy` via GeoIP; BIN → issuer).
+
+**The logging arrow is the part everyone forgets.** Offline you can only train on what you **logged**. If `user_agent` isn't logged, you can't train on it, and once you add logging you wait out label maturity. **Log the full raw request plus every enrichment output at serving time.**
+
+GeoIP databases change monthly. Enriching old IPs with *today's* database gives a different `ip_country` than the model saw: skew. Fix: log the enrichment output (simplest, exact), or version the reference data and join as of `t`.
+
+### Assumptions
+
+- Fields mean the same across clients (web, SDK versions, POS terminals).
+- Fields are **honest**. Many aren't: IP, user agent and device attributes are client-controlled and spoofed.
+- Enrichment fits the latency budget.
+
+### Design choices
+
+1. **One shared transform library** for serving and training. Java-only serving and Python-only training is guaranteed skew.
+2. **Log raw payload and computed features.** Raw enables new features; computed gives exactly what the model saw.
+3. **Inline vs precomputed enrichment.** In-memory GeoIP inline; a 30–80 ms third-party risk API only for risky segments, or async.
+4. **Spoofable vs trusted fields.** Client-controlled fields are weak alone, stronger when compared (1.4).
+
+### Trade-offs
+
+| Strength | Weakness |
+|---|---|
+| Freshest possible signal | Client-controlled fields can be spoofed |
+| No state, no streaming infra | Unusable offline until logged and matured |
+| Works on the first-ever event | Logging costs storage, **and IPs, addresses, user agents are PII** |
+| Cheap to compute | Enrichment adds latency and reference-data versioning |
+
+### Failure modes
+
+| Failure | What happens | Fix |
+|---|---|---|
+| **Post-decision fields leak** | Warehouse rows carry `decline_reason`, `rule_hit`, `manual_review_outcome`, written *after* the decision | Build training rows from the **request log**; tag every column known-at-`t` or after |
+| Field not logged | Can't train on a new signal for months | Log the full payload from day one |
+| Enrichment version drift | Offline `ip_country` ≠ served | Log enrichment outputs |
+| Client schema change | Amount in cents, new `channel` value | Validate at ingest; alert on new categories and range shifts |
+| Missingness correlates with channel | "No user agent = in-store", not "suspicious" | Missing indicators; per-channel segments |
+| Timezone confusion | "Night-time" is noise | One timezone per feature, named: `hour_local_cardholder` |
+
+### Connections
+
+- **0.1:** request features are known at `t`; *other columns on the same row* may not be. **0.3:** reference-data versioning is bitemporal. **1.2:** strongest request features are relative (amount vs the card's average). **1.4:** request vs attribute location is a cross feature. **Branch 4:** on-demand definitions still belong in the feature store. **Branch 5:** train on logged features. **Branch 7:** PII retention and access.
+
+<Callout title="Exercise 1.3">
+  The warehouse `transactions` table has `amount`, `merchant_id`, `channel`, `ip_address`, `created_at`, `decline_reason`, `manual_review_outcome`, and `ip_country` (filled nightly with the current GeoIP database). `user_agent` reaches the API but **isn't stored**. Sort each column into safe request feature / leaks / skew risk / not a feature. What logging change would you make? You want `user_agent` next week: what's realistic?
+</Callout>
+
+<details>
+<summary>Answer key 1.3</summary>
+
+| Column | Verdict | Why |
+|---|---|---|
+| `amount`, `merchant_id`, `channel` | Safe request features | Known at `t` (`merchant_id` needs encoding) |
+| `ip_address`, `created_at` | Not features themselves | Raw inputs for enrichment and derived features; IP is PII and very high-cardinality |
+| `decline_reason`, `manual_review_outcome` | **Leak** | Written after the decision; encode model, rule or human judgment |
+| `ip_country` | **Skew risk** | Today's GeoIP database, not the one used at `t` |
+
+**Logging:** append-only at scoring time: full raw request (user agent, headers, session signals), enrichment outputs plus GeoIP version, computed feature vector, model version, score, decision, `txn_id`, timestamp.
+
+**`user_agent` next week:** not realistic. No history; start logging now and wait out label maturity (60–90 days). Meanwhile: rules, shadow scoring, proxy labels.
+
+</details>
+
+## 1.4 Cross and relational features
+
+### What problem it solves
+
+Much fraud signal lives *between* fields and entities:
+- **Inconsistency between fields.** Fraudsters control *some* fields (shipping address, name) but not all (BIN country, IP geolocation). Mismatches expose them.
+- **Shared infrastructure.** Each ring card looks clean alone; the *network* of shared devices, addresses and IPs doesn't.
+
+Two families: **crosses** (combinations within one event) and **relational/graph** features (connections across events).
+
+### Part A: Cross features
+
+| Kind | Example | What it catches |
+|---|---|---|
+| **Mismatch** | `ip_country ≠ billing_country`, `BIN_country ≠ shipping_country` | Stolen card used from abroad |
+| **Distance** | km between IP geolocation and billing address | Same, graded |
+| **Relative** | `amount / merchant_avg_amount_30d` | $900 at a coffee shop |
+| **Pair history** | `first_time(card, merchant)`, `days_since_card_first_used_device` | New relationship = higher risk |
+| **Categorical cross** | `country × MCC` | Risky combinations of individually safe parts |
+
+Linear models can't learn interactions; trees can, but learning `ip_country ≠ billing_country` means splitting on every country pair. One precomputed flag gives the answer in a single split.
+
+### Part B: Relational / graph features
+
+Nodes are entities (cards, devices, addresses, IPs, emails); edges mean "seen together", each with a `first_seen` timestamp. A ring from card C77's point of view:
+
+<Diagram src="features/fraud-ring-graph.svg" />
+
+| Feature | Meaning | Compute |
+|---|---|---|
+| **Degree** | `distinct_cards_7d(device)`, `distinct_accounts(address)` | Distinct-count over a relation; streaming, online |
+| **Shared-with-flagged, 1 hop** | Does this device touch a card flagged before `t`? | Online lookup with per-node flags |
+| **Hops to fraud / component size** | Distance to nearest known fraud, cluster size | Multi-hop batch job, served precomputed |
+| **Label propagation / graph embeddings** | Risk spread over the network, learned node vectors | Batch + GNN; model-derived (1.5) |
+
+### The time rule, applied to graphs
+
+The graph **as of `t`** contains only edges with `first_seen` before `t` and flags with `flagged_at` before `t`. Rings are uncovered *after* the fact, so today's components are bigger than they were. Training on today's component size teaches "big component = fraud" with information that didn't exist at decision time. Also exclude **the node itself**: nearby fraud that is only C77's own chargeback is the label.
+
+### Assumptions
+
+- Shared attributes mean shared control (breaks for families, offices, public Wi-Fi, freight forwarders).
+- Keys are normalized, or one address spelled 3 ways splits the ring into 3 clean nodes.
+- Flags are timely (label delay means recent ring members aren't flagged yet).
+
+### Design choices
+
+1. **Online 1-hop, batch multi-hop.** Two-hop expansion can touch thousands of nodes and blow 100 ms; precompute hourly or daily and accept staleness.
+2. **Edge windowing.** Age out or down-weight old edges (e.g. last 90 days).
+3. **Which edge types.** More types catch more rings and create more accidental links.
+4. **Cross explosion control.** `country × MCC` ≈ 160k mostly empty cells: hash, embed, or keep only justified crosses.
+
+### Trade-offs
+
+| | Gain | Cost |
+|---|---|---|
+| Mismatch / distance crosses | Cheap, strong, explainable | Fraudsters align fields (VPN to the right country) |
+| Degree features | Catch rings, cheap online | Noisy on shared infrastructure |
+| Multi-hop / component features | Catch sophisticated rings | Batch-only, stale, expensive, hard to explain |
+| Large sparse categorical crosses | Risky combinations | Overfit on rare cells, memory |
+
+### Failure modes
+
+| Failure | What happens | Fix |
+|---|---|---|
+| **Placeholder values become super-nodes** | `none@none.com`, `device_id = 0000…`, `"N/A"` link millions of cards into a fake "ring" | Nulls and placeholders are *no edge*; blocklist placeholders; cap degree |
+| Legitimately shared infrastructure | Carrier NAT IPs, universities, freight forwarders | `is_shared_infra`; ignore high-degree edges; weight by rarity |
+| Future edges or flags | Component size or proximity computed today leaks | Timestamp edges and flags; build the graph as of `t` |
+| Self-label leak | Own chargeback counts as "nearby fraud" | Exclude self and the current transaction |
+| Unnormalized keys | Rings split and look clean | Normalize keys |
+| Adaptive rings | Burned devices and addresses rotated out | Short edge windows; combine with behavior features |
+
+### Connections
+
+- **0.2:** nodes are entities; edges are composite-key relationships. **0.3:** edges and flags need arrival timestamps. **1.1 / 1.3:** mismatch crosses compare attributes with request fields. **1.2:** degree is a distinct-count aggregate. **1.5:** graph embeddings are model-derived. **Branches 3/4:** online 1-hop vs batch multi-hop. **Branch 7:** graph features can hit whole communities (fairness).
+
+<Callout title="Exercise 1.4">
+  A ring rotates ~20 stolen cards, reusing **2 shipping addresses** and ~**4 residential-proxy IPs**; each card is used once. Propose two graph features with windows and an explicit as-of rule. Which would you serve online and which in batch, against a 100 ms budget? Your first version flags 3% of *all* transactions, and one address node has 400,000 cards attached: what happened, and what's the fix?
+</Callout>
+
+<details>
+<summary>Answer key 1.4</summary>
+
+**1. Two graph features.**
+- `distinct_cards_7d(ship_address, t)`: count only edges whose `first_seen` arrived before `t`.
+- `flagged_cards_30d(ship_address, t)`: count only cards with `flagged_at < t`, excluding the current card.
+- For IPs, use `distinct_cards_24h(ip_subnet, t)`. It's weaker, because residential proxies are shared with legitimate users.
+
+**2. Online vs. batch.**
+- Degree features go **online**: a streaming distinct count (HyperLogLog) makes each one a single O(1) lookup.
+- Multi-hop, component and fraud-proximity features go **batch**, recomputed hourly. Expanding 2+ hops at request time can touch thousands of nodes, which doesn't fit in 100 ms.
+
+**3. The 400k-card address.**
+- It's a **placeholder super-node**: "N/A", or blank addresses that normalization collapsed into one string, or a marketplace warehouse or freight forwarder.
+- Fix it in layers:
+  - Treat placeholders as *no edge*, and keep a blocklist of them.
+  - Cap node degree, or ignore nodes above a threshold.
+  - Weight edges by rarity, e.g. 1/log(degree).
+  - Check that normalization doesn't merge distinct blanks.
+
+</details>
+
+## 1.5 Model-derived features
+
+### What problem it solves
+
+Some signal is too high-dimensional, unstructured or relational to hand-craft:
+
+- 10M merchant IDs
+- raw event sequences
+- merchant descriptor text
+- the entity graph
+
+**Another model** can compress it into a few dense numbers. Model-derived features also let one team reuse another team's work. Your fraud model can consume the account-takeover team's score without rebuilding their system.
+
+| Kind | Fraud example | How it's trained |
+|---|---|---|
+| Entity embeddings | Merchant vector: similar merchants sit close together | Self-supervised on co-occurrence ("cards that shop at X also shop at Y"). **No labels needed.** |
+| Sequence encoding | 64-dimensional summary of a card's last 50 events | Self-supervised, or supervised on fraud |
+| Graph embeddings | GNN node vector for a device (1.4) | Self-supervised or supervised |
+| Text embeddings | Merchant descriptor `"AMZN MKTP*2K4"` → vector | Pretrained language model |
+| Other models' scores | Account-takeover score, email-risk score, vendor device reputation | Other teams or vendors |
+| Unsupervised anomaly | Isolation-forest score, autoencoder reconstruction error | No labels at all |
+
+The self-supervised and unsupervised rows matter a lot for fraud. Labels are rare (about 0.1%) and delayed (0.3). Upstream models can learn structure from *all* transactions, and the downstream model then needs fewer labels.
+
+### How it works
+
+An upstream model is trained separately. Its outputs are either **materialized** (a batch job writes merchant embeddings daily) or **computed online** (the sequence encoder runs per request). They're stored in the feature store keyed by entity *and model version*, and the downstream model consumes them like any other feature:
+
+<Diagram src="features/model-derived-features-versioned-pipeline.svg" />
+
+### The three traps that make this family different
+
+**1. Embeddings from different training runs aren't comparable.**
+
+- Retrain the same embedding model and you get vectors of the same dimension that live in a *different coordinate system*. Dimension 12 in v3 means nothing in v4.
+- So the downstream model is **pinned** to an upstream version.
+- A new upstream version requires regenerating historical features with v4, then retraining downstream, then deploying the two **together**.
+
+**2. Point-in-time applies to the upstream model too.**
+
+- A training row at time `t` should use the upstream model *as it existed at `t`*.
+- The common shortcut is to use today's embedding for all historical rows. That embedding was trained on data *after* `t`, so it leaks the future.
+  - This is mild if the upstream model is self-supervised: it only encodes future co-occurrence.
+  - It's **severe** if the upstream model is supervised on fraud labels: it memorized which merchants *later* turned out to be fraudulent.
+- Fixes: **log the served embeddings and scores** (log-and-wait, branch 5), or retrain upstream in time slices.
+
+**3. Stacking on the same labels needs out-of-fold predictions.**
+
+- Suppose the upstream model was trained on the same chargebacks as your downstream training rows. Its scores on those rows are **overconfident**, because it saw their answers.
+- The downstream model learns to trust it too much, then loses that edge live.
+- Standard fix: the upstream score for each training row comes from a model that **didn't train on that row**, via out-of-fold predictions or a time-based split.
+
+### Assumptions
+
+- The upstream model is stable and versioned, and its owners tell you before they change it.
+- Upstream serving is at least as available and fast as your own. Your p99 latency now includes theirs.
+- The upstream objective is relevant to yours. An embedding tuned for recommendations may throw away signal fraud needs.
+
+### Design choices
+
+1. **Batch vs online.** Entity embeddings are usually batch (daily). They're cheap to serve but stale, and brand-new entities have none. Sequence encodings are usually online: fresh, but they cost inference latency.
+2. **In-house vs vendor.** A vendor score gets you signal fast, but it's opaque, costs money per call, can change without notice, and can't be reproduced for historical rows unless you logged it.
+3. **Full vector vs compressed signal.** Pass all 64 dimensions to the GBDT, or reduce first: similarity to known-fraud centroids, or PCA to 8 dimensions. Fewer dimensions give a more stable, more explainable model.
+4. **Ownership contract.** Agree with the upstream owner on the version, schema, expected distribution, update cadence and deprecation notice (branch 7).
+
+### Trade-offs
+
+| Gain | Cost |
+|---|---|
+| Captures signal hand-crafting can't reach | Coupling: "change anything, change everything" |
+| Self-supervised upstream reduces label hunger | Version pinning, coordinated deploys |
+| Reuses other teams' work | Opaque, hard to explain a decline |
+| Dense encoding for high-cardinality IDs | Extra latency and availability dependency |
+
+### Failure modes
+
+| Failure | What happens | Fix |
+|---|---|---|
+| Silent upstream retrain | Vector space or score distribution shifts, and downstream degrades with no error | Version pinning, contracts, distribution monitoring on inputs |
+| Today's embedding used for all history | Time-travel leakage, offline results look inflated | Log served values, or time-sliced upstream models |
+| In-sample stacking | Upstream score is overconfident offline | Out-of-fold or time-split upstream scores |
+| Upstream timeout at serving | A default (0 or null) gets served. If 0 means "low risk", fraud walks through. | Explicit missing indicator, safe fallback policy, alert on the fallback rate |
+| New entity has no embedding | A zero vector looks like a real, average merchant | "Unknown" vector plus a flag, or back off to category-level embeddings (0.2) |
+| Feedback loop | Your model declines transactions, so those never get labels. The upstream model trains on data your decisions filtered. | Keep a small random holdout that gets approved or reviewed. Covered in more depth under labels and data. |
+
+### Connections
+
+- **0.4:** this is the "model finds the signal" end of the spectrum.
+- **1.2 / 1.4:** sequence and graph embeddings are learned versions of aggregates and graph features.
+- **Branch 2:** embeddings are also an encoding choice for high-cardinality categoricals.
+- **Branch 4:** the feature store must key on version as well as entity.
+- **Branch 5:** stacking and today's-embedding leakage are two more leakage shapes.
+- **Branch 6:** importance of an opaque 64-dimensional block is hard to interpret.
+- **Branch 7:** lineage and ownership, i.e. who gets paged when upstream changes.
+
+<Callout title="Exercise 1.5">
+
+The account-takeover (ATO) team offers you `ato_score`. Their model is trained on the **last 12 months of labels**, including the same chargebacks you train on. They **retrain monthly** and serve the score through an API with a p99 latency of 40 ms.
+
+1. Name **two leakage risks** in adding `ato_score` to your training set, and how you'd fix each.
+2. They retrain monthly. What must your pipeline do on each of their releases?
+3. Their API times out and your code fills in `ato_score = 0`. What goes wrong, and what should happen instead?
+
+</Callout>
+
+<details>
+<summary>Answer key 1.5</summary>
+
+**1. Two leakage risks.**
+
+- **(a) In-sample stacking.** The ATO model trained on the same chargebacks you train on, so its scores on your training rows are overconfident. Fix: score each row with an ATO model version whose training data ended **before `t`**. Their monthly retrains help here: "the version that was live at `t`" is out-of-time by construction.
+- **(b) Time travel.** If you score all historical rows with *today's* model, that model has learned from labels that came after `t`. Fix: log the scores actually served and train on those, or use the version that was live at `t`.
+
+**2. What your pipeline does on each release.**
+
+- Never hot-swap. Treat each release as a **new feature version**.
+- Run the new version in shadow, and compare its score distribution with the old one.
+- Keep the downstream model pinned to the old version until it's retrained on logged scores from the new one. Then deploy both together.
+- Better: agree a contract that `ato_score` is a **calibrated probability**. Its meaning then stays stable across retrains, and drift stays small.
+
+**3. The timeout filled with 0.**
+
+- 0 means "no ATO risk", so every timeout becomes a free pass. It's also a **fail-open** hole: an attacker who can slow down the ATO service can switch off your defense.
+- Instead: send null plus an `ato_score_missing` flag. Train with realistic missingness injected so the model learns what a missing score means. Add a fallback policy (rules, or step-up authentication), and alert on the timeout rate.
+
+</details>

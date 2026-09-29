@@ -1,0 +1,12 @@
+<svg width="100%" viewBox="0 0 680 300" role="img"><title>Slow-changing attribute: versioned join versus overwritten table</title><desc>Merchant M5's risk tier was low from January 1 to March 9 and high from March 10 after an investigation. A training row from February 15 should get low via a versioned as-of join. An overwritten table only knows high, which leaks the investigation outcome into the past.</desc><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<text class="ts" x="40" y="62" dominant-baseline="central">Merchant M5 history</text>
+<g class="c-teal"><rect x="40" y="80" width="340" height="56" rx="4" stroke-width="0.5"/><text class="th" x="210" y="98" text-anchor="middle" dominant-baseline="central">risk_tier = low</text><text class="ts" x="210" y="120" text-anchor="middle" dominant-baseline="central">Jan 1 to Mar 9</text></g>
+<g class="c-coral"><rect x="384" y="80" width="256" height="56" rx="4" stroke-width="0.5"/><text class="th" x="512" y="98" text-anchor="middle" dominant-baseline="central">risk_tier = high</text><text class="ts" x="512" y="120" text-anchor="middle" dominant-baseline="central">From Mar 10, after investigation</text></g>
+<circle cx="250" cy="166" r="6" fill="none" stroke="var(--text-primary)" stroke-width="1.5"/>
+<text class="ts" x="236" y="166" text-anchor="end" dominant-baseline="central">Training row, txn Feb 15</text>
+<line class="arr" x1="250" y1="158" x2="250" y2="140" marker-end="url(#arrow)"/>
+<line class="arr" x1="250" y1="174" x2="250" y2="210" marker-end="url(#arrow)"/>
+<line class="arr" x1="258" y1="171" x2="440" y2="210" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+<g class="c-teal"><rect x="40" y="214" width="290" height="56" rx="4" stroke-width="0.5"/><text class="th" x="185" y="232" text-anchor="middle" dominant-baseline="central">Versioned as-of join</text><text class="ts" x="185" y="254" text-anchor="middle" dominant-baseline="central">Feb 15 gets low: correct</text></g>
+<g class="c-coral"><rect x="350" y="214" width="290" height="56" rx="4" stroke-width="0.5"/><text class="th" x="495" y="232" text-anchor="middle" dominant-baseline="central">Overwritten table</text><text class="ts" x="495" y="254" text-anchor="middle" dominant-baseline="central">Feb 15 gets high: label leak</text></g>
+</svg>
