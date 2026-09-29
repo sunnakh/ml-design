@@ -1,0 +1,295 @@
+---
+title: C. Online evaluation
+description: Measuring on live users.
+---
+
+## C1 Shadow mode
+
+<Diagram src="evaluation/shadow-mode-architecture.svg" />
+
+### What shadow mode measures
+
+| Category | Checks | Store finding (example) |
+|---|---|---|
+| **Operational** | p50/p99 latency, error and timeout rate, CPU/GPU/memory, cost per 1k requests | p99 = **85 ms** against a 50 ms budget. Users with long histories hit a slow path |
+| **Skew** | Logged online feature values vs. offline recomputation **for the same requests** | `user_purchases_30d` is **0 for 18% of requests** online, never offline. Cause: a user-ID type mismatch (string vs. int) in the feature-store lookup |
+| **Prediction distribution** | Score histograms vs. what offline evaluation predicted; calibration ratio where labels exist | Scores shifted lower for users hit by the skew bug |
+| **Agreement with champion** | Top-20 overlap, rank correlation | **12%** average overlap. A big behavior change, so the A/B needs careful guardrails |
+| **Coverage** | Share of requests served by fallback, missing features, empty results | 3% of requests returned fewer than 20 items |
+
+Each of these would have hurt users in an A/B test, and some would have **ruined the A/B result itself**. The skew bug alone would have made the model look worse online than it really is, and the team might have dropped a good model.
+
+### The key limitation: shadow mode can't see reactions
+
+Users never see shadow outputs, so **you can't observe how they'd respond.** Whether that matters depends on the task:
+
+- **Passive prediction tasks** (the outcome happens regardless of the prediction): a delivery ETA estimate that isn't shown, a fraud score that isn't acted on, a demand forecast. The real outcome arrives anyway, so **shadow mode gives true online accuracy.** For these tasks, shadow mode is a very strong evaluation.
+- **Decision tasks** (the prediction changes what happens): recommendations, ranking, pricing, blocking. The only outcomes you get are for what the **champion** showed. You can't learn whether a user would have bought the item the shadow model *wanted* to show. For the store, shadow mode validates **the system, not the value**. Value needs an A/B test (C2) or off-policy estimation (D3).
+
+### Design choices
+
+- **Sync vs. async fork.** *Sync:* the router calls both models on each request. That's realistic latency under shared load, but a slow or crashing shadow can hurt production unless it's isolated with strict timeouts. *Async:* replay logged requests to the shadow afterwards. It's safe, but timing and load are less realistic.
+- **Traffic share:** mirroring 100% doubles serving cost; 5–10% is usually enough for operational metrics. Make sure the sample covers **peak hours** and the **full weekly cycle**.
+- **Isolation:** separate compute; **no writes to shared state**.
+- **Promotion criteria, written in advance:** for example, p99 < 50 ms, error rate < 0.1%, feature mismatch rate < 1% per feature, fallback rate < 1%.
+- **Duration:** long enough to see a full weekly traffic pattern; typically days, not weeks.
+
+### Assumptions
+
+- The shadow path is **the same as the production path would be**: same feature store, same hardware class, same code. Otherwise the latency and skew results don't carry over.
+- **No side effects.** The shadow doesn't change anything users or other systems depend on.
+- The mirrored traffic represents the full traffic.
+
+### Trade-offs
+
+- **Cost vs. coverage:** more mirrored traffic catches rarer bugs but costs more compute.
+- **Realism vs. safety:** a sync fork gives true latency under load but puts production at risk; async is safe but less faithful.
+- **Time:** shadowing adds days before the A/B test. For low-risk changes (retraining the same architecture), teams sometimes skip it and rely on a canary.
+
+### Failure modes
+
+- **Side effects.** The shadow writes to the online feature store, increments "times recommended" counters, updates frequency caps, sends notifications, or calls paid third-party APIs. **This corrupts production data**, including the champion's features.
+- **Different infrastructure,** so the latency results don't hold in production.
+- **Treating shadow "accuracy" on logged labels as online value** for a decision task. Those labels only exist for champion-shown items.
+- **Not logging features,** which makes skew undetectable.
+- **Forgotten shadows** left running for months, burning compute.
+
+### Where it sits in the rollout
+
+**Offline gate → shadow (system works?) → canary (1% of real traffic, watching for breakage; this is about safety, not measurement) → A/B test (does it create value?) → gradual ramp → full launch.** Canary is really part of deployment (stage 7). The A/B test is where evaluation happens next.
+
+### Connections
+
+- **B2:** Shadow mode is the main detector for **availability skew** and pipeline leakage.
+- **B4:** Check calibration on live score distributions.
+- **C2:** It de-risks the A/B test, so the A/B measures the *model*, not a bug.
+- **D2, D3:** Its blind spot for decision tasks is exactly what off-policy evaluation tries to cover.
+- **Stage 7:** The deployment path. **Stage 8:** The same dashboards become production monitoring.
+- **E5:** Feature logging and the comparison tooling are evaluation infrastructure.
+
+<Callout title="Exercise 11">
+
+1. For each system below, is shadow mode enough to measure its **value**, or only its **system health**? Answer in one line each:
+   (a) Food delivery ETA shown on the checkout page, (b) a credit-card fraud score that **auto-blocks** transactions, (c) the same fraud score used **only to prioritize a human review queue** that reviews every flagged transaction anyway, (d) the store's recommendation row.
+2. Your shadow deployment writes each recommended item to a "recently recommended" table that the champion uses to avoid repeating items. What goes wrong, and how do you fix it?
+
+</Callout>
+
+## C2 A/B test design
+
+### The problem it solves
+
+The question we actually care about is **causal**: *if we ship the new model, will users buy more **because of it**?*
+
+The obvious approach, "launch it and compare this week with last week," doesn't work. This week might have had a sale, a holiday, a marketing email, a competitor outage or a site slowdown. **Anything that changes over time is mixed in with your model's effect.**
+
+**Randomization** fixes this. Randomly split users into two groups and give one group the new model. Everything else (season, marketing, competitors) hits both groups equally, **in expectation**. So the only systematic difference between the groups is the model, and the gap in outcomes estimates its **causal effect**.
+
+> **An A/B test is a randomized controlled experiment. It's the only standard tool that measures what the model *causes*, not just what it *correlates* with.**
+
+### How it works
+
+<Diagram src="evaluation/ab-test-design-flow.svg" />
+
+The design decisions, in the order you make them:
+
+**1. Hypothesis and metrics, written down before launch.**
+"The personalized row increases **row purchases per user** (OEC) by ≥ 1% (minimum detectable effect), without regressing the guardrails: sitewide revenue per user, p99 latency, return rate, new-user conversion." These come straight from A2. Writing them in advance is what stops you from choosing whichever metric came out green (the "look at 20 metrics" failure).
+
+**2. Randomization unit.** This is the most important structural choice:
+
+| Unit | Pros | Cons | Use when |
+|---|---|---|---|
+| **User** (logged-in ID) | Consistent experience; captures learning and retention effects | Fewer units, so less power; needs a stable ID | **Default for product changes like ours** |
+| **Session / page view** | Many units, more power | The same user sees both variants: inconsistent, and effects carry over; can't measure retention | Stateless changes like search ranking tweaks, where consistency doesn't matter |
+| **Device / cookie** | Works for logged-out traffic | One person on two devices can end up in both arms | Logged-out experiences |
+| **Cluster / region / market** | Handles **interference** between users | Very few units, so low power | Marketplaces, social networks, shared inventory |
+| **Switchback** (alternate by time slot) | Handles interference from shared supply | Carryover between slots; needs careful analysis | Ride-hailing, delivery dispatch, pricing |
+
+**3. Deterministic assignment.** `hash(user_id + experiment_salt) mod 100`. The same user always lands in the same arm, no assignment table is needed, and a **per-experiment salt** keeps assignments independent across concurrent experiments.
+
+**4. Analysis unit = randomization unit.** If you randomize by user but compute CIs per impression, you've treated correlated impressions as independent: **falsely narrow intervals** (the same mistake as B7's bootstrap unit). Aggregate per user first, or use the delta method for ratio metrics (C3).
+
+**5. Triggering.** Only **users who actually reached the row** can be affected by it. If only 30% of homepage visitors scroll far enough to render the row, including the other 70% just adds noise: a +3% effect among triggered users becomes about +0.9% diluted across everyone, which is much harder to detect. So analyze **triggered users**, but define the trigger identically in both arms, based on something that happens **before** the treatment ("row was rendered in the viewport"). Also log **counterfactually**: in control, log what the treatment *would* have shown. That lets you trigger only on requests where the two models actually differ, which increases power further.
+
+**6. Allocation and ramp.** 50/50 gives maximum power for a fixed amount of traffic. Ramp up to it for safety: **1% for a day** (canary: is anything broken?) → **10%** → **50/50** for the measurement period. **Only analyze the stable 50/50 period**, because mixing ramp phases with different allocations invites Simpson's paradox (B5).
+
+**7. Duration.** Set by the power calculation (C3), rounded up to **whole weeks** so weekday and weekend behavior are balanced. Never "until it looks significant." That's the peeking problem in C6.
+
+**8. Validate the pipeline.**
+- **A/A test:** both arms get the champion. The result should be "no difference" about 95% of the time. If A/A tests often come out "significant," the metric or variance pipeline is broken.
+- **SRM (sample ratio mismatch) check:** a 50/50 design should produce very close to a 50/50 split. With 1M users, 508k vs. 492k is about 16 standard deviations off. **Something is broken** (bots filtered from one arm only, a redirect losing treatment users, a crash on treatment), and **the results can't be trusted**, however good they look.
+
+### Store design summary
+
+| Choice | Decision |
+|---|---|
+| Unit | Logged-in user ID (logged-out traffic analyzed separately by cookie) |
+| Trigger | Row rendered in viewport; counterfactual logging in control |
+| OEC | Row purchases per triggered user |
+| Guardrails | Sitewide revenue/user, p99 latency, return rate, new-user conversion |
+| Ramp | 1% → 10% → 50/50 |
+| Duration | From the power calculation, rounded up to whole weeks (≥ 2) |
+| Validity | A/A test beforehand; SRM check every day |
+
+### Assumptions
+
+- **No interference (SUTVA):** one user's treatment doesn't affect another user's outcome. **The store can violate this.** If the new model steers many treatment users to the same limited-stock item, they buy it up, and control users who would have bought it can't. Control looks worse, and the effect is **overstated**. Shared features ("trending now," computed from all users' behavior) can also carry the treatment's influence into control.
+- **Stable assignment:** users don't switch arms or appear under multiple IDs.
+- **Identical measurement:** the same logging and metric code in both arms.
+- **The effect persists:** what you measure in 2 weeks is what you'll get later. Novelty and learning effects break this (C6, E3).
+
+### Trade-offs
+
+- **Unit granularity:** finer units give more power but less consistency and more carryover.
+- **Allocation:** 50/50 has maximum power but maximum exposure if the treatment is bad. 90/10 is safer but slower.
+- **Duration:** longer tests catch weekly cycles and novelty decay, but slow iteration and delay wins.
+- **Triggered vs. overall effect:** triggering gives power, but the business cares about the **overall** impact. Report both: the triggered effect × the trigger rate ≈ the diluted overall effect.
+
+### Failure modes
+
+- Randomizing by page view for a change users learn from over time.
+- A mismatch between analysis unit and randomization unit, giving falsely confident results.
+- **Triggering on post-treatment behavior** ("users who clicked the row"). The same trap as B5's post-treatment slices.
+- Ignoring SRM.
+- Changing the allocation mid-test and pooling the phases.
+- **Caching:** a CDN or cache serves the control page to treatment users, so the arms blur together.
+- Bots and internal test accounts inflating one arm.
+- Overlapping experiments on the same surface interacting with each other without anyone knowing.
+
+### Connections
+
+- **A2:** The OEC and guardrails are defined here.
+- **B5:** Pre-treatment slices become the A/B slice analysis.
+- **B7:** The same CI logic, but **online arms have different users**, so no pairing. Variance reduction comes instead from pre-experiment data (C3, CUPED).
+- **C1:** Shadow mode first, so the A/B measures the model, not a bug.
+- **C3:** How long, and with how many users.
+- **C4:** Guardrails in detail. **C6:** What breaks A/B tests.
+- **D2:** Interference and shared features connect to feedback loops.
+- **E1:** Launch gates consume the A/B results.
+
+<Callout title="Exercise 12">
+
+1. Why randomize the store row by **user** rather than by **page view**? Give two concrete reasons tied to this product.
+2. Only 30% of homepage visitors scroll far enough to see the row. The team analyzes **all** homepage visitors. What happens to the measured effect and the test's sensitivity, and what should they do instead?
+
+</Callout>
+
+## C3 Power and statistics
+
+### The problem it solves
+
+C2 gave you a clean experiment. Two questions remain:
+1. **Before:** *How many users, for how long,* so a real effect of the size you care about **reliably shows up**?
+2. **After:** *How do you read the result* without fooling yourself?
+
+Skip question 1 and you get the most common, most expensive failure in online experimentation: an **underpowered test** comes back "flat," and the team **abandons a model that actually worked.**
+
+### Four quantities, one trade-off
+
+| Quantity | Meaning | Typical choice |
+|---|---|---|
+| **α** (significance level) | Probability of declaring a win when there's no real effect (false positive) | 0.05 |
+| **Power (1−β)** | Probability of detecting a real effect **of size MDE** | 0.80 |
+| **MDE** (minimum detectable effect) | The smallest effect you care about | Business choice, e.g. +1% |
+| **σ²** (metric variance) | How noisy the metric is per user | Measured from historical data |
+
+These four fix the required sample size. For α = 0.05 and power = 0.8, the rule of thumb is:
+
+**n per arm ≈ 16 · σ² / δ²**   (δ = MDE in absolute units)
+
+It comes from 2·(1.96 + 0.84)² ≈ 15.7. The key fact is **n grows with 1/δ²: halve the MDE and you need 4× the users.**
+
+### Store numbers
+
+OEC = row purchases per triggered user over the test. Historical data: **mean 0.08, sd 0.40** (most users buy nothing; a few buy several items). About **1.5M triggered users per week**, so 750k per arm at 50/50.
+
+For MDE = **1% relative**: δ = 0.0008, n = 16 · 0.16 / 0.0008² ≈ **4,000,000 per arm**, which is **about 5.3 weeks.** That's too long. How required duration depends on MDE:
+
+<Diagram src="evaluation/ab-duration-vs-mde-with-cuped.svg" />
+
+A 2-week budget can detect **about 1.6%** without variance reduction, or **about 1.4%** with CUPED. If the team really needs to detect 1%, the design has to change.
+
+### Levers when the test is too slow
+
+1. **Accept a bigger MDE.** Honest, but means ignoring smaller real gains.
+2. **Reduce variance with CUPED.** Use each user's **pre-experiment** value of the metric (purchases in the prior 4 weeks) as a covariate:
+   `Y_adj = Y − θ·(X − mean(X))`, with `θ = cov(X, Y) / var(X)`
+   X is measured **before** assignment, so the adjustment is unbiased. Variance shrinks by a factor of **(1 − ρ²)**, where ρ is the correlation between the pre-period and in-test metric. This is online testing's version of B7's pairing: it cancels out how much each user naturally buys.
+3. **Cap heavy tails (winsorizing).** One buyer with 40 purchases can dominate the variance. Capping at the 99.9th percentile cuts σ² a lot, at the cost of a small bias.
+4. **Sharpen triggering** (C2): counterfactual triggering drops users for whom the two models showed the same thing.
+5. **A more sensitive metric, as a leading indicator.** Row CTR moves faster, but the decision stays on the OEC (A2).
+6. **Interleaving (C5)** for ranking: often 10–100× more sensitive.
+
+### Analyzing the result
+
+- **Per-user metric → t-test / z-test** on the difference in means. With hundreds of thousands of users, the central limit theorem makes this valid even for skewed metrics. Report **the absolute Δ, the relative Δ, and a 95% CI**, not only a p-value.
+- **Relative lift CI:** the delta method, or bootstrapping by user. Ratios of noisy means have their own variance.
+- **Ratio metrics where the unit ≠ randomization unit** (CTR = clicks/impressions, randomized by user): impressions are correlated within a user. Use the **delta method** or a **user-level bootstrap**, never an impression-level binomial formula (the C2 analysis-unit mismatch).
+- **Non-significant ≠ no effect.** A result of +0.6% with CI (−0.4%, +1.6%) means "we can't tell." Effects of +1.5% haven't been ruled out. Report the interval and say whether the test was powered for the effect that matters.
+
+### Peeking: the problem that quietly causes the most damage
+
+Checking the p-value daily and stopping as soon as it drops below 0.05 **inflates the false-positive rate** far above 5%. Over 14 daily peeks, the real rate is roughly 20–30%. Random walks cross thresholds by chance, and if you stop at the first crossing you'll often be recording noise.
+
+Fixes:
+- **Fixed horizon:** decide n and duration up front, look once at the end.
+- **Sequential testing:** alpha-spending boundaries (O'Brien–Fleming) or always-valid p-values (mSPRT). These let you look any time with a controlled error rate, in exchange for a little power.
+- **Asymmetric early stopping:** stop early **for harm** (a guardrail breach) with a conservative boundary. Stopping early **for wins** needs the sequential methods above.
+
+### Winner's curse, online version
+
+When power is low, the results that *do* reach significance **overestimate** the true effect, because only the lucky draws cleared the bar. An underpowered test that shows "+4%!" is often really +1%. That's another reason to run properly powered tests, and to be skeptical of large lifts from small tests.
+
+### Assumptions
+
+Independent randomization units; enough sample for the CLT; stable variance (estimated from recent history); for CUPED, pre-period data exists (**new users have none**, so the variance reduction is weaker there) and the covariate isn't affected by the treatment.
+
+### Trade-offs
+
+- **α vs. power:** fewer false wins vs. fewer missed wins. Many teams accept α = 0.1 for cheap, reversible changes and use α = 0.01 for risky ones.
+- **MDE vs. duration:** smaller detectable effects cost quadratically more time.
+- **Fixed horizon vs. sequential:** fixed has the most power at a given n; sequential lets you stop early but needs somewhat more data in the worst case.
+- **Winsorizing:** less variance, but it slightly biases revenue metrics. Pick the cap before seeing results.
+
+### Failure modes
+
+- No power calculation, then "flat, kill it" on an underpowered test.
+- Peeking and stopping on a win.
+- Impression-level variance for user-randomized tests: falsely significant results.
+- **MDE chosen after the fact** to justify the result.
+- A CUPED covariate measured **during** the experiment, which biases the result.
+- Many metrics or slices tested without correction (B5).
+- Reporting "p = 0.03" with no effect size or CI.
+
+### Connections
+
+- **B7:** The same logic offline. CUPED is the online counterpart of pairing.
+- **C2:** Unit and triggering choices determine σ² and n.
+- **C4:** Guardrails need their own power calculation, and often **non-inferiority** tests ("not worse by more than X") rather than superiority tests.
+- **C5:** Interleaving is the most powerful lever for ranking.
+- **C6:** Peeking is the top pitfall.
+- **E1:** Gates stated as "CI lower bound > 0 and point estimate ≥ MDE," not "p < 0.05."
+- **E5:** Power calculators, CUPED and sequential boundaries belong in the experimentation platform, not in ad-hoc notebooks.
+
+<Callout title="Exercise 13">
+
+Store data: OEC mean **0.08**, sd **0.40**; **1.5M** triggered users per week, split 50/50.
+
+1. Compute n per arm and the number of weeks for an MDE of **2% relative**. How long would you actually run it, and why?
+2. The PM checks the dashboard daily and wants to stop "as soon as p < 0.05." Explain in two sentences what goes wrong, and propose a design that still lets them stop early safely.
+3. The test ends: **+0.6%, 95% CI (−0.4%, +1.6%)**. The team says "no effect, drop the model." Your response?
+
+</Callout>
+
+## C4 Guardrails
+
+Define metrics that must not get worse (latency, revenue, complaints) and block launch if they do.
+
+## C5 Interleaving
+
+For ranking, mix both models' results in one list. Much more sensitive than an A/B test, so good as a quick filter.
+
+## C6 A/B pitfalls
+
+Peeking, novelty effects, network effects between users, and too-short tests all produce false conclusions.

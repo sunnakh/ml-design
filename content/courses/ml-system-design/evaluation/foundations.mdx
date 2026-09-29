@@ -1,0 +1,199 @@
+---
+title: A. Foundations
+description: What evaluation is, what "good" means, and what we compare against.
+---
+
+## A1 Why evaluate
+
+### The problem it solves
+
+A model is fit to **past** data but used on **future** data, under conditions its own existence changes. Training loss only tells you how well the model fits examples it has already seen. A big enough model can memorize its training set and be useless on new users.
+
+> **Evaluation is estimating how a decision will perform in the future deployment setting, using evidence you can get before (or while) you commit to it.**
+
+1. **A decision.** You evaluate a choice: "ship the personalized model instead of bestsellers?" Evaluation is relative by default.
+2. **The future deployment setting.** Next month's users, new products, holiday spikes.
+3. **An estimate.** Every number has noise (variance) and can be off (bias). A number without uncertainty is half an answer.
+
+### The three questions evaluation answers
+
+| Question | Store example | Type |
+|---|---|---|
+| Is it better than what we have? | Beats bestsellers? | Relative (drives most decisions) |
+| Is it good enough at all? | Latency under 50 ms, no offensive recommendations | Absolute (constraints) |
+| Where and why does it fail? | Bad for new users? Recommends items already bought? | Diagnostic (drives the next iteration) |
+
+### The core recipe
+
+1. **Get data the model didn't learn from**, as close to deployment conditions as you can afford.
+2. **Have the model make predictions** on it.
+3. **Score the outputs** with a metric that reflects the value you care about.
+4. **Compare against a baseline** and report the uncertainty.
+
+Methods differ in how realistic step 1 is, which gives a **fidelity ladder**:
+
+<Diagram src="evaluation/fidelity-ladder.svg" />
+
+Training loss is coral because it isn't evaluation at all. Left is cheap, fast, safe and less realistic; right is costly, slow, risky and realistic. Use **the whole ladder as a funnel**: cheap methods filter out bad ideas, expensive ones confirm the survivors.
+
+### The assumptions (where evaluation quietly breaks)
+
+1. **Representativeness.** Test data from last spring won't represent holiday shoppers.
+2. **Independence from training.** A feature computed over the whole log, including the test period, peeks at the answer.
+3. **Correct labels.** "No click" might mean "didn't like it" or "never scrolled down".
+4. **Metric validity.** Clicks rise with clickbait while purchases fall.
+5. **Non-reactivity.** Old logs only contain reactions to bestsellers; you don't know reactions to items never shown.
+6. **Fresh test set.** 200 experiments against one test set means you've partly fit to it.
+
+### Design choices you make every time
+
+- **What** to measure (A2), **against what** (A3), **on what data** (B1–B2), **where on the ladder** (C, E), and **how sure** you need to be (B7, C3).
+
+### Trade-offs
+
+- **Fidelity vs cost and speed.** A/B tests take weeks; offline evals take minutes.
+- **Fidelity vs risk.** Higher fidelity exposes real users to a possibly worse model.
+- **Reusing the test set vs trusting it.**
+
+### Failure modes
+
+- Reporting training or validation loss as "the model is good."
+- No baseline, so "AUC 0.82" means nothing.
+- One aggregate number hiding a group that got worse.
+- A test set that doesn't match deployment.
+- An offline win that is really leakage.
+- Stopping at "better" without asking "how sure?"
+
+### Connections
+
+- **Requirements** defines the metric and success bar.
+- **Data** produces splits and labels; data bugs become evaluation bugs.
+- **Modeling** uses offline evaluation as its inner loop.
+- **Deployment** is gated by evaluation.
+- **Monitoring** is evaluation that never stops.
+
+<Callout title="Exercise A1">
+  The store team reports: training accuracy 97%, test AUC **0.91** vs **0.85** for a bestseller baseline. The test set is a **random 20%** of 6 months of homepage logs collected **while the bestseller row was live**. They want to ship to 100% next week. Name up to three reasons the result might not mean users buy more, and which assumption each breaks. If you could run only one extra check, which and why?
+</Callout>
+
+## A2 Metric ladder
+
+### How it works
+
+Each arrow means **"is assumed to predict."** Going down, metrics get faster, cheaper, less noisy and more sensitive. Going up, they get closer to real value.
+
+<Diagram src="evaluation/metric-ladder.svg" />
+
+| Level | Store metric | Speed | Used for |
+|---|---|---|---|
+| North star | 90-day revenue per user, retention | Months | Strategy, long-term holdouts (E3) |
+| Online primary (OEC) | Purchases from the row per user | 1–3 weeks | **The** ship / no-ship metric in an A/B test |
+| Online proxy | Row click-through rate (CTR) | Days | Early read, debugging |
+| Offline | Recall@20 or NDCG@20 on next week's purchases | Minutes | Model selection and tuning |
+| Training loss | Log loss of predicted click probability | Seconds | Gradient descent only |
+| Guardrails | Latency, returns, diversity | Continuous | Veto a launch even if the primary wins |
+
+**Every arrow is a hypothesis, not a fact.** "Better recall@20 → more purchases" must be checked empirically, and re-checked. Keep a log of past experiments:
+
+| Experiment | Offline Δ recall@20 | Online Δ purchases/user |
+|---|---|---|
+| exp-12 | +3.1% | +1.2% |
+| exp-15 | +0.4% | +0.1% |
+| exp-19 | +5.0% | **−0.8%** |
+
+If offline gains **usually move with** online gains, the offline metric is a trustworthy filter. When they disagree (exp-19), something broke in the chain (branch D).
+
+### What makes a metric good
+
+1. **Aligned (valid):** rises when real value rises.
+2. **Sensitive:** moves detectably for a realistic change. 90-day revenue rarely moves significantly in 2 weeks.
+3. **Hard to game.**
+4. **Attributable:** your change moves it, not a marketing promotion.
+5. **Cheap and fast enough** for the decision.
+6. **Defined before the experiment.**
+
+Alignment and sensitivity **trade off**, which is why the ladder exists.
+
+### Design choices
+
+- **Training label:** clicks (plentiful, noisy, gameable), add-to-cart, or purchase (sparse, closest to value). Often combined: `score = p(click) · w₁ + p(purchase) · price · w₂`. The weights are a business decision.
+- **One OEC**, agreed beforehand. Several "primary" metrics means one always went up.
+- **Guardrails and thresholds**, e.g. p99 latency +5 ms max, return rate +0.2 pp max. Hard vetoes.
+- **Time horizon:** decide how to catch long-term harm (E3 holdouts).
+- **Metric unit:** per user, session or impression (C3, gaming).
+
+### Failure modes
+
+- **Goodhart:** train on clicks and the model learns flashy "you won't believe the price" items. CTR +8%, purchases flat, returns up.
+- **Ratio traps:** showing the row less often, only to engaged users, raises CTR while total clicks and purchases fall. Check numerator and denominator.
+- **Misaligned ladder:** train on clicks, select on purchase recall, business wants margin.
+- **Proxy decay:** the row moves below the fold and last year's aligned proxy stops being aligned.
+- **Guardrail omission:** a heavier model adds 40 ms to the homepage and costs more sitewide than the row gained.
+- **Choosing the metric after the fact.**
+
+### Connections
+
+- **Framing and requirements** build the ladder. **Data:** the training label is the bottom rung. **B3:** the offline rung in detail. **C2–C4:** OEC and guardrails become the A/B design. **D1:** when arrows break. **Monitoring:** the same ladder in production.
+
+<Callout title="Exercise A2">
+  The VP says: *"Grow revenue from the homepage this quarter."* The team proposes training on clicks and shipping if row CTR rises in the A/B test. Propose an OEC and two guardrails with a sentence each. Describe one specific way the model could raise CTR while lowering your OEC (name the mechanism). What evidence would you want before trusting offline recall@20, and what would make you stop trusting it?
+</Callout>
+
+## A3 Baselines
+
+### The problem it solves
+
+"Test recall@20 = 0.21." Good? **You can't tell.** A metric only means something relative to reference points:
+
+| Baseline | Question it answers | Store example |
+|---|---|---|
+| **Floor** (random, constant, base rate) | Is the pipeline working? | Random products |
+| **Heuristic** | Is ML worth the complexity? | Popularity, "recently viewed" |
+| **Simple ML** | Is the complex model worth its cost? | Matrix factorization, logistic regression |
+| **Champion** (in production now) | **Should we switch?** The actual decision | Bestseller row |
+| **Ceiling** (oracle, human) | How much headroom? Where's the bottleneck? | Oracle ranking the user's actual purchases first, within available candidates |
+
+### How it works
+
+Run **every baseline and the candidate through the same pipeline**: same test period, users, candidate set and metric code. Read the model's position **between floor and ceiling**:
+
+<Diagram src="evaluation/baseline-ladder.svg" />
+
+1. **Against the champion:** 0.21 vs 0.11 is +91% relative. The number the team will quote.
+2. **Against the best cheap heuristic:** 0.21 vs 0.17 ("recently viewed") is +0.04 absolute. A one-line SQL heuristic gets **~80% of the gain** at almost no serving cost. Is the last +0.04 worth a feature pipeline, GPU serving, on-call and harder debugging?
+3. **Against the ceiling:** headroom captured = (0.21 − 0.01) / (0.34 − 0.01) ≈ **61%**. At 0.33 you'd stop tuning the ranker and look at retrieval, which limits the ceiling.
+
+### Assumptions
+
+- **Equal effort:** baselines tuned seriously. **Equal conditions:** same data, split, candidates, filters, metric code. **Current numbers:** champion re-scored on today's test set. **Realistic ceiling:** the oracle respects system constraints.
+
+### Design choices
+
+- **Which baselines:** at minimum floor, strongest cheap heuristic, champion. Add simple ML for expensive candidates, a ceiling when deciding where to invest.
+- **Tune baselines fairly.** If you'd be embarrassed to show its config to a reviewer, it's a straw man.
+- **Report absolute and relative lift.**
+- **Complexity-adjusted gain:** put gain next to latency, compute, maintenance, explainability.
+- **Online baselines too:** sometimes run a heuristic arm (A/B/C).
+
+### Trade-offs
+
+- **Strong baselines make wins smaller but real**; weak ones make them big and fake.
+- A day tuning the heuristic can save a quarter building a model that doesn't beat it.
+- A heuristic that's 80% as good and never breaks can be the right choice.
+
+### Failure modes
+
+- **Straw-man baseline** (default hyperparameters, 10% of data).
+- **Stale comparison** (champion's number from last year's report).
+- **Mismatched conditions** (full catalog vs in-stock only).
+- **No floor**, so pipeline bugs go unnoticed.
+- **Beating the ceiling:** almost certainly **leakage or a metric bug** (B2).
+- **Log bias** favoring popularity-like models (D2).
+
+### Connections
+
+- **A2:** same rung. **B1–B2:** same splits; leakage shows as "beating the ceiling". **B7 / C3:** is +0.04 bigger than noise? **C2:** the champion is the A/B control. **E1–E2:** launch gates. **Modeling:** build baselines before the model; sometimes the baseline is what you ship.
+
+<Callout title="Exercise A3">
+  A teammate: *"New model recall@20 = **0.21**, MF baseline = **0.12**. +75%!"* The MF baseline used **default hyperparameters** from an evaluation **two months ago**, and ranked the **full catalog** while the new model ranks only **in-stock items**. What's wrong, and how would you fix each? After fixing, the model scores **0.36**, above the 0.34 oracle ceiling: what do you conclude, and what do you check first?
+</Callout>

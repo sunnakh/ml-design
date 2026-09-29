@@ -1,0 +1,17 @@
+<svg width="100%" viewBox="0 0 680 250" role="img"><title>Point-in-time correctness for features</title><desc>Timeline with the moment a recommendation is shown, time t. A feature using the user's purchases in the 30 days before t ends before t and is safe. Item popularity over January to June and item page views that day both extend past t and leak future information. The purchase outcome happens after t.</desc><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<text class="th" x="400" y="28" text-anchor="middle" dominant-baseline="central">Rec shown (t)</text>
+<line x1="400" y1="40" x2="400" y2="48" stroke="var(--t)" stroke-width="1" stroke-dasharray="3 3"/>
+<line x1="400" y1="74" x2="400" y2="82" stroke="var(--t)" stroke-width="1" stroke-dasharray="3 3"/>
+<line x1="400" y1="108" x2="400" y2="116" stroke="var(--t)" stroke-width="1" stroke-dasharray="3 3"/>
+<line x1="400" y1="142" x2="400" y2="156" stroke="var(--t)" stroke-width="1" stroke-dasharray="3 3"/>
+<g class="c-teal"><rect x="220" y="50" width="172" height="22" rx="3" stroke-width="0.5"/><text class="ts" x="306" y="61" text-anchor="middle" dominant-baseline="central">User buys, last 30d</text></g>
+<g class="c-coral"><rect x="60" y="84" width="560" height="22" rx="3" stroke-width="0.5"/><text class="ts" x="230" y="95" text-anchor="middle" dominant-baseline="central">Item popularity, all of Jan to Jun</text></g>
+<g class="c-coral"><rect x="320" y="118" width="170" height="22" rx="3" stroke-width="0.5"/><text class="ts" x="445" y="129" text-anchor="middle" dominant-baseline="central">Views that day</text></g>
+<line class="arr" x1="40" y1="160" x2="636" y2="160" marker-end="url(#arrow)"/>
+<circle cx="520" cy="160" r="4" fill="var(--t)"/>
+<text class="ts" x="520" y="180" text-anchor="middle" dominant-baseline="central">Purchase (t + 2d)</text>
+<text class="ts" x="220" y="206" text-anchor="middle" dominant-baseline="central">Allowed: known before t</text>
+<text class="ts" x="540" y="206" text-anchor="middle" dominant-baseline="central">Forbidden: after t</text>
+<g class="c-teal"><rect x="40" y="226" width="12" height="12" rx="2" stroke-width="0.5"/></g><text class="ts" x="60" y="232" dominant-baseline="central">Safe feature</text>
+<g class="c-coral"><rect x="160" y="226" width="12" height="12" rx="2" stroke-width="0.5"/></g><text class="ts" x="180" y="232" dominant-baseline="central">Leaky feature</text>
+</svg>

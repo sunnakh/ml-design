@@ -1,0 +1,13 @@
+<svg width="100%" viewBox="0 0 680 200" role="img"><title>Time split with gaps, label maturity, and refit</title><desc>Timeline January to July. Row one: train January to April, gap, validation in May, gap, test in June, then a label settling window in early July. Row two: after selecting a model, refit on train plus validation and score the test window once.</desc>
+<text class="ts" x="60" y="36" dominant-baseline="central">Jan</text><text class="ts" x="140" y="36" dominant-baseline="central">Feb</text><text class="ts" x="220" y="36" dominant-baseline="central">Mar</text><text class="ts" x="300" y="36" dominant-baseline="central">Apr</text><text class="ts" x="380" y="36" dominant-baseline="central">May</text><text class="ts" x="460" y="36" dominant-baseline="central">Jun</text><text class="ts" x="540" y="36" dominant-baseline="central">Jul</text>
+<g class="c-teal"><rect x="60" y="54" width="320" height="34" rx="4" stroke-width="0.5"/><text class="th" x="220" y="71" text-anchor="middle" dominant-baseline="central">Train: fit candidates</text></g>
+<g class="c-purple"><rect x="398" y="54" width="62" height="34" rx="4" stroke-width="0.5"/><text class="th" x="429" y="71" text-anchor="middle" dominant-baseline="central">Val</text></g>
+<g class="c-coral"><rect x="478" y="54" width="62" height="34" rx="4" stroke-width="0.5"/><text class="th" x="509" y="71" text-anchor="middle" dominant-baseline="central">Test</text></g>
+<rect x="540" y="54" width="44" height="34" rx="4" fill="none" stroke="var(--b)" stroke-width="0.5" stroke-dasharray="4 3"/>
+<text class="ts" x="389" y="106" text-anchor="middle" dominant-baseline="central">gap</text>
+<text class="ts" x="469" y="106" text-anchor="middle" dominant-baseline="central">gap</text>
+<text class="ts" x="562" y="106" text-anchor="middle" dominant-baseline="central">labels settle</text>
+<g class="c-teal"><rect x="60" y="130" width="400" height="34" rx="4" stroke-width="0.5"/><text class="th" x="260" y="147" text-anchor="middle" dominant-baseline="central">Refit chosen model on train + val</text></g>
+<g class="c-coral"><rect x="478" y="130" width="62" height="34" rx="4" stroke-width="0.5"/><text class="th" x="509" y="147" text-anchor="middle" dominant-baseline="central">Test</text></g>
+<rect x="540" y="130" width="44" height="34" rx="4" fill="none" stroke="var(--b)" stroke-width="0.5" stroke-dasharray="4 3"/>
+</svg>

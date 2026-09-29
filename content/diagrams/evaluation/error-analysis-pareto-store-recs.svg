@@ -1,0 +1,29 @@
+<svg width="100%" viewBox="0 0 680 280" role="img"><title>Error categories for missed purchases, sorted by frequency</title><desc>Pareto of 100 missed purchases. Already-purchased items recommended 32 percent, fix with filter or feature. New users with no history 21 percent, fix with cold-start path. Bought via search not row 15 percent, fix label definition. Out-of-stock candidates 12 percent, an evaluation bug. Gifts off-profile 10 percent, context features. Near-duplicate items 10 percent, diversity rerank.</desc>
+<line x1="240" y1="28" x2="240" y2="220" stroke="var(--b)" stroke-width="0.5"/>
+<text class="t" x="40" y="44" dominant-baseline="central">Already bought, re-shown</text>
+<g class="c-teal"><rect x="240" y="35" width="224" height="18" rx="2" stroke-width="0.5"/></g>
+<text class="ts" x="472" y="44" dominant-baseline="central">32%</text>
+<text class="ts" x="640" y="44" text-anchor="end" dominant-baseline="central">Filter / feature</text>
+<text class="t" x="40" y="76" dominant-baseline="central">New user, no history</text>
+<g class="c-teal"><rect x="240" y="67" width="147" height="18" rx="2" stroke-width="0.5"/></g>
+<text class="ts" x="395" y="76" dominant-baseline="central">21%</text>
+<text class="ts" x="640" y="76" text-anchor="end" dominant-baseline="central">Cold-start path</text>
+<text class="t" x="40" y="108" dominant-baseline="central">Bought via search</text>
+<g class="c-coral"><rect x="240" y="99" width="105" height="18" rx="2" stroke-width="0.5"/></g>
+<text class="ts" x="353" y="108" dominant-baseline="central">15%</text>
+<text class="ts" x="640" y="108" text-anchor="end" dominant-baseline="central">Label definition</text>
+<text class="t" x="40" y="140" dominant-baseline="central">Out-of-stock candidate</text>
+<g class="c-coral"><rect x="240" y="131" width="84" height="18" rx="2" stroke-width="0.5"/></g>
+<text class="ts" x="332" y="140" dominant-baseline="central">12%</text>
+<text class="ts" x="640" y="140" text-anchor="end" dominant-baseline="central">Eval bug</text>
+<text class="t" x="40" y="172" dominant-baseline="central">Gift, off-profile</text>
+<g class="c-teal"><rect x="240" y="163" width="70" height="18" rx="2" stroke-width="0.5"/></g>
+<text class="ts" x="318" y="172" dominant-baseline="central">10%</text>
+<text class="ts" x="640" y="172" text-anchor="end" dominant-baseline="central">Context features</text>
+<text class="t" x="40" y="204" dominant-baseline="central">Near-duplicate items</text>
+<g class="c-teal"><rect x="240" y="195" width="70" height="18" rx="2" stroke-width="0.5"/></g>
+<text class="ts" x="318" y="204" dominant-baseline="central">10%</text>
+<text class="ts" x="640" y="204" text-anchor="end" dominant-baseline="central">Diversity rerank</text>
+<g class="c-teal"><rect x="40" y="246" width="12" height="12" rx="2" stroke-width="0.5"/></g><text class="ts" x="60" y="252" dominant-baseline="central">Fix the model or system</text>
+<g class="c-coral"><rect x="250" y="246" width="12" height="12" rx="2" stroke-width="0.5"/></g><text class="ts" x="270" y="252" dominant-baseline="central">Fix the labels or evaluation</text>
+</svg>

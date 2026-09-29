@@ -1,0 +1,19 @@
+<svg width="100%" viewBox="0 0 680 240" role="img"><title>Same plus 0.005 lift under three views of uncertainty</title><desc>Observed lift of plus 0.005 in recall. Unpaired 95 percent confidence interval spans minus 0.002 to plus 0.012 and includes zero. Paired interval spans plus 0.002 to plus 0.008 and excludes zero. Seed-to-seed spread for the identical model spans roughly minus 0.007 to plus 0.007, so the lift is within training noise.</desc>
+<line x1="368" y1="28" x2="368" y2="176" stroke="var(--t)" stroke-width="0.5" stroke-dasharray="3 3"/>
+<text class="t" x="40" y="50" dominant-baseline="central">Unpaired CI</text>
+<line x1="336" y1="50" x2="568" y2="50" stroke="#D85A30" stroke-width="3"/>
+<line x1="336" y1="42" x2="336" y2="58" stroke="#D85A30" stroke-width="1.5"/><line x1="568" y1="42" x2="568" y2="58" stroke="#D85A30" stroke-width="1.5"/>
+<g class="c-coral"><circle cx="452" cy="50" r="5"/></g>
+<text class="t" x="40" y="100" dominant-baseline="central">Paired CI</text>
+<line x1="405" y1="100" x2="499" y2="100" stroke="#1D9E75" stroke-width="3"/>
+<line x1="405" y1="92" x2="405" y2="108" stroke="#1D9E75" stroke-width="1.5"/><line x1="499" y1="92" x2="499" y2="108" stroke="#1D9E75" stroke-width="1.5"/>
+<g class="c-teal"><rect x="447" y="95" width="10" height="10"/></g>
+<text class="t" x="40" y="150" dominant-baseline="central">Seed-to-seed spread</text>
+<g class="c-gray"><rect x="250" y="140" width="236" height="20" rx="3" stroke-width="0.5"/></g>
+<line x1="452" y1="134" x2="452" y2="166" stroke="#D85A30" stroke-width="1.5"/>
+<line x1="200" y1="180" x2="620" y2="180" stroke="var(--b)" stroke-width="0.5"/>
+<text class="ts" x="200" y="196" text-anchor="middle" dominant-baseline="central">−0.01</text>
+<text class="ts" x="368" y="196" text-anchor="middle" dominant-baseline="central">0</text>
+<text class="ts" x="536" y="196" text-anchor="middle" dominant-baseline="central">+0.01</text>
+<text class="ts" x="410" y="220" text-anchor="middle" dominant-baseline="central">Change in recall@20; marker = observed +0.005</text>
+</svg>

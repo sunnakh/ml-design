@@ -1,0 +1,17 @@
+<svg width="100%" viewBox="0 0 680 240" role="img"><title>Choosing a task metric by how the output is used</title><desc>Root question: how is the model output used? Four branches: decide yes or no uses precision, recall and expected cost, for example fraud blocking; rank a list uses NDCG at k, recall at k, MRR and MAP, for example the store row; estimate a value uses MAE, RMSE and quantile loss, for example delivery ETA; use a probability uses log loss and calibration, for example ad bidding.</desc>
+<g class="c-gray"><rect x="230" y="30" width="220" height="44" rx="4" stroke-width="0.5"/><text class="th" x="340" y="52" text-anchor="middle" dominant-baseline="central">How is the output used?</text></g>
+<line x1="340" y1="74" x2="340" y2="92" stroke="var(--b)" stroke-width="0.5"/>
+<line x1="110" y1="92" x2="569" y2="92" stroke="var(--b)" stroke-width="0.5"/>
+<line x1="110" y1="92" x2="110" y2="110" stroke="var(--b)" stroke-width="0.5"/>
+<line x1="263" y1="92" x2="263" y2="110" stroke="var(--b)" stroke-width="0.5"/>
+<line x1="416" y1="92" x2="416" y2="110" stroke="var(--b)" stroke-width="0.5"/>
+<line x1="569" y1="92" x2="569" y2="110" stroke="var(--b)" stroke-width="0.5"/>
+<g class="c-gray"><rect x="40" y="110" width="140" height="84" rx="4" stroke-width="0.5"/><text class="th" x="110" y="130" text-anchor="middle" dominant-baseline="central">Decide yes/no</text><text class="ts" x="110" y="154" text-anchor="middle" dominant-baseline="central">Precision, recall</text><text class="ts" x="110" y="174" text-anchor="middle" dominant-baseline="central">Expected cost</text></g>
+<g class="c-purple"><rect x="193" y="110" width="140" height="84" rx="4" stroke-width="0.5"/><text class="th" x="263" y="130" text-anchor="middle" dominant-baseline="central">Rank a list</text><text class="ts" x="263" y="154" text-anchor="middle" dominant-baseline="central">NDCG@k, recall@k</text><text class="ts" x="263" y="174" text-anchor="middle" dominant-baseline="central">MRR, MAP</text></g>
+<g class="c-gray"><rect x="346" y="110" width="140" height="84" rx="4" stroke-width="0.5"/><text class="th" x="416" y="130" text-anchor="middle" dominant-baseline="central">Estimate a value</text><text class="ts" x="416" y="154" text-anchor="middle" dominant-baseline="central">MAE, RMSE</text><text class="ts" x="416" y="174" text-anchor="middle" dominant-baseline="central">Quantile loss</text></g>
+<g class="c-gray"><rect x="499" y="110" width="140" height="84" rx="4" stroke-width="0.5"/><text class="th" x="569" y="130" text-anchor="middle" dominant-baseline="central">Use probability</text><text class="ts" x="569" y="154" text-anchor="middle" dominant-baseline="central">Log loss</text><text class="ts" x="569" y="174" text-anchor="middle" dominant-baseline="central">Calibration (B4)</text></g>
+<text class="ts" x="110" y="214" text-anchor="middle" dominant-baseline="central">e.g. block fraud</text>
+<text class="ts" x="263" y="214" text-anchor="middle" dominant-baseline="central">e.g. our store row</text>
+<text class="ts" x="416" y="214" text-anchor="middle" dominant-baseline="central">e.g. delivery ETA</text>
+<text class="ts" x="569" y="214" text-anchor="middle" dominant-baseline="central">e.g. ad bidding</text>
+</svg>

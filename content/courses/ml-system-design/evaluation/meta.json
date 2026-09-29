@@ -1,0 +1,5 @@
+{
+  "title": "Evaluation",
+  "icon": "ChartColumn",
+  "pages": ["index", "foundations", "offline-evaluation", "online-evaluation", "the-gap", "decisions"]
+}

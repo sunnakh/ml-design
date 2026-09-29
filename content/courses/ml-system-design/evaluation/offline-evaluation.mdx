@@ -1,0 +1,612 @@
+---
+title: B. Offline evaluation
+description: Measuring on historical data without touching users.
+---
+
+## B1 Data splits
+
+How you split decides which question the test set answers:
+
+<Diagram src="evaluation/split-strategies.svg" />
+
+A **random split** scatters test rows everywhere and leaks the future. A **time split** holds out the last period for everyone, matching deployment. A **user split** holds out whole users, testing new-user generalization.
+
+A production-faithful time split also needs gaps, label settling and a refit:
+
+<Diagram src="evaluation/time-split-with-gaps.svg" />
+
+- **Gaps (embargo).** A model trained through Sunday usually serves from Tuesday (pipeline lag, delayed features). Build that lag in. Gaps also stop boundary rows sharing information, such as a session spanning the cutoff.
+- **Label maturity.** Purchases can follow days later and returns up to 30 days. Scored on July 1, late-June impressions look like "no purchase" only because outcomes haven't happened. **Wait for labels to settle.**
+- **Refit before the final test.** After choosing on validation, retrain on train + val and score the test set **once**. Test the exact production procedure.
+
+**Match the test horizon to the retraining schedule.** Weekly retraining means the model is 0–7 days stale, so test on the week right after training ends.
+
+### Assumptions
+
+- **Local stationarity:** the test period resembles the near future.
+- **Independence across the boundary:** groups, sessions and duplicates don't cross it.
+- **Enough test data**, especially per slice (300 cold-start users is very noisy).
+- **Correct timestamps:** event time, not ingestion time.
+
+### Design choices
+
+Split key (time, user, item, or a combination), window lengths, gap size, test horizon, refit policy, test size, number of rolling folds, and **which slices you report** (warm/cold users, new/old items).
+
+### Trade-offs
+
+- **Recency vs training data:** hence refitting.
+- **Test size vs noise.**
+- **One window vs rolling:** N× compute, but shows variance and seasonality.
+- **Representative vs worst case:** a holiday week may be unrepresentative and also exactly when the system matters most.
+
+### Failure modes
+
+- **Random split on time-ordered data:** great offline, disappointing online.
+- **Entity overlap** when the question is about new users or items.
+- **Duplicates across the split.**
+- **Preprocessing fit on all data** (normalization, vocabularies, popularity counts, target encodings): leakage (B2).
+- **Immature labels.**
+- **Test set reused for tuning.**
+- **Test candidates don't match serving** (all products vs in-stock, region-available ones).
+
+### Connections
+
+- **A1** assumptions (representativeness, independence, fresh test set) are implemented here. **A3:** every baseline uses the same split. **B2:** information crossing the split. **B5:** warm/cold reporting. **B7:** rolling folds show variance. **Data:** time splits need point-in-time correct features (E5). **Monitoring:** production traffic is the final out-of-time test.
+
+<Callout title="Exercise B1">
+  Homepage logs cover **Jan 1 – Jun 30**. The model retrains **every Monday** on data through the previous Saturday. Purchases arrive **up to 7 days** after an impression; returns take up to **30 days**, and the OEC counts net purchases. Specify train, validation and test windows, gap sizes, and when final test numbers can be computed. Which slices would you report? In one sentence: why does a random 20% split overstate the gain here?
+</Callout>
+
+## B2 Leakage
+
+### The problem it solves
+
+**Leakage** is when the model, in training or evaluation, gets information that **won't be available in production**. It looks brilliant offline and falls apart online. It's among the most dangerous failures because it's **silent** (just *better* numbers), **the incentives favor it** (leaky experiments "win"), and it usually lives **in data engineering**, not model code.
+
+### The core principle: point-in-time correctness
+
+For every example with prediction time **t**, every feature must use **only data the serving system would have at t**: data before t, minus pipeline lag.
+
+<Diagram src="evaluation/leakage-point-in-time.svg" />
+
+"Views that day" is the subtle one. Clicking the recommendation lands the user on the product page, and that view is counted, so the feature partly **encodes the outcome**. The model learns "high views → will click", which it can't use at serving time.
+
+### Six ways information leaks
+
+| Type | Mechanism | Store example |
+|---|---|---|
+| **Target leakage** | A feature is caused by the label, or computed after it | "Views that day" includes views caused by the click |
+| **Temporal leakage** | A feature aggregates data from after t | Item popularity over all of Jan–Jun; user embedding trained on the full log |
+| **Contamination** | Same entity or info on both sides, or preprocessing fit on all data | Duplicate listings; vocabularies, scalers, **target encodings** over train + test |
+| **Availability skew** | Offline uses fresher or more complete data than serving | Offline computes last-hour item CTR exactly; the online store refreshes **daily** |
+| **Sampling leakage** | How examples were sampled correlates with the label | Positives from active buyers, negatives from random users |
+| **Evaluation leakage** | The eval setup contains the answer | Candidates = purchased item + 99 random items; production retrieval returns 500 *plausible* items |
+
+The last is common in recommenders and search: the **model** is fine, but the **evaluation task is easier than production**.
+
+### Detection
+
+- **Too good to be true:** beats the ceiling, AUC 0.99. Treat it as a bug report.
+- **Feature importance:** one feature dominates; check what it really is.
+- **Ablation:** drop the suspect; if the metric collapses, trace its computation.
+- **Feature audit:** source table, **which timestamp column**, as-of logic, serving freshness. If nobody knows, assume it leaks.
+- **Offline–online feature comparison:** log served values and compare to offline recomputation.
+- **Adversarial validation:** if a classifier easily tells train rows from test rows, something identifies the split.
+- **Shadow mode (C1):** compare live and offline prediction distributions.
+
+### Prevention
+
+- **Point-in-time joins** in a feature store.
+- **Log and wait:** train on served feature logs; zero skew by construction.
+- **Split before any preprocessing;** fit encoders on train only, packaged as one pipeline object.
+- **Production-faithful evaluation:** offline candidates = what retrieval returns.
+- **Deduplicate entities** across splits, including near-duplicates.
+- **A leakage checklist** in code review for every new feature.
+
+### Assumptions
+
+Timestamps are correct event times; serving lag and freshness are known; offline and online features share one implementation.
+
+### Trade-offs
+
+- **Log-and-wait vs backfill:** leak-free but weeks of logging, vs instant but risky. Mature teams backfill with point-in-time joins, then confirm with logs.
+- **Strictness vs useful signal:** real-time session clicks *before* the impression are valid **if** serving has them in time. The test is availability at serving time, not suspicion.
+- **Freshness vs cost:** closing availability skew may need streaming features.
+
+### More failure modes
+
+- Fixing a leak in training but not evaluation, or vice versa.
+- A leak added **later** by an upstream change (column redefined, backfilled with current values). Leakage is a **regression risk** (E5).
+- Assuming a vendor or platform feature store is point-in-time correct without testing it.
+
+### Connections
+
+- **B1:** leakage crosses the split boundary. **A3:** "beats the ceiling" is the alarm. **C1:** shadow mode catches availability skew. **D1:** a major cause of the offline–online gap. **Data and Features:** point-in-time feature stores. **Monitoring:** continuous skew checks. **E5:** automated leakage tests.
+
+<Callout title="Exercise B2: spot the leak">
+  Mark each store-model feature **safe** or **leaky**, and explain the mechanism for one leaky feature. (1) Purchases the user made in the 30 days before the impression. (2) The item's total purchase count over the full Jan–Jun log. (3) Times the user viewed this item's page on the impression day. (4) Item price at the moment of the impression. (5) A user embedding trained on the full Jan–Jun interaction log. (6) Item click rate in the hour before the impression, computed offline from raw logs, while the online feature store refreshes daily.
+</Callout>
+
+## B3 Task metrics
+
+### The problem it solves
+
+The **offline rung** of the ladder (A2) needs a concrete formula. There are dozens of metrics, and picking one by habit ("everyone uses AUC") is how teams end up optimizing the wrong thing. The principle:
+
+> **The metric must mirror how the product uses the model's output.** Ask what happens downstream with the prediction.
+
+<Diagram src="evaluation/task-metric-selection-tree.svg" />
+
+Our store row is a **ranking** problem, so that branch goes deepest. The other three come up constantly in real systems, and in interviews.
+
+### 1. Classification (decide yes/no)
+
+Everything starts from the **confusion matrix**: TP, FP, FN, TN at some threshold.
+
+| Metric | Formula | Answers | Watch out |
+|---|---|---|---|
+| **Accuracy** | (TP+TN)/all | Share of predictions that are right | **Useless when classes are imbalanced.** "Never fraud" is 99.9% accurate |
+| **Precision** | TP/(TP+FP) | Of the cases we flagged, how many were real? | Depends on the threshold |
+| **Recall** | TP/(TP+FN) | Of the real cases, how many did we catch? | Depends on the threshold |
+| **F-beta** | Weighted harmonic mean | Balances the two | β encodes how much you value recall over precision. That's a business choice |
+| **ROC-AUC** | P(random positive scored above random negative) | Overall ranking quality | **Looks great under heavy imbalance** even when precision at the threshold you'd actually use is terrible |
+| **PR-AUC** | Area under the precision–recall curve | Quality on the rare class | Its baseline equals prevalence, so compare against that |
+| **Expected cost** | FP·c_fp + FN·c_fn | **What the business actually pays** | Needs cost estimates, which is exactly why it's honest |
+
+Key idea: **threshold-free metrics** (AUC) are for comparing models. **Operating-point metrics** (precision at the threshold you'll ship) are for deciding whether to launch. You need both.
+
+### 2. Ranking (our store row)
+
+The labels are graded relevance per (user, item). Let's grade by business value: **purchase = 3, add-to-cart = 2, click = 1, nothing = 0.**
+
+| Metric | What it measures | Good for | Blind spot |
+|---|---|---|---|
+| **Precision@k** | Share of the top k that are relevant | "How much of the row is useful?" | Ignores order within the top k |
+| **Recall@k** | Share of the user's relevant items that appear in the top k | "Did we surface what they wanted?" | Ignores order; depends on how many relevant items exist |
+| **MRR** | 1 / rank of the first relevant item | Search with one right answer | Ignores everything after the first hit |
+| **MAP** | Average precision across ranks | Binary relevance, order-aware | No graded relevance |
+| **NDCG@k** | Graded gains, discounted by position, normalized | **Graded, order-sensitive lists** such as feeds and rows | Less intuitive; the discount curve is an assumption |
+
+**How NDCG works.** Take one user's top-5 list with relevance grades `[0, 3, 0, 1, 0]`:
+
+- **DCG** = Σ relᵢ / log₂(i+1) = 3/log₂3 + 1/log₂5 = 1.89 + 0.43 = **2.32**
+- **Ideal ordering** `[3, 1, 0, 0, 0]`: **IDCG** = 3/1 + 1/log₂3 = 3 + 0.63 = **3.63**
+- **NDCG@5** = 2.32 / 3.63 = **0.64**
+
+Putting the purchase at rank 2 instead of rank 1 cost about a third of the score. The log discount **assumes** attention falls off roughly logarithmically with position. Whether that matches your UI is something you can check against real click-through by position.
+
+**Beyond accuracy.** A list of 20 nearly identical phone cases can score well on NDCG and still be a bad row. Teams track **coverage** (share of the catalog ever recommended), **intra-list diversity** and **novelty**, usually as guardrails (A2).
+
+### 3. Regression (estimate a value)
+
+- **MAE:** the average absolute error. Robust to outliers; optimizing it targets the median.
+- **RMSE:** squares errors, so large misses are punished heavily. Optimizing it targets the mean.
+- **MAPE:** relative error. It **breaks near zero** and treats over- and under-prediction unequally.
+- **Quantile (pinball) loss:** for **asymmetric costs**. A delivery ETA that says 30 minutes and arrives in 45 makes people angry; one that arrives in 20 makes them happy. Evaluate at the 80th or 90th percentile, not the mean.
+
+### 4. Probability consumed downstream
+
+If another system multiplies your number, as in bid = p(click) × value, then **ranking correctly isn't enough; the probabilities have to be accurate.** Use **log loss** (a proper scoring rule: it rewards honest probabilities) plus **calibration**. That's the whole of B4.
+
+### Design choices for the store
+
+- **Which k?** Use **the number of items users actually see.** The row holds 20 items, but **on mobile only about 4 are visible without swiping.** If 70% of traffic is mobile, NDCG@4 may matter more than NDCG@20. Report both.
+- **Relevance grades.** The 3/2/1 weights are **business decisions**. They say a purchase is worth three clicks. Agree on them with the product team, as with the OEC.
+- **Averaging.** **Per-user (macro)**: compute the metric per user, then average, so every user counts equally. **Global (micro)**: pool all impressions, so heavy users dominate. They answer different questions. Macro is usually closer to "a typical user's experience."
+- **Primary metric vs. dashboard.** Pick **one** primary offline metric for model selection, with the rest as diagnostics. Several primaries means you can always find one that improved (A2).
+
+### Assumptions
+
+- **Labels represent relevance.** A click isn't approval, and no click isn't rejection.
+- **Unshown items aren't irrelevant.** In recommendation logs, most items were **never shown** to the user, so "no interaction" often means "never had the chance." Standard offline metrics treat those as negatives. That biases evaluation toward whatever the old system showed, which is D2 and D3.
+- The **candidate set and k match production** (B2).
+
+### Trade-offs
+
+- **Interpretability vs. fidelity.** "Recall@20 = 0.21" is easy to explain to a VP. NDCG is closer to the real objective but harder to explain.
+- **Threshold-free vs. operating point.** Covered above; use both.
+- **One metric vs. a panel.** A single primary metric makes decisions easy; a panel catches blind spots. Standard answer: one primary metric plus a small fixed set of guardrails.
+
+### Failure modes
+
+- Accuracy on imbalanced data.
+- ROC-AUC 0.95 on a 0.5% fraud rate, while precision at the chosen threshold is 8%, so the ops team drowns in false alarms.
+- Evaluating @20 when users see 4.
+- Micro-averaging that lets 5% of power users set the number.
+- Comparing metric values across **different test sets or candidate sets**. NDCG isn't comparable across them.
+- Optimizing the average while the tail degrades, for example cold-start users. That's what B5 is for.
+- Treating unshown items as negatives, then being surprised online (D2).
+
+### Connections
+
+- **A2:** This is the offline rung. Its alignment with the OEC must be checked with the experiment log.
+- **A3:** Every baseline is scored with the same metric code.
+- **B4:** Calibration, for when the probabilities themselves matter.
+- **B5:** The same metrics, computed per segment.
+- **B7:** Every metric value needs a confidence interval.
+- **C5:** Interleaving is essentially an **online** ranking metric.
+- **D3:** Off-policy estimators fix the "unshown items" problem.
+
+<Callout title="Exercise 6 (design)">
+
+The store row shows **20 items**. On mobile (70% of traffic) only **4** are visible without swiping; on desktop, **8**. Labels available: purchase, add-to-cart, click.
+
+1. Choose your **primary offline metric**: which metric, which k (or k values), the relevance grades, and micro vs. macro averaging. Justify each choice in one line.
+2. A candidate model raises NDCG@20 by 3% but lowers NDCG@4 by 1%. Ship-worthy? What would you check before deciding?
+
+</Callout>
+
+## B4 Calibration
+
+### The problem it solves
+
+A model outputs a score like 0.20. **Calibration asks whether that score means what it says**: of all the cases scored around 0.20, did about 20% actually happen?
+
+That matters whenever **a downstream system uses the number as a probability**:
+- Expected value: `p(purchase) × price`
+- Bidding: `bid = p(click) × value per click`
+- Blending objectives, **which is exactly what our store does** (A2): `score = p(click)·w₁ + p(purchase)·price·w₂`
+- Thresholds tied to costs: block if `p(fraud) × loss > review cost`
+- Forecasting: "expect 1,200 purchases from this row tomorrow"
+
+The key fact: **ranking metrics can't detect miscalibration.** AUC and NDCG only look at order. Double every score, or square them, and the order stays the same, so AUC and NDCG don't change. A model can have excellent AUC and probabilities that are off by 10×.
+
+In the store: if `p(purchase)` is inflated 3× while `p(click)` is accurate, the blend silently overweights purchases. Expensive items flood the row, and nothing in your B3 metrics warns you.
+
+### How you measure it
+
+**Reliability diagram:** group predictions into bins (0–0.1, 0.1–0.2, …). For each bin, plot the average prediction against the observed rate. Perfect calibration is the diagonal.
+
+<Diagram src="evaluation/reliability-diagram-downsampling.svg" />
+
+**Summary numbers:**
+
+| Measure | What it is | Use |
+|---|---|---|
+| **Calibration ratio** (calibration-in-the-large) | mean(predicted) / observed rate. For example, predicted CTR 4.0% vs actual 3.2% gives **1.25** | The simplest check. Great for **production monitoring** |
+| **ECE** (expected calibration error) | Weighted average gap between predicted and observed, across bins | One-number summary of the reliability diagram. Sensitive to how you choose bins |
+| **Log loss / Brier score** | Proper scoring rules. They mix **calibration** and **discrimination** | A model can improve log loss through either one, so don't read it as calibration alone |
+| **Per-slice ratio** | The calibration ratio per segment | Overall calibration can hide a 2× error on new users or expensive items |
+
+### Why models become miscalibrated
+
+1. **Negative downsampling.** This is the most common cause in recommendation and ads systems. There are billions of non-clicks, so you train on, say, 5% of the negatives. The model learns a world where positives are 20× more common, and every prediction is inflated. That's the coral curve above.
+2. **Class weights / focal loss.** These deliberately distort the loss to handle imbalance, and the probabilities distort with it.
+3. **Overconfident models.** Deep networks and boosted trees with many rounds push scores toward 0 and 1.
+4. **Base-rate shift.** CTR jumps during a holiday sale while the model still predicts June's rates. Calibration drifts even though the model hasn't changed.
+5. **Selection and position bias.** The model is trained on items that were shown, often at top positions where clicks are inflated, then applied to candidates at other positions (D2).
+
+### How to fix it (post-hoc recalibration)
+
+Fit a small **monotone** mapping from raw score to probability, **on held-out data, never on training data**:
+
+- **Sampling correction** (exact, if downsampling is the only cause): with negative keep rate `w`,
+  `p = p' / (p' + (1 − p') / w)`
+- **Platt scaling:** fit a logistic regression on the score. Two parameters, data-efficient, assumes an S-shaped distortion.
+- **Isotonic regression:** a non-parametric monotone step function. Fits any shape, but needs more data, can overfit, and creates **ties** that slightly change the ranking.
+- **Temperature scaling:** one parameter that softens a neural network's logits. The standard fix for deep classifiers.
+
+Because the mapping is monotone, **ranking quality stays essentially the same** while the probabilities become honest. Calibration and discrimination are **separate properties**: recalibrating won't make a bad ranker good.
+
+### System design implication: a fourth data split
+
+Recalibration needs its own held-out data, so B1's picture becomes **train → calibration → validation → test**, ordered in time. The calibration window should be **recent**, because calibration is the part that goes stale fastest.
+
+A common production pattern: the **main model retrains weekly**, while a **lightweight calibration layer refits daily** on the newest labels. It's cheap and fast, and it absorbs base-rate drift between full retrains.
+
+### When you can skip it
+
+If the output is **only used for ordering by a single score**, calibration doesn't matter. The moment scores are **combined, thresholded against costs, compared across models, or summed into forecasts**, it does. Our store blends two heads, so we need it.
+
+### Assumptions
+
+The calibration data resembles serving traffic; the label definition is the same as the one used downstream; base rates don't move much between recalibrations.
+
+### Trade-offs
+
+- **Platt vs. isotonic:** bias vs. variance. Use Platt with little data; isotonic with a lot.
+- **Global vs. per-segment calibrators:** per-segment fixes slice-level errors but multiplies the overfitting risk and the maintenance work.
+- **Recalibration frequency:** more frequent is fresher, but noisier and with more moving parts.
+
+### Failure modes
+
+- Fitting the calibrator on **training data**. It looks perfect and is useless.
+- **Changing the downsampling rate** without updating the correction.
+- Calibrated **overall** but 1.8× off for expensive items, which distorts the blend in exactly the region that affects revenue.
+- **Thresholds that break silently.** Downstream thresholds were tuned on the old score distribution. A new model or calibrator shifts scores, and the fraud team's "block above 0.7" rule now blocks twice as many people.
+- **One head calibrated, the other not,** in a multi-objective blend.
+
+### Connections
+
+- **A2:** The blend weights only mean something if each head is calibrated.
+- **B1:** Adds the calibration split.
+- **B3:** Log loss mixes calibration with discrimination, and ranking metrics can't see calibration at all.
+- **B5:** Check calibration per slice.
+- **C:** A miscalibrated head changes blend behavior online in ways offline NDCG didn't predict.
+- **Stage 8:** The calibration ratio is one of the **cheapest and most sensitive drift alarms** in production.
+
+<Callout title="Exercise 7">
+
+1. The store's `p(purchase)` head was trained keeping **5% of negatives**. For one item it outputs **p′ = 0.20**. What's the corrected probability? Show the calculation.
+2. After correction, the overall calibration ratio is **1.0**, but for items priced **above $200** it's **1.8**. What happens to the blended row, and how would you fix it without hurting other segments?
+
+</Callout>
+
+## B5 Slicing
+
+### The problem it solves
+
+Every aggregate metric is a **weighted average over segments**. An average can go up while an important group gets worse. The store's new model reports +0.04 recall@20 overall. That number gives no hint of who pays for it.
+
+> **Slicing = computing the same metric, with uncertainty, for meaningful subgroups, so you know who wins and who loses before you ship.**
+
+Here's the store's candidate model, compared with the champion by slice:
+
+<Diagram src="evaluation/slice-deltas-recall-new-vs-champion.svg" />
+
+How to read it:
+- **New users get worse** (−0.03), and the whole interval is below zero, so it's a real regression. New users might be only 15% of traffic, but they're the store's **future customers**. A bad first impression costs more than one session.
+- **Long-tail items** at −0.01 have an interval that reaches zero, so this is **not a clear regression**. It's a warning sign: the model may be concentrating attention on popular items (a popularity feedback loop, D2).
+- **Desktop +0.08 vs. mobile +0.02.** Most traffic is mobile, so the overall gain is smaller than the desktop result suggests. It also connects to B3's k choice: mobile shows about 4 items.
+- The overall +0.04 is true, and on its own it would have **hidden all three of these findings.**
+
+### How it works
+
+1. **Pre-register critical slices** before looking at results. Pick dimensions from the user, item and context:
+   - *User:* tenure (new/returning), activity level, device, region, language
+   - *Item:* popularity (head/torso/tail), price band, category, newly listed items
+   - *Context:* traffic source, time of day, season
+2. For each slice, compute **the metric, the delta vs. the champion, a CI, and the sample size**.
+3. **Classify each slice**: guardrail slice (must not regress significantly) or informational.
+4. **Check intersections** where risk concentrates: new users *on mobile* may be the worst case, and neither single slice shows it.
+5. **Discover slices you didn't think of**: fit a shallow decision tree on per-example errors, or cluster the failures. That's the bridge to **B6**.
+
+### Fairness is slicing with a moral and legal dimension
+
+When slices correspond to **people or groups who deserve equal treatment** (protected attributes, regions, languages, small vs. large sellers), a per-slice gap stops being just a performance issue.
+- **Performance parity:** does recall or error differ across groups?
+- **Exposure fairness** (important in marketplaces): do small sellers' items ever get shown? A recommender can quietly shut them out.
+- These are usually encoded as **guardrails** with explicit thresholds, sometimes because the law requires it.
+
+### Pitfall: Simpson's paradox
+
+When the **mix of slices differs** between the two things you're comparing, the aggregate can point the opposite way from every slice. Offline, both models are scored on the same users, so the mix is fixed. But across time periods, or in an A/B test where one model **changes who shows up** (say it attracts more new users, who naturally have lower metrics), the aggregate can fall while every slice improves. **Always check slice-level results next to the aggregate before concluding.**
+
+### Assumptions
+
+- **Slice membership is defined before treatment**, meaning it's set before the model acts. "New user" is fine. "Users who clicked the row" is defined by the outcome, and comparing on it is meaningless.
+- Slice attributes are available and accurate at evaluation time.
+- Each slice has enough samples for a meaningful CI.
+
+### Design choices
+
+Which dimensions and intersections to include; minimum sample size per slice; which slices are guardrails and what their thresholds are; how to handle multiple comparisons; the **policy for trading off** "global gain vs. local loss," decided *before* you see results.
+
+### Trade-offs
+
+- **More slices, more false alarms.** Check 40 slices at 95% confidence and you expect about 2 "significant regressions" from pure noise. Fix: pre-register a small set of guardrail slices, correct for multiple comparisons (Bonferroni, or false-discovery-rate control), and treat everything else as exploratory.
+- **Granularity vs. noise.** Finer slices are more precise about *who*, but have wider CIs.
+- **One model vs. patches.** Fixing a losing slice can mean a fallback (serve bestsellers to new users), a dedicated cold-start model, or better features. Each adds system complexity.
+
+### Failure modes
+
+- Reporting only the aggregate.
+- Chasing noise: trying to fix a "regression" in a slice of 200 users with a CI of ±0.05.
+- Slicing on post-treatment variables.
+- Ignoring small slices *because* they're noisy, when they're exactly where harm concentrates. Get more data or run a longer evaluation for them; don't drop them.
+- Missing intersections.
+- Slices defined using leaky or future information, such as "users who will become heavy buyers."
+
+### Connections
+
+- **B1:** The warm/cold split was your first slice.
+- **B3, B4:** Metrics and calibration, per slice.
+- **B6:** Error analysis finds the slices you didn't pre-register.
+- **B7:** CIs per slice.
+- **C4:** Guardrail slices become A/B guardrails.
+- **D2:** A regression on long-tail items hints at popularity feedback loops.
+- **E2:** Deciding whether "+0.04 overall, −0.03 on new users" is acceptable.
+- **Stage 8:** Production dashboards use the same slices.
+
+<Callout title="Exercise 8">
+
+Using the chart above:
+1. The product lead says: *"Overall is +0.04, just ship it."* Give **two concrete launch options** that handle the new-user regression, with one trade-off for each.
+2. A teammate proposes adding the slice **"users who clicked the row at least once during the test"** to the report. What's wrong with it?
+
+</Callout>
+
+## B6 Error analysis
+
+### The problem it solves
+
+Metrics tell you **how much** the model fails. They don't tell you **why**, and without the why, the next iteration is guesswork: tune hyperparameters, add layers, hope. Error analysis turns failures into a **ranked list of fixes**, each tagged with the kind of work it needs: data, labels, features, model, product, or a bug in the evaluation itself.
+
+> **Error analysis = systematically looking at failures, grouping them into causes, sizing each cause, and turning the biggest ones into specific fixes and tests.**
+
+This is the most underrated habit in applied ML. Strong teams spend hours reading examples; weak teams spend weeks tuning.
+
+### How it works: the loop
+
+1. **Sample the errors on purpose.** Don't pick them at random from everything. Stratify: the worst misses by loss, false positives, false negatives, each guardrail slice, and especially **cases where the champion was right and the challenger was wrong** ("diff analysis"). That last group tells you what you'd break by shipping.
+2. **Inspect by hand.** For each example look at the inputs, feature values, prediction, label and context. Usually 50–100 examples. Include a domain expert, such as a merchandiser for the store.
+3. **Open-code, then build a taxonomy.** Write free-form notes first ("recommended the same sneakers they bought last week"), then group the notes into categories. Don't start with categories you've already decided on; you'll only find what you expected.
+4. **Size each category.** Frequency, and ideally **impact** (revenue or users affected). Sort into a Pareto chart.
+5. **Assign a root cause and a fix type** to each category.
+6. **Verify.** Build a targeted slice or test set for each category, measure it, fix, and re-measure. Keep it as a **regression test** (E5).
+
+### Store example
+
+We sampled 100 validation users where the new model **missed** an item they bought in the following week, and tagged each one:
+
+<Diagram src="evaluation/error-analysis-pareto-store-recs.svg" />
+
+What this chart tells you that no metric could:
+
+- **The top problem isn't a modeling problem.** 32% of misses come from recommending items the user **already bought** (a pair of sneakers they bought last week). A cheap fix: an "already purchased" feature, or a business-rule filter for non-consumable categories. No new architecture needed.
+- **27% of "errors" aren't really model errors.** "Bought via search" means the label counts *any* purchase as relevant to the homepage row, even purchases the user went looking for on purpose. "Out-of-stock candidate" means the eval scores items that production would never show (B2 evaluation leakage in reverse). Fixing these changes **your measurement**, not your model. Your metric was partly measuring noise.
+- **Cold start (21%)** confirms B5's new-user regression and points to the fix: a separate cold-start path, not more tuning.
+- **Gifts** are a real limit of history-based personalization. They need context signals (season, recent searches for "gift").
+
+### Tools that scale the loop
+
+- **Slice discovery:** train a shallow decision tree to predict "error vs. correct" from metadata. Its splits are candidate slices. Clustering the embeddings of failed examples works similarly.
+- **Feature attribution** (e.g., SHAP) on errors: which features pushed the model toward the wrong answer?
+- **LLM-assisted tagging:** a model tags thousands of errors using your taxonomy, and humans audit a sample. This lets you size categories on a large set once you've defined them by hand.
+- **Label audits:** have multiple people re-label a sample. If annotators often disagree, part of your "error" is label noise, and your ceiling (A3) is lower than you thought.
+
+### Assumptions
+
+- **The error sample represents the errors**, or its stratification is known and you reweight for it.
+- **The label is correct**, which is often false. Always include a category like "model was right, label was wrong."
+- Taggers apply categories consistently. Check by having two people tag the same 20 examples.
+
+### Design choices
+
+- **Which data:** do error analysis on the **validation set, not the test set**. Reading test examples and then changing the model turns the test set into a validation set (A1 assumption 6).
+- **Sample size:** about 100 examples reliably reveals categories at 5% or more. Rarer but severe categories (offensive recommendations) need targeted searches.
+- **Sizing:** by count or by **impact** (revenue, affected users). The two can give different priorities.
+- **Who tags:** engineers plus domain experts. Engineers miss business context; experts miss pipeline bugs.
+
+### Trade-offs
+
+- **Depth vs. scale:** reading by hand gives insight but not statistics; automated tagging gives statistics but only for categories you already know about. Use hand reading to discover categories and automation to size them.
+- **Quick rule patch vs. model fix:** a rule like "filter already-bought items" ships today but piles up as special cases nobody remembers. A feature generalizes but takes longer. Mature teams do both: patch now, then remove the rule once the model learns the behavior.
+- **Biggest category vs. cheapest fix:** prioritize by **impact ÷ effort**, not by frequency alone.
+
+### Failure modes
+
+- **Skipping it:** jumping straight to hyperparameter search.
+- **Anecdote-driven:** looking at 5 memorable examples and generalizing from them.
+- **Confirmation bias:** tagging with the categories you expected, so you only find those.
+- **Treating label errors as model errors:** you "fix" the model to match noise.
+- **Contaminating the test set** by doing error analysis on it.
+- **No follow-through:** categories found but never turned into regression tests, so the same failure comes back two model versions later.
+
+### Connections
+
+- **B5:** Categories you discover become pre-registered slices.
+- **B2:** Error analysis is one of the best leakage and evaluation-bug detectors ("out-of-stock candidate").
+- **B3, A2:** "Bought via search" reveals that the **label definition** doesn't match the row's purpose. That's a metric-ladder problem.
+- **A3:** Label noise lowers the realistic ceiling.
+- **Stages 3–5:** Each fix type sends work to data/labeling, features, or modeling.
+- **E5:** Categories become **golden test sets** in the evaluation pipeline.
+- **Stage 8:** Production error sampling reuses the same taxonomy.
+
+<Callout title="Exercise 9">
+
+Using the Pareto chart:
+1. You have **two weeks**. Which two categories would you fix first, and why? Consider both impact and effort.
+2. After fixing "bought via search" and "out-of-stock candidate," recall@20 for **both** the champion and the new model changes. Would you expect it to go up or down, and why is that good news, not bad?
+3. Why must this analysis run on the validation set rather than the test set?
+
+</Callout>
+
+## B7 Uncertainty
+
+### The problem it solves
+
+"New model: recall@20 = 0.215. Champion: 0.210." Is +0.005 **real**, or would a different test week, a different sample of users, or a different random seed erase it? Every offline number is an **estimate from a finite, random sample**, produced by a **random training process**. Without error bars you can't tell improvement from luck, and teams end up shipping noise and calling it progress.
+
+> **Uncertainty quantification = attaching an honest range to every number, so decisions separate real effects from noise.**
+
+### Four sources of noise
+
+| Source | What varies | How to measure it |
+|---|---|---|
+| **Test sampling** | Which users happen to be in the test set | Standard error, bootstrap |
+| **Training randomness** | Seed, data order, GPU nondeterminism. Same config, different model | Train 3–5 seeds |
+| **Time** | Which week you tested on | Rolling folds (B1) |
+| **Selection (winner's curse)** | You picked the best of 50 configs on validation, so its score is inflated | Clean test set; expect regression toward the mean |
+
+Most teams measure only the first, if any. The second is often **bigger**.
+
+### Tool 1: confidence intervals
+
+For a metric that averages per-user values (like per-user recall@20):
+
+`SE = sd / √n` and `95% CI ≈ estimate ± 1.96 · SE`
+
+For metrics that aren't simple averages (AUC, NDCG with complicated aggregation), use the **bootstrap**: resample **users** with replacement about 1,000 times, recompute the metric each time, and take the 2.5th and 97.5th percentiles.
+
+**Resample the right unit.** One user produces many correlated impressions. Resampling impressions treats them as independent and gives **falsely narrow** CIs. Resample at the unit that's actually independent, usually the user.
+
+### Tool 2: paired comparison (a large, free gain in precision)
+
+Both models are scored on the **same users**. Some users are easy (heavy buyers), some are hard (new users). That difficulty affects both models the same way. So compute **each user's difference** `dᵢ = model_new(i) − champion(i)` and put a CI on the mean of the differences. The user difficulty cancels out.
+
+Store numbers: 20,000 test users, per-user recall sd ≈ 0.35, per-user difference sd ≈ 0.20.
+- **Unpaired:** SE of the difference = √2 · 0.35/√20000 ≈ 0.0035, so the CI is **±0.0069**
+- **Paired:** SE = 0.20/√20000 ≈ 0.0014, so the CI is **±0.0028**
+
+Same data, an interval **about 2.5× tighter**, only by pairing.
+
+### Tool 3: seeds
+
+Train the **same config** 5 times with different seeds. Store result: 0.208, 0.212, 0.205, 0.214, 0.210, so sd ≈ 0.0035. Two runs of the **identical** model can differ by about ±0.007. Any "improvement" smaller than that could be seed luck.
+
+Putting it together for the +0.005 result:
+
+<Diagram src="evaluation/uncertainty-paired-unpaired-seed-noise.svg" />
+
+Three views of the same result, three different conclusions:
+1. **Unpaired:** the interval includes 0, so "can't tell." Too pessimistic, because it wastes information.
+2. **Paired:** the interval excludes 0, so "real." But this only covers **test sampling** noise.
+3. **Seeds:** the +0.005 is inside the range where identical models differ from each other. **This model run** beat the champion, but **this config** might not reliably beat it.
+
+The honest conclusion: *"Promising, not established."* Retrain with 3–5 seeds for both models and compare the averages (or all seed pairs). Or, if the change is cheap and low-risk, send it to an online test where the traffic volume can settle the question (C3).
+
+### Statistical vs. practical significance
+
+"Significant" means **probably not zero**. It doesn't mean **worth shipping**. With a million test users, +0.0003 can be significant and still worthless next to added serving cost or complexity. Decide the **minimum meaningful effect** in advance (e.g., "+0.01 recall@20, or it isn't worth the added complexity") and compare the **whole CI** to it:
+- The CI is entirely above the minimum: a clear win.
+- The CI straddles it: promising, gather more evidence.
+- The CI is entirely below it: not worth it, even if it's "significant."
+
+### Assumptions
+
+- **Independent units**, or the resampling respects clustering: users, not impressions.
+- The test set represents deployment (B1). CIs measure **noise, not bias**. A leaky test set gives a narrow, confident, **wrong** interval.
+- Seeds capture the training randomness that matters (data order, initialization, dropout).
+
+### Design choices
+
+Resampling unit; paired vs. unpaired design; number of seeds (3 minimum, 5 is better); CI level; minimum meaningful effect; how to correct for multiple comparisons across metrics and slices (B5); **reporting format**: always the estimate, the CI, and n.
+
+### Trade-offs
+
+- **Rigor vs. compute and speed:** 5 seeds × 3 rolling folds × 1,000 bootstrap samples costs real money and time. Common compromise: cheap single-seed screening, then full rigor for the few finalists.
+- **Test set size vs. training data** (B1): a bigger test set gives tighter CIs but less data to train on.
+- **Strictness vs. compounding small gains:** demanding very high confidence for every change rejects real small improvements. Ten real +0.3% gains add up to a lot. Mature teams set rigor according to **risk**: strict for risky or costly changes, looser for cheap and reversible ones.
+
+### Failure modes
+
+- **No error bars at all.** The most common one.
+- **Bootstrapping impressions** instead of users, giving falsely tight intervals.
+- **"The CIs overlap, so there's no difference."** Wrong: two independent CIs can overlap while the paired difference is clearly nonzero.
+- **Ignoring seed variance**, so the team ships seed luck and the online A/B test "mysteriously" comes out flat.
+- **Winner's curse:** the best of 50 validation runs reports +2%, the test shows +0.8%, online shows +0.3%. That's the expected pattern, not a mystery.
+- **P-hacking:** 20 metrics × 10 slices, and you report whatever came out significant.
+- **Treating a narrow CI as proof of validity.** Precision isn't accuracy; leakage gives beautifully tight intervals.
+
+### Connections
+
+- **B1:** Rolling folds give temporal variance.
+- **A3:** Baseline gaps need CIs; "+0.04 over the heuristic" might be ±0.03.
+- **B5:** Per-slice CIs plus multiple-comparison control.
+- **C3:** The same statistics online. Power and sample size are B7 turned around: "how many users do I need to detect +X?"
+- **E1:** Launch gates should be written as CI conditions, not point estimates.
+- **E5:** Evaluation infrastructure should produce bootstraps and seed runs automatically, so rigor is the default, not extra effort.
+
+<Callout title="Exercise 10">
+
+The test set has **10,000 users**. Per-user **paired** difference: mean **+0.006**, sd **0.25**. The team's minimum meaningful effect is **+0.005**. Across 5 seeds, the new model's recall has **sd 0.004**.
+
+1. Compute the 95% CI for the paired difference. Is it statistically significant? Is it practically significant?
+2. Given the seed variation, what do you tell the team, and what's the next step?
+
+---
+
+That's **branch B (offline evaluation) fully taught.** Next is **branch C: online evaluation** (shadow mode, A/B design, power, guardrails, interleaving, pitfalls). Before we go on: branches A and B are the foundation for everything online, and right now **none of it is checked**. A 10-minute combined A+B quiz would show us both what actually stuck. Say "quiz" to take it, or "move on to C" to continue.
+
+</Callout>

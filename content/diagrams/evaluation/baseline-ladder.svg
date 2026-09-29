@@ -1,0 +1,22 @@
+<svg width="100%" viewBox="0 0 680 280" role="img"><title>Baselines compared on recall at 20</title><desc>Horizontal bars of recall at 20 on the same test week: random 0.01, popularity champion 0.11, recently viewed 0.17, matrix factorization 0.19, new model 0.21, oracle ceiling 0.34 shown as a dashed outline.</desc>
+<line x1="220" y1="24" x2="220" y2="238" stroke="var(--b)" stroke-width="0.5"/>
+<text class="t" x="40" y="41" dominant-baseline="central">Random (floor)</text>
+<g class="c-gray"><rect x="220" y="30" width="10" height="22" rx="2" stroke-width="0.5"/></g>
+<text class="ts" x="238" y="41" dominant-baseline="central">0.01</text>
+<text class="t" x="40" y="77" dominant-baseline="central">Popularity (champion)</text>
+<g class="c-coral"><rect x="220" y="66" width="110" height="22" rx="2" stroke-width="0.5"/></g>
+<text class="ts" x="338" y="77" dominant-baseline="central">0.11</text>
+<text class="t" x="40" y="113" dominant-baseline="central">Recently viewed</text>
+<g class="c-gray"><rect x="220" y="102" width="170" height="22" rx="2" stroke-width="0.5"/></g>
+<text class="ts" x="398" y="113" dominant-baseline="central">0.17</text>
+<text class="t" x="40" y="149" dominant-baseline="central">Matrix factorization</text>
+<g class="c-gray"><rect x="220" y="138" width="190" height="22" rx="2" stroke-width="0.5"/></g>
+<text class="ts" x="418" y="149" dominant-baseline="central">0.19</text>
+<text class="t" x="40" y="185" dominant-baseline="central">New model</text>
+<g class="c-purple"><rect x="220" y="174" width="210" height="22" rx="2" stroke-width="0.5"/></g>
+<text class="ts" x="438" y="185" dominant-baseline="central">0.21</text>
+<text class="t" x="40" y="221" dominant-baseline="central">Oracle (ceiling)</text>
+<rect x="220" y="210" width="340" height="22" rx="2" fill="none" stroke="var(--b)" stroke-width="0.5" stroke-dasharray="4 3"/>
+<text class="ts" x="568" y="221" dominant-baseline="central">0.34</text>
+<text class="ts" x="220" y="258" dominant-baseline="central">Recall@20, same test week, same candidate set</text>
+</svg>

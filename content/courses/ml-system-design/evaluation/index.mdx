@@ -1,0 +1,41 @@
+---
+title: Evaluation
+description: Prove the model is better offline, then prove it online.
+icon: ChartColumn
+---
+
+Evaluation is a two-gate funnel. Offline checks are cheap, fast, and don't touch users. Online checks cost more and carry more risk, but they're the only real proof.
+
+<Diagram src="evaluation/offline-online-funnel.svg" />
+
+## Offline evaluation (held-out data, no users)
+
+- **Data splits**: split by time whenever the data is time-ordered; split by user for per-user tasks. A random split leaks future information and inflates scores.
+- **Metrics**: classification: precision, recall, PR-AUC (better than ROC-AUC when classes are imbalanced), log loss. Ranking: NDCG@k, MAP, recall@k. Regression: RMSE, MAE. Check calibration when probabilities feed decisions.
+- **Slice analysis**: break results down by segment (new vs returning users, country, device). The model can win on average and still hurt a group that matters.
+- **Error analysis**: read the worst errors by hand and group them.
+- **Offline gate**: beat the baseline without regressing on key slices or latency. If it fails, go back to modeling.
+
+## Online evaluation (real users)
+
+- **Shadow mode**: the new model runs on live traffic but isn't served. Catches crashes, latency problems and skew at zero risk.
+- **A/B test**: choose the randomization unit, compute sample size first, pick one primary metric plus guardrails, run at least a full week, and watch for novelty and network effects.
+- **Interleaving**: for ranking, mix results from A and B into one list and let clicks decide. Needs 10–100× less traffic than an A/B test.
+
+## Running example
+
+An online store's homepage has a **"Recommended for you" row**. Today it shows the **top 20 bestsellers** to everyone. Your team trained a **personalized model** and wants to ship. Your job is to decide whether they should.
+
+## Topic map
+
+<Cards>
+  <Card title="A. Foundations" href="/courses/ml-system-design/evaluation/foundations">Why evaluate · Metric ladder · Baselines</Card>
+  <Card title="B. Offline evaluation" href="/courses/ml-system-design/evaluation/offline-evaluation">Splits · Leakage · Task metrics · Calibration · Slicing · Error analysis · Uncertainty</Card>
+  <Card title="C. Online evaluation" href="/courses/ml-system-design/evaluation/online-evaluation">Shadow mode · A/B design · Power · Guardrails · Interleaving · Pitfalls</Card>
+  <Card title="D. The gap" href="/courses/ml-system-design/evaluation/the-gap">Proxy gap · Feedback loops · Off-policy evaluation</Card>
+  <Card title="E. Decisions" href="/courses/ml-system-design/evaluation/decisions">Launch gates · Trade-offs · Holdouts · Re-evaluation</Card>
+</Cards>
+
+<Callout title="Interview tip">
+  Offline gains often don't carry over online. Name the gap and explain why: proxy metrics, feedback loops, distribution shift.
+</Callout>
