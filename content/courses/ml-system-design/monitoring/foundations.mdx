@@ -1,0 +1,215 @@
+---
+title: 1. Foundations
+description: Why ML fails silently, and what "normal" means.
+---
+
+## 1.1 Silent failure
+
+ML systems fail while every service dashboard stays green. At PayCo, failures can hit every step of the path, while the dashboard shows **200 OK, p99 38 ms, 0 errors**:
+
+<Diagram src="monitoring/silent-failure-points.svg" />
+
+### Three classes of silent failure
+
+Every ML incident belongs to one of three classes. Knowing which tells you where to look.
+
+**1. Pipeline failures: the world is fine, but your plumbing is broken.**
+The Redis cache behind `txn_count_10min` stops updating. The feature falls back to 0. To the model, "0 recent transactions" looks like a calm cardholder, so card-testing attacks, which normally show high velocity, get through. No error anywhere. Other cases: a unit change (cents → dollars), a renamed category, timezone bugs, a join that silently drops rows.
+→ The **most common** class, and the cheapest to catch, because you can check it immediately without labels.
+
+**2. World changes: the plumbing is fine, but reality moved.**
+A fraud ring discovers that transactions under $50 at gift-card merchants rarely get blocked, and moves there. Inputs still look normal; the *relationship* between inputs and fraud changed. Other cases: seasonality, a new market, a product change, a pandemic.
+→ Hardest to catch. You often need labels, and they arrive months later.
+
+**3. Self-inflicted: the system changes its own world.**
+The model blocks transactions, and blocked transactions **never produce chargebacks**. You never learn whether a block was right, and retraining learns from a sample the model censored itself.
+→ Subtle and slow. Needs deliberate design (branch 5).
+
+### Assumptions monitoring rests on
+
+1. **You have a reference**: something that counts as "normal", usually training data or a recent healthy period (1.2).
+2. **Change in inputs or outputs is a useful early warning.** Often, not always: inputs can shift with no effect on quality (false alarm), and concept drift can happen with no visible input shift (missed failure).
+3. **Someone acts on alerts.** An alert nobody handles is only a cost.
+
+### Design choices
+
+| Choice | Option A | Option B |
+|---|---|---|
+| What to monitor | Everything (every feature, every slice) | Only what's critical |
+| When to check | Real-time streaming | Batch jobs (hourly or daily) |
+| What counts as "bad" | Statistical change | Business impact |
+
+### Trade-offs
+
+- **Coverage vs alert fatigue.** 200 features tested hourly at a 1% false-positive rate is about 48 false alarms a day. The team starts ignoring alerts, including real ones.
+- **Speed vs certainty.** Input and output signals are immediate but only proxies. Label-based quality is the truth but arrives at day 60.
+- **Cost.** Logging every feature at 3k TPS is several hundred GB a day. Sampling saves money but loses rare events, and fraud is rare.
+
+### Failure modes of monitoring itself
+
+- **Only standard service dashboards.**
+- **Only aggregates.** The overall fraud rate looks flat while one country is on fire.
+- **Things nobody can act on.** Graphs without owners or response plans.
+- **Monitoring breaks silently too.** If logging dies, drift dashboards show "no drift". Alert when data stops arriving.
+
+### Connections
+
+- **Data and features:** pipeline failures start here; a feature store prevents part of this class.
+- **Requirements:** the business metric and its budget decide what's worth alerting on.
+- **Deployment:** prediction logging must be designed into serving from day one.
+- **Retraining:** monitoring output drives when you retrain.
+
+<Callout title="Exercise 1.1">
+  PayCo's **block rate** rose from **0.8% to 1.4%** over 5 days. All service dashboards are green. Chargebacks for this period won't exist for weeks. Give at least three hypotheses covering different failure classes. For each, name the first signal you'd check and whether you can check it today or need labels. Bonus: is a rising block rate necessarily bad? Argue both sides.
+</Callout>
+
+<details>
+<summary>Answer key 1.1</summary>
+
+- One hypothesis per failure class: a broken velocity feature (pipeline), a new fraud pattern or holiday traffic mix (world), or an upstream rules change sending the model riskier traffic (self-inflicted).
+- Most can be checked **today** without labels: feature null and default rates, input mix by merchant and country, score distribution per segment.
+- A rising block rate isn't automatically bad: bad if blocking legitimate customers, good if there really is more fraud.
+
+</details>
+
+## 1.2 Reference distributions
+
+### The problem it solves
+
+"Drift", "anomaly" and "looks wrong" only mean something **relative to a baseline**. A 1.4% block rate is alarming if normal is 0.8%, fine if normal is 1.5%. The reference is your written-down definition of **normal**; every detector is `distance(current, reference)`.
+
+### How it works
+
+1. Choose a **reference dataset**: a period or sample declared healthy.
+2. Compute a **profile**, not raw rows: quantiles or histograms for numeric features, frequency tables for categoricals, null/default rates and cardinality per feature, the **score distribution** and decision rate.
+3. Store the profile **versioned alongside the model**.
+4. Profile each current window the same way and compare (branch 4).
+
+### The main design choice: which period counts as normal
+
+<Diagram src="monitoring/reference-windows.svg" />
+
+| Reference | Question it answers | Strength | Weakness |
+|---|---|---|---|
+| **Training data** | Does serving look like what the model learned from? | Catches **train-serve skew** | Goes stale; often **resampled**, distorting distributions |
+| **Fixed launch window** | How far have we moved since things were fine? | Captures **slow, cumulative** drift | Frozen; eventually everything is "drifted" |
+| **Rolling window** (last 7 days) | Did something change *suddenly*? | Few false alarms; catches breakages | **Boiling frog**: gradual drift never flagged; **absorbs incidents** into normal |
+| **Seasonal** (same weekday last week or year) | Is this normal *for a Friday*? | Removes weekly and yearly patterns | Needs history; breaks on moving holidays |
+
+**Use more than one:** training data at launch for skew, a fixed reference for cumulative drift, rolling or seasonal for sudden breaks. Refresh the fixed reference **when you retrain**.
+
+### PayCo trap: resampled training data
+
+PayCo **downsampled legitimate transactions 10×** for training. As a reference, that training set shifts the **score distribution** upward (production looks "drifted down" on day one) and pulls **feature distributions** toward fraud-like values. Fix: a **natural-rate holdout sample**, the launch window, or reweighting by the inverse sampling rate.
+
+### Assumptions
+
+1. **The reference was healthy.** A bug live in the launch window defines broken as normal.
+2. **Same population and pipeline stage.** Training profiles taken after imputation or log-scaling vs raw serving logs create fake drift.
+3. **Enough samples.** 12 transactions in a category gives a meaningless frequency.
+
+### Design choices & trade-offs
+
+- **Global vs per-segment references.** Per country catches "Brazil broke"; 40 countries × 200 features = 8,000 profiles and more false alarms. Segment only a few high-risk dimensions.
+- **Profile vs raw sample.** Profiles are cheap but fixed; a 1% raw sample lets you debug later.
+- **Refresh policy.** Too often and you stop seeing drift; never and everything alerts.
+
+### Failure modes
+
+- **Incident absorbed into the rolling reference.** By day 8 the "last 7 days" *is* the bug; the alarm stops and looks like recovery.
+- **Reference not updated after retrain:** new scores compared with the old model's distribution.
+- **Profile computed on different code** than serving.
+- **Timezone or weekday misalignment:** Sunday vs weekday alerts every week.
+
+### Connections
+
+- **Training pipeline** outputs the reference profile, versioned in the model registry (model v7 ↔ profile v7). **Feature store** makes the training reference trustworthy. **Branch 4** consumes current-vs-reference pairs. **1.3** the current side. **Branch 7:** exclude incident periods from rolling references.
+
+<Callout title="Exercise 1.2">
+  PayCo: 12 months of training data with legitimate transactions downsampled 10×; a strong **weekly pattern**; **monthly** retraining; a merchant-category mapping bug went live **9 days ago** unnoticed. Pick references for (a) the `merchant_category` distribution and (b) the score distribution, justified by the facts. The team uses only a **rolling 7-day** reference: what does its dashboard show for the bug on day 9, and why? What should happen to references when the monthly retrain ships?
+</Callout>
+
+<details>
+<summary>Answer key 1.2</summary>
+
+1. (a) **Seasonal** (same weekday), because of the weekly pattern. (b) A **natural-rate holdout or the launch window**, because training was downsampled; training data would false-alarm on day one.
+2. **Nothing.** The bug has been live 9 days, so the whole reference window contains it. The alarm fired briefly around day 1, then stopped.
+3. Regenerate reference profiles from the new model's holdout and version them with it.
+
+</details>
+
+## 1.3 Windows
+
+### The problem it solves
+
+A reference defines normal; a **window** defines **now**. Window size controls the core tension: **small** windows detect fast but are noisy; **large** windows are stable but slow (a 6-hour outage barely moves a 7-day average). The right size depends on **how fast the failure happens** and **how much data flows through the segment**.
+
+### Why sample size matters
+
+Block-rate noise is `SE = sqrt(p(1−p)/n)`. At p = 0.8%:
+
+| Window contains | SE | 95% band | Distinguish 0.8% from 1.4%? |
+|---|---|---|---|
+| n = 1,000 | 0.28 pp | ±0.55 pp | Barely; many false alarms |
+| n = 100,000 | 0.03 pp | ±0.06 pp | Easily |
+
+Globally PayCo sees ~10.8M transactions/hour, so even 1 minute is plenty. Segmented by category × country, many cells see ~200/hour, and an hourly window is noise. **Windows and segmentation must be designed together.**
+
+### Window types
+
+<Diagram src="monitoring/window-types.svg" />
+
+| Type | How | Good for | Cost |
+|---|---|---|---|
+| **Tumbling** | Fixed back-to-back blocks | Batch jobs, dashboards | Up to one window of delay; boundary splits |
+| **Sliding** | Last 60 min, recomputed every 5 min | Faster, smoother reaction | Correlated repeat alerts; more compute |
+| **Count-based** | Last N events | **Constant statistical power**; low-traffic segments | Variable time span; slow in quiet segments |
+| **EWMA** | Exponentially weighted average | Streaming, cheap | Harder to reason about; α needs tuning |
+
+### Multiple resolutions
+
+- **Minutes** → catastrophic breaks (null rate 0.1% → 100%); page *now*.
+- **Hours to a day** → partial breaks and sudden shifts.
+- **Weeks** → slow drift.
+
+**The size of the effect you're looking for sets the window.**
+
+### Time semantics
+
+- **Event time vs processing time.** Late terminal batches grouped by arrival land in the wrong window as fake spikes.
+- **Late data and incomplete windows.** Wait a buffer (watermark) or mark windows provisional.
+- **Label windows are cohorts.** Measure fraud rate **by transaction week**, not chargeback-arrival week; a cohort is meaningful only once **matured** (~90 days).
+- **Align with the reference** hour-of-week to hour-of-week.
+
+### Assumptions
+
+1. Data within a window is roughly **homogeneous** (or mixed like the reference).
+2. Events are roughly **independent**; a card-testing bot's 5,000 near-identical transactions shrink the effective sample.
+3. **Late data is bounded.**
+
+### Failure modes
+
+- **One window size for everything:** constant noise or blind to fast breaks.
+- **Tiny segment windows** alert almost daily.
+- **Processing-time windows:** delays look like drops, then spikes.
+- **Sliding-window alert storms:** 12 overlapping alerts for one incident.
+- **Immature label cohorts:** false "the model improved!".
+
+### Connections
+
+- **1.2:** comparable window and reference. **Branch 4:** thresholds should depend on n. **Branch 5:** cohorts and maturity. **Branch 6:** minute windows need streaming; daily ones batch SQL.
+
+<Callout title="Exercise 1.3">
+  Choose a window type and size, justified by effect size, volume or time semantics, for: (1) null rate of `txn_count_10min` (global, ~10.8M txns/hour); (2) block rate for **gift-card merchants in Portugal** (~150 txns/hour, busier on weekends); (3) **actual fraud rate** from chargebacks for the current model version. Bonus: why would a sliding 60-minute window on (1) trouble the on-call engineer during an incident?
+</Callout>
+
+<details>
+<summary>Answer key 1.3</summary>
+
+1. Tumbling or sliding **5-min**: huge volume plus a huge effect, and it should page.
+2. **Count-based** (e.g. last 3k transactions) or daily, compared **weekend-to-weekend**; hourly is noise at 150/hour.
+3. **Cohort by transaction week, per model version**, read only once mature (~90 days).
+
+Bonus: overlapping windows cause an alert storm, and the metric stays red up to 60 minutes *after* the fix, so on-call can't tell whether it worked.
+
+</details>

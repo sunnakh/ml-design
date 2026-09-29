@@ -1,0 +1,5 @@
+{
+  "title": "Monitoring",
+  "icon": "Activity",
+  "pages": ["index", "foundations", "signal-layers", "drift", "detection", "ground-truth", "architecture", "response", "operations"]
+}

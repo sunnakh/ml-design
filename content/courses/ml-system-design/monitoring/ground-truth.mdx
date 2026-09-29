@@ -1,0 +1,113 @@
+---
+title: 5. Ground truth
+description: Measuring real quality when labels are late or missing.
+---
+
+## 5.1 Label delay
+
+### The problem it solves
+Every quality metric needs the **true outcome**. In most real systems the truth arrives **late**:
+
+| Domain | Label | Typical delay |
+|---|---|---|
+| Ads | Click | Seconds |
+| Recommendations | Watch / skip | Minutes |
+| E-commerce | Purchase / return | Days to weeks |
+| **Card fraud (PayCo)** | **Chargeback** | **Days to 120 days** |
+| Lending | Default | Months to years |
+| Medical | Outcome | Years |
+
+During that gap, you're **flying blind on quality**. Worse, naive measurements made during the gap are **systematically wrong**, and wrong in a way that looks good.
+
+### How it works: the maturity curve
+Labels don't all arrive at the same age. Plot the **cumulative share of eventual chargebacks that have arrived**, by days since the transaction:
+
+<Diagram src="monitoring/chargeback-maturity-curve.svg" />
+
+### The trap: immature cohorts always look better
+True fraud rate = 0.10% in every week. What a naive dashboard shows today:
+
+| Cohort (transaction week) | Age | Maturity | Observed fraud rate | Looks like |
+|---|---|---|---|---|
+| 12 weeks ago | 84 d | ~99% | 0.099% | Normal |
+| 8 weeks ago | 56 d | ~94% | 0.094% | Normal |
+| 4 weeks ago | 28 d | ~78% | 0.078% | "Improving" |
+| 2 weeks ago | 14 d | 55% | 0.055% | "Big improvement!" |
+| Last week | 7 d | 30% | 0.030% | "Fraud down 70%!" |
+
+**Recent cohorts always look healthier**, and the model deployed most recently always looks like a hero. It's the most common false conclusion in delayed-label systems.
+
+### Three techniques to deal with it
+
+**1. Cohort by prediction time (from 1.3).**
+Group by **when the transaction happened**, never by when the label arrived.
+
+**2. Compare at equal age (fixed-horizon metrics).**
+Define **"14-day fraud rate"** = chargebacks arriving within 14 days of the transaction. Compare the new model's cohorts with the old model's cohorts **at the same age**. It's a fair comparison available at day 14, as long as the maturity curve is stable.
+
+**3. Maturity adjustment (the actuarial approach).**
+Insurance has the same problem: claims that are **incurred but not reported** (IBNR). Their fix works here:
+```
+estimated_final_rate(cohort) = observed_rate(age) / maturity(age)
+```
+Last week: 0.030% / 0.30 = **0.10%**. The trend disappears. You can also attach uncertainty, since young cohorts are noisier. Estimate maturity curves **per segment**: online vs. card-present and domestic vs. international mature at different speeds.
+
+(More formally, it's **survival analysis**: time-to-label with right-censoring. The maturity curve is 1 − the survival function.)
+
+### Label delay also affects training
+If you retrain on data up to yesterday, recent frauds **haven't been labeled yet**, so they enter training as **legitimate**. That teaches the model that recent fraud patterns are safe, which is precisely the concept drift you're trying to learn.
+
+Options:
+- **Exclude immature data**: train only on transactions older than the horizon (e.g. 90 days). Correct, but always **~3 months stale**.
+- **Shorter horizon**: label = "fraud within 30 days" (80% complete). Fresher, with 20% label noise that you accept knowingly.
+- **Maturity weighting**: include recent data, but down-weight negatives by the probability they'll still turn fraud.
+- **Two-stage**: the main model on mature data plus a fast-adapting component on proxies (5.2).
+
+### Assumptions
+1. **The maturity curve is stable.** It isn't always. A holiday backlog at issuers, a card-network rule change on dispute windows, or a new issuer with slow processes all change it, and every adjustment becomes wrong.
+2. **The label horizon captures nearly everything.** Late chargebacks beyond 90 days are treated as legitimate.
+3. **Every transaction can eventually get a label.** **Blocked transactions never do.** That's 5.3.
+
+### Trade-offs
+- **Wait vs. act**: waiting for maturity gives the truth too late to prevent losses. Acting on early reads is fast but depends on the maturity model.
+- **Horizon length**: long = complete labels, stale model. Short = fresh model, noisy labels.
+- **Per-segment curves vs. data**: more accurate, but small segments don't have enough chargebacks to estimate their own curve. Pool or use hierarchical estimates.
+
+### Failure modes
+- **"Fraud dropped 70% after launch!"** from comparing immature cohorts with mature ones.
+- **Label-arrival windows** instead of cohorts → metrics mixing transactions from months apart.
+- **Training on immature labels** → the model systematically underestimates recent fraud patterns.
+- **Stale maturity curve** → all adjustments are silently off. You need to **monitor the maturity curve itself** by comparing each new cohort's arrival pace with the historical curve.
+- **Forgetting censored (blocked) transactions** → covered in 5.3.
+
+### Connections
+- **1.3**: cohorts and label windows.
+- **2.4**: why fraud loss is a slow KPI and why early proxies matter.
+- **3.2**: concept drift detection is only as fast as your labels.
+- **3.3**: prior estimates from immature cohorts are biased low.
+- **5.2 (next)**: proxies that fill the blind gap.
+- **Branch 7**: retraining windows and horizon choice.
+
+<Callout title="Your exercise">
+
+> PayCo deployed **v8** 3 weeks ago. v7's mature fraud rate was **0.10%**. Observed rates for v8's weekly cohorts today:
+> - W1 (21 days old): **0.080%**
+> - W2 (14 days old): **0.055%**
+> - W3 (7 days old): **0.030%**
+>
+> Maturity curve: day 7 = 30%, day 14 = 55%, day 21 = 70%.
+>
+> 1. The PM says "v8 cut fraud by half." Compute **maturity-adjusted** estimates for each cohort. What do you conclude?
+> 2. Design a fair **v7 vs. v8 comparison** you can report today, without waiting for maturity.
+> 3. Next week's retrain: which **date range** of data do you use and how do you label it? Justify the trade-off.
+> 4. In December, issuers slow down processing. How would you **detect** that the maturity curve has shifted, and what would go wrong if you didn't?
+
+</Callout>
+
+## 5.2 Proxies
+
+Use early signals (e.g. analyst review outcomes, disputes) as proxies until real labels arrive.
+
+## 5.3 Feedback
+
+The model's actions hide some labels. Keep a small exploration sample to measure what it blocks.

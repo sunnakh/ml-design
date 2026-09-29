@@ -1,0 +1,349 @@
+---
+title: 4. Detection
+description: Turning signals into alerts.
+---
+
+## 4.1 Statistical tests & distance measures
+
+### The problem it solves
+Branches 1–3 said "compare current with reference". Branch 4 is **how**: turning two distributions into a **number**, and that number into a **decision**. There are two families of method, and mixing them up is the most common mistake in drift detection:
+
+| Family | Question it answers | Output | Examples |
+|---|---|---|---|
+| **Hypothesis tests** | "Is there *any* difference, or could it be chance?" | p-value | KS test, chi-square, two-proportion z-test |
+| **Distance / effect size** | "*How big* is the difference?" | Distance | PSI, Wasserstein, JS divergence, KS statistic D |
+
+### The significance trap (the key lesson of this part)
+A p-value depends on **sample size**. With enough data, **every** difference is "significant", including meaningless ones.
+
+PayCo example: the `txn_amount` distribution shifts by a trivial amount (KS D = 0.005, roughly the median moving $38.00 → $38.20). Same shift, different window sizes:
+
+| Window size (per side) | KS p-value | PSI noise floor (10 bins, no real shift) |
+|---|---|---|
+| 1,000 | ≈ 1.0 → "no drift" | ≈ 0.018 |
+| 100,000 | ≈ 0.16 | ≈ 0.0002 |
+| 1,000,000 | ≈ 3×10⁻¹¹ → "drift!" | ≈ 0.00002 |
+| 10.8M (1 hour, global) | ≈ 10⁻¹⁰⁸ → "DRIFT!!" | ≈ 0.000002 |
+
+Two failure modes, one at each end:
+- **At large n, p-values alarm on everything.** Globally, PayCo would page every hour on every feature.
+- **At small n, distances are inflated by noise.** Under no real shift, expected PSI ≈ `(k−1)·(1/n_ref + 1/n_cur)`. For a 1,000-row segment that's a PSI of about 0.018 **from nothing**, and occasionally much more.
+
+→ **Rule**: decide on **effect size against a practical threshold**, and require a **minimum sample size** (or a significance check) to guard against small-n noise.
+
+### Which method for which data
+
+<Diagram src="monitoring/drift-method-selection-by-data-type.svg" />
+
+### How each method works
+
+**Numeric features**
+- **KS statistic D** = the maximum gap between the two CDFs. Bounded in [0, 1], needs no binning. Most sensitive around the **middle** of the distribution and weak in the **tails**, which is a problem for fraud, where the action is in the tails.
+- **Wasserstein (earth mover's) distance** = the average amount of "movement" needed to turn one distribution into the other, **in the feature's own units**. "Amounts moved $3.10 on average" is **interpretable** and sensitive to tails. Its scale depends on the feature, so thresholds are set per feature (or on standardized values).
+- **PSI** (Population Stability Index), the standard in credit and fraud:
+  ```
+  PSI = Σ_bins (cur_i − ref_i) · ln(cur_i / ref_i)
+  ```
+  - **Bins come from reference quantiles** (e.g. 10 bins of 10% each). Equal-width bins have the same flaw as in 2.3.
+  - Empty bins → `ln(0)`. Add a small epsilon, which slightly changes the value.
+  - Rule of thumb: **< 0.1 stable, 0.1–0.25 moderate, > 0.25 major**. It's a *convention* from credit scoring, not a law. Calibrate it for your data (4.2).
+  - PSI is a symmetrized KL divergence.
+
+**Categorical features**
+- **PSI or JS divergence** over category shares. JS is **symmetric and bounded** in [0, 1] (log base 2), and handles categories that appear on only one side without blowing up. **KL divergence** does blow up there and is asymmetric, so it's rarely used directly.
+- **Chi-square test**: same sample-size trap as KS.
+- **Unseen-category share**: the % of current traffic in categories *absent* from the reference. Simple, interpretable, and catches mapping bugs (2.2) and new markets (3.1).
+- **Max share change** (L∞): "the largest category moved 4 pp". Easy to explain in an incident.
+
+**Rates** (null rate, block rate, default-fill rate)
+- **Two-proportion z-test**, or better, **control charts** (Shewhart, CUSUM, EWMA). These come from manufacturing quality control and are built for "is this rate still in its normal band?" over time. CUSUM accumulates small persistent deviations, so it catches **slow drifts** that single-window tests miss.
+
+**Many features jointly / high-dimensional** (embeddings, images, text)
+- **Domain classifier** (from 3.1): AUC as the effect size, feature importances for explanation.
+- **MMD** (maximum mean discrepancy): a kernel two-sample test on embeddings.
+- **Reconstruction error**: fit PCA or an autoencoder on the reference and watch for rising error on current data.
+
+### Hidden assumption: independence
+Every p-value assumes **independent samples**. PayCo breaks that constantly:
+- A card-testing bot sends 5,000 near-identical transactions. The effective sample size is closer to **1** than to 5,000.
+- Consecutive windows overlap (sliding) or are autocorrelated (day-to-day traffic).
+→ p-values come out **overconfident**. That's another reason to prefer effect sizes with **empirically calibrated** thresholds (4.2), i.e. thresholds learned from how the metric behaves across historical healthy periods.
+
+### Design choices
+| Choice | Recommendation for PayCo |
+|---|---|
+| Test or distance? | **Distance as the decision metric.** Tests only as a small-n guard |
+| Numeric default | **PSI on reference-quantile bins** (the standard, comparable across features) + **Wasserstein** for key features (interpretable $) |
+| Tails | Add a separate **tail check** (e.g. share above reference p99) because KS and PSI with 10 bins underweight tails |
+| Categorical | **JS + unseen share** |
+| Rates | **Control charts** (EWMA/CUSUM) |
+| Joint | Weekly **domain classifier** |
+
+### Trade-offs
+- **Interpretability vs. generality**: Wasserstein is in dollars, but every feature has its own scale. PSI is comparable across features, but "PSI 0.14" means nothing to a business stakeholder.
+- **Binning**: more bins → more sensitive, but a higher noise floor and more empty bins. Fewer bins → stable, but blind inside each bin.
+- **Univariate vs. joint**: univariate is cheap and explainable, but misses combinations. Joint catches combinations but needs a follow-up investigation to explain.
+- **Compute**: 200 features × 40 segments × several windows. PSI on pre-aggregated histograms is cheap. Domain classifiers and MMD are expensive, so run them less often.
+
+### Failure modes
+- **p-value thresholds at scale** → everything alarms, and the team mutes the channel.
+- **Fixed PSI 0.1/0.25 cutoffs on small segments** → noise floor alarms.
+- **Equal-width bins** on skewed features → tail changes invisible.
+- **KL with empty bins** → infinity, dashboards break.
+- **Ignoring dependence** (bots, repeated cards) → overconfident tests.
+- **Averaging distances across features** → one badly broken feature gets diluted by 199 stable ones.
+
+### Connections
+- **1.2 / 1.3**: the reference provides the bins, and the window provides n. Both directly change what any test shows.
+- **2.3**: score-distribution monitoring uses the same methods, with quantile/log-odds bins.
+- **3.1–3.3**: domain classifier (covariate), error-rate detectors (concept, 3.2), BBSE (label shift).
+- **4.2 (next)**: turning distances into alert thresholds without drowning in false alarms (empirical calibration, multiple testing).
+
+<Callout title="Your exercise">
+
+> Pick a method (and justify it) for each PayCo signal:
+> 1. `txn_amount`, global, hourly (about 10.8M rows)
+> 2. `merchant_category` for **Portugal gift cards** (about 150 rows/hour)
+> 3. Null rate of `device_id`
+> 4. A 64-dim **device embedding** feature
+>
+> Then interpret these two results:
+> 5. `txn_amount` global: **PSI = 0.03, KS p = 10⁻⁴⁰**, n = 10M. Alert or not?
+> 6. Portugal gift cards: **PSI = 0.21**, n = 300 current rows vs. 2,000 reference rows. Alert or not? What would you do before deciding?
+
+</Callout>
+
+<details>
+<summary>Answer key 4.1</summary>
+
+1. **PSI on reference-quantile bins + Wasserstein** (in $) + a **tail check** (share above reference p99). No p-values at 10M rows.
+2. **Count-based or daily window**, **JS + unseen share**, a minimum sample gate, possibly coarser category groups. Compare against the noise floor.
+3. **Control chart** (EWMA/CUSUM) plus an absolute ceiling.
+4. **Domain classifier or MMD**, run weekly.
+5. **Don't alert.** PSI 0.03 is below any practical threshold, and at 10M rows the p-value tells you nothing.
+6. The noise floor is about 9 × (1/300 + 1/2000) ≈ **0.035**, so 0.21 is about 6× the floor. Suspicious, not conclusive. First run a **bootstrap/permutation null**, look at *which* categories moved, check it's a weekend-to-weekend comparison, then likely **warn, not page**.
+
+</details>
+
+## 4.2 Thresholds
+
+### The problem it solves
+4.1 produces a **number** (PSI = 0.14). An alert needs a **decision**: fire or not. The threshold is where you trade **false alarms** against **missed incidents**, and at PayCo's scale this trade-off determines whether monitoring gets used or ignored.
+
+Alert fatigue is the reason most ML monitoring projects fail. The problem is rarely missing detectors. It's too many alerts, which people learn to ignore.
+
+### Where thresholds come from
+
+| Source | How | Strength | Weakness |
+|---|---|---|---|
+| **Convention** | PSI 0.1 / 0.25 everywhere | Zero effort | Ignores each metric's natural noise. Small segments constantly alarm |
+| **Business impact** | "Alert if block rate > 1.2%" (the 2.4 guardrail). "Null rate > 1% costs ≈ $X/day" | Meaningful, easy to prioritize | Only possible for metrics whose impact you can model |
+| **Empirical (backtested)** | Compute the metric over many **historical healthy windows**. Threshold = p99.9 of that distribution, per feature × segment × window | Automatically absorbs noise floor, dependence, and seasonality | Needs clean history. Healthy periods must be identified |
+| **Adaptive / forecast** | Predict the expected value (hour-of-week seasonal baseline, forecasting model). Alert on the **residual** | Handles seasonality and trends | **Can adapt to a slow incident** (boiling frog, like the rolling reference in 1.2) |
+
+**Default for PayCo**: **business thresholds** for the few metrics with clear cost (block rate, approval rate, fallback rate), and **empirical thresholds** for everything else (feature drift distances).
+
+### Anatomy of a good alert rule
+A threshold is more than a single number:
+
+<Diagram src="monitoring/alert-threshold-persistence-timeline.svg" />
+
+The parts of a rule:
+1. **Value threshold**: the line itself.
+2. **Severity tiers**: **warn** (ticket, business hours) vs. **page** (wake someone up). Most drift should warn. Pages are for fast, costly failures.
+3. **Persistence (k-of-n)**: fire only if k of the last n windows are over the line. This removes blips but **adds detection delay** (3 hourly windows = up to 3 hours late).
+4. **Hysteresis**: fire at 0.25, resolve only below 0.15. Without it, a metric hovering near the line **flaps** (fire, resolve, fire…) and floods the channel.
+5. **Minimum sample gate**: don't evaluate if n < N_min. Links to 4.1's noise floor.
+6. **Comparable baseline**: the threshold assumes the right reference (seasonal, 1.2) and the right window (1.3).
+
+**Persistence vs. speed depends on the failure type.** For the 100% null-rate break (2.1), use **no persistence**, because one 5-minute window is proof enough. For slow drift, use k-of-n over hours or days.
+
+### The multiple-testing problem
+PayCo: 200 features × 40 segments × 24 hourly windows = **192,000 checks per day**. Even if each check has a 0.1% false-alarm rate, that's **192 false alarms a day**. Every check is reasonable on its own, and the total is unusable.
+
+Solutions, from simplest to best:
+- **Bonferroni**: divide α by the number of tests. Controls false alarms, but becomes so strict that real drift gets missed.
+- **FDR control** (Benjamini–Hochberg): control the **fraction** of alerts that are false (e.g. ≤ 10%), not the chance of any false alert. Much better power.
+- **Hierarchy (the best practical fix)**: don't test everything independently. Check **top-level signals first** (outputs, decision rate, fallback rate: a handful of checks). Drill into per-feature and per-segment results **only when a top signal moves**, or only for the ~20 most important features. That cuts the check count by orders of magnitude.
+- **Alarm budget**: decide how many false pages a week the team can tolerate (say ≤ 2), and allocate that budget across checks, spending most of it where impact is highest.
+
+### How to know your thresholds work: backtest
+Treat the monitoring system itself as a **classifier** of "incident vs. normal":
+- **Replay history**: run the rules over the past 6–12 months. Count false alarms in periods known to be healthy.
+- **Incident library**: past incidents (the velocity bug, the cents bug, the category-mapping bug). Would each rule have caught them, and **how fast**?
+- **Synthetic injection**: deliberately corrupt a copy of the data (multiply amounts by 100, null out 30% of a feature, shift a category's share) and check the detection rate and delay. This is **chaos testing for monitors**.
+- The outcome is a **precision/recall/delay** profile per rule, used to tune it the same way you would tune a model.
+
+### Assumptions
+1. **History contains healthy periods** you can identify. If last month had an unnoticed bug, empirical thresholds learn it as normal.
+2. **The noise process is stable**: traffic volume and mix change slowly enough that last quarter's thresholds still fit.
+3. FDR methods assume tests are independent or positively dependent. Drift across correlated features breaks this somewhat.
+
+### Trade-offs
+- **Sensitivity vs. fatigue**: the core trade-off. The alarm budget makes it explicit.
+- **Persistence vs. delay**: fewer blips, later detection.
+- **Per-segment thresholds vs. maintenance**: 8,000 tuned thresholds are accurate, but they rot. Tiered defaults plus tuned thresholds for the top segments are usually enough.
+- **Adaptive vs. fixed**: adaptive follows seasonality but can absorb slow incidents. Pair it with a **fixed ceiling** that never adapts.
+
+### Failure modes
+- **Copy-pasted 0.25 everywhere**: small segments page nightly, big ones are never sensitive enough.
+- **Thresholds set once, never revisited**: traffic doubles, noise shrinks, and the thresholds become too loose.
+- **Adaptive baseline absorbs an incident**: the same boiling-frog problem as 1.2.
+- **No hysteresis**: flapping alert storms.
+- **No minimum sample**: 3 a.m. pages from 40-transaction windows.
+- **Never backtested**: nobody knows whether rules would have caught the last three incidents.
+
+### Connections
+- **4.1**: the distance metric and its noise floor set what a sensible threshold can be.
+- **1.2 / 1.3**: reference and window choice change the metric's baseline behavior.
+- **2.4**: business guardrails *are* thresholds, and the most defensible kind.
+- **4.3 (next)**: what happens after a threshold fires, i.e. routing, grouping, context, ownership.
+- **Branch 8**: thresholds on SLOs and alarm budgets are an operations policy.
+
+<Callout title="Your exercise">
+
+> PayCo has 200 features, 40 segments, hourly windows. The on-call team will tolerate **≤ 2 false pages per week**.
+>
+> 1. If every feature × segment × window were checked independently and could page, what **per-check false-alarm rate** would you need to stay within budget? What does that do to sensitivity?
+> 2. Design a **hierarchical** alerting scheme that fits the budget. What do you check at the top level, and when do you drill down?
+> 3. Write a complete alert rule for **default-fill rate of `txn_count_10min`** (from 2.1): source of threshold, warn/page values, window, persistence, hysteresis, min sample.
+> 4. How would you **backtest** that rule? Name one real and one synthetic incident you'd test it against.
+
+</Callout>
+
+<details>
+<summary>Answer key 4.2</summary>
+
+1. Checks per week = 200 × 40 × 24 × 7 = **1.344M**, so the per-check false-alarm rate must be **≤ about 1.5×10⁻⁶**. Thresholds that extreme only catch huge shifts, so you'd be **blind to moderate drift**.
+2. **Top level (page-able, about 10 checks)**: fallback rate, default-fill rate for the top features, block/approval rate for a few major segments, score top-tail mass, traffic volume, hard data-quality constraints. **Warn tier**: daily drift on the top 20 features, **FDR-controlled**, as tickets. **Drill down** into segments and features only when a top signal moves.
+3. Threshold source: business + empirical (baseline about 0.05%). **Warn** > 0.5% for 3 of 3 five-minute windows. **Page** > 2% in any single five-minute window. **Resolve** < 0.3% for 15 min. **Min sample** 10k requests per window. Include a per-Redis-shard breakdown in the alert.
+4. Replay 6 months and count fires in healthy periods. **Real incident**: the Redis velocity outage. **Synthetic**: inject timeouts into 5% of lookups on replayed traffic. Measure detection delay.
+
+</details>
+
+## 4.3 Alerting
+
+### The problem it solves
+A threshold firing isn't the goal. **A person (or automation) taking the right action quickly** is the goal. Between the two, alerts fail by:
+- going to the **wrong team**
+- arriving as **one of 40 duplicates** of the same root cause
+- saying "PSI 0.31 on feature_117" with **no context**, which leaves on-call digging for an hour
+
+Aim: every alert is **actionable, owned, and understandable in under 5 minutes**.
+
+### How it works: the alert pipeline
+
+<Diagram src="monitoring/alert-pipeline-with-feedback.svg" />
+
+### 1. Group: one root cause, one incident
+The cents bug from 2.2 alone triggers: amount PSI in 9 segments, score top-tail up, mobile block rate up, approval rate down. That's **14 alerts for one bug**.
+- **Time + label grouping**: alerts within minutes of each other that share a segment or feature → one incident.
+- **Dependency-aware suppression** (inhibition): if an **upstream** alert fires (a feature pipeline or data-quality check), suppress the **downstream** alerts it explains (score drift, block rate). This needs a **lineage graph**: source table → feature → model → decision.
+- **Risk**: over-grouping hides a *second*, unrelated problem happening at the same time. Suppressed alerts should still be **visible inside** the incident, not deleted.
+
+### 2. Enrich: give on-call context
+Most debugging time goes to answering "what changed?". Put the answer in the alert:
+
+```
+[PAGE] Block rate spike: mobile channel
+  Now 1.9% (ref 0.8%, page threshold 1.2%), since 10:07, 4/4 windows over
+  Top segments: mobile/US +1.4pp, mobile/CA +1.2pp; web unchanged
+  Top shifted features: txn_amount (PSI 2.8, median $38 -> $3,800)
+  Recent changes (last 6h):
+    10:00  mobile app v5.2 rollout started (owner: mobile-payments)
+    08:15  no model / threshold / rules changes
+  Est. impact: ~1,900 extra declines/hour, ~$95k/hour blocked GMV
+  Runbook: go/payco-runbook/block-rate-spike
+  Dashboard: go/payco-monitoring/mobile   Sample rows: go/payco-samples/INC-4412
+```
+
+Essentials:
+- **Value vs. threshold vs. reference**, plus since when and how persistent
+- **Where**: the top contributing segments
+- **Why**: top shifted features or attribution drift (2.3)
+- **Change correlation**: model/threshold/rules/config deploys and upstream releases. **Most incidents are caused by a change**, so this line saves the most time.
+- **Impact estimate** in business units, which is how priority gets decided
+- **Runbook link** (branch 7) and **sample rows** for inspection
+
+### 3. Route: send it to whoever can fix it
+| Root cause | Primary owner | Also notified |
+|---|---|---|
+| Serving latency, fallbacks | Platform / SRE | ML on-call |
+| Upstream data (field rename, units) | **Producer team** (mobile, payments) | ML on-call |
+| Drift, calibration, model behavior | ML team | Risk |
+| Business KPI trend | Risk / product (weekly review) | ML team |
+
+This requires an **ownership registry**: every feature and source table has an owner. Without it, every alert lands in the ML channel, and the ML team becomes a message relay.
+
+**Severity → channel**:
+- **P1 page**: fast and costly. Fallback surge, approval cliff, 100% nulls, score collapse.
+- **P2 ticket**: act within business hours. Drift warnings, segment calibration issues.
+- **Digest**: weekly report. Slow drift trends, KPI movement, low-priority shifts.
+
+### 4. Respond: human, automation, or both
+Automate responses that are **well understood and safe to reverse**:
+- Canary breaks a guardrail → **auto-rollback** to the previous model
+- Feature pipeline fails validation → **auto-quarantine** the batch and keep serving the last good version
+- Feature store unreachable → **auto-switch** to the fallback path (it's already built, see 2.1)
+
+Keep humans on **ambiguous** cases, such as drift that might be a real fraud wave. Guard automation itself: rate-limit auto-rollbacks (no rollback loops) and alert whenever automation acts.
+
+### 5. Feedback: monitor the monitoring
+- At resolution, label every alert: **true positive, actionable / true positive, not actionable / false positive**.
+- Track per rule: **alert precision**, pages per week, **MTTD** (time to detect), **MTTA** (time to acknowledge), **MTTR** (time to resolve).
+- Monthly review: **retire or retune** low-precision rules. Add rules for incidents that were found by humans rather than by monitors.
+- **Dead-man's switch**: if a detector job dies, "no alerts" looks exactly like "healthy". Send a heartbeat, and alert when it's **missing**.
+- **Silences with expiry**: planned launches (Brazil) produce expected drift. Silence the relevant rules **with an end date and a named owner**. Silences left in place indefinitely are a common way real incidents get missed.
+
+### Assumptions
+1. **Owners exist and respond**, including upstream teams. That's an organizational agreement, not a technical fact.
+2. **Change logs are machine-readable**: deploys, config changes and upstream releases are recorded somewhere an alert can query.
+3. **Lineage metadata** exists for dependency-aware grouping.
+
+### Trade-offs
+- **Grouping vs. hiding**: fewer notifications, but a real second incident can get buried.
+- **Rich context vs. build cost**: enrichment needs lineage, change logs and attribution, which is real engineering work (branch 6).
+- **Automation speed vs. risk**: auto-rollback saves minutes and can also roll back a *good* model on a noisy guardrail.
+- **Routing upstream vs. control**: producer teams fix things faster, but they need to accept ML alerts in their on-call.
+
+### Failure modes
+- Everything goes to one **#ml-alerts** channel that nobody reads.
+- Alerts **without runbooks or change context** → the first hour of every incident is spent digging.
+- **Alert storms**: 40 pages for one bug, and the real signal is lost.
+- **Silences that never expire**.
+- **The detector dies silently**, with no heartbeat.
+- **No feedback labeling**, so rules never improve, precision decays, and the team learns to ignore pages.
+- **Auto-rollback loops** on a flapping guardrail.
+
+### Connections
+- **4.2**: thresholds decide *when* to fire, 4.3 decides *what happens next*.
+- **2.3 / 3.x**: attribution and segment breakdowns feed enrichment.
+- **Branch 6 Architecture**: lineage, change logs, sample storage and alert infrastructure (e.g. Alertmanager/PagerDuty) have to be built.
+- **Branch 7 Response**: runbooks, rollback and diagnosis start here.
+- **Branch 8 Operations**: on-call rotations, SLOs, and alert review meetings.
+
+<Callout title="Your exercise">
+
+> **10:00** mobile app v5.2 starts rolling out (the cents bug). By **10:30**, 14 alerts have fired: `txn_amount` PSI in 9 mobile segments, score top-tail up, mobile block rate up, approval rate down. Customer-service contacts rise at 11:15.
+>
+> 1. Design the **grouping**: what exactly should the on-call person see at 10:30, and which alerts are suppressed under which?
+> 2. **Routing**: who gets paged, who is notified, and why?
+> 3. Is there a safe **automated response** here? What should it be, and what could go wrong?
+> 4. After resolution, which **alert metrics** tell you whether the monitoring process worked, and what would you change if MTTD was 25 minutes?
+
+**Branch 4 is complete after this.** Options:
+- **(a)** Answer this exercise
+- **(b)** **Checkpoint**: 5 questions covering branches 1–4. Clears the ⚠️ marks.
+- **(c)** Move on to **branch 5: Ground truth** (label delay, proxies, feedback loops)
+
+</Callout>
+
+<details>
+<summary>Answer key 4.3</summary>
+
+1. **One incident**: "Mobile `txn_amount` anomaly → block-rate spike". Root: the `txn_amount` data-quality/drift alerts. **Suppressed as children**: score top-tail, block rate, approval rate. Enriched with the **v5.2 rollout** as the correlated change.
+2. **Page** ML on-call **and mobile-payments on-call**, since only the producer can halt the rollout or fix it. **Notify** risk (approval hit) and customer service (expect contacts).
+3. Safest automation: **auto-halt the staged app rollout** on an ML guardrail breach, if the release tool supports it. Risky: auto-converting units at serving (double-conversion once mobile fixes it). Also risky: halting releases on false positives.
+4. **MTTD, MTTA, MTTR, alerts per incident** (14 → 1 is the grouping goal), and **did customers notice before monitoring did?** If MTTD was 25 minutes: segment by **app version** (new vs. old shows 100× immediately), drop persistence on data-quality rules, and put a **data-contract check in mobile CI**.
+
+</details>

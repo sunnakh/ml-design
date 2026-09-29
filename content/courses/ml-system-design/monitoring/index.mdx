@@ -1,0 +1,58 @@
+---
+title: Monitoring
+description: Detect silent failures in production, then respond and retrain.
+icon: Activity
+---
+
+Monitoring has two halves: **what you watch**, and **what you do when something breaks**.
+
+## What you watch: a stack of layers
+
+Problems usually start low in the stack and show up higher. The top three layers are ML-specific; normal service monitoring doesn't cover them.
+
+<Diagram src="monitoring/monitoring-layers-stack.svg" />
+
+| Layer | Question | Signals |
+|---|---|---|
+| Business KPIs | Is it doing what we built it for? | CTR, revenue, retention |
+| Model quality | Is it still accurate? (needs ground truth) | Accuracy, calibration, slices |
+| Drift | Has the distribution shifted? | Data drift, prediction drift, concept drift |
+| Data quality | Are inputs sane? | Schema, nulls, ranges |
+| System health | Is the service up? (classic SRE) | Latency, throughput, errors |
+
+## What you do: the response loop
+
+<Diagram src="monitoring/response-loop.svg" />
+
+**Detect** (alert on a threshold) → **Diagnose** (which layer broke?) → **Fix a data bug**, **retrain** on fresh data, or **roll back** to the last good model → **Validate** (offline + shadow) → **Canary deploy** → back to monitoring.
+
+Start diagnosis at the bottom of the stack. Most real incidents are data bugs, not model decay.
+
+## Retraining strategies
+
+| Strategy | When | Trade-off |
+|---|---|---|
+| Scheduled (daily/weekly) | Slow, predictable drift | Simple, but may retrain for nothing or react too late |
+| Trigger-based | A drift or performance alert fires | Efficient, but needs reliable detection |
+| Continual / online | Very fast change (ads, feeds) | Fresh, but complex and risky (feedback loops) |
+
+## Running example: PayCo
+
+PayCo scores card transactions for fraud with a gradient-boosted model using velocity and geo features, then blocks or allows. Truth arrives as chargebacks around day 60. Meanwhile the service dashboard shows 200 OK, p99 38 ms, 0 errors.
+
+## Topic map
+
+<Cards>
+  <Card title="1. Foundations" href="/courses/ml-system-design/monitoring/foundations">Silent failure · Reference · Windows</Card>
+  <Card title="2. Signal layers" href="/courses/ml-system-design/monitoring/signal-layers">System health · Data quality · Outputs · Business KPIs</Card>
+  <Card title="3. Drift" href="/courses/ml-system-design/monitoring/drift">Covariate · Concept · Label shift</Card>
+  <Card title="4. Detection" href="/courses/ml-system-design/monitoring/detection">Statistical tests · Thresholds · Alerting</Card>
+  <Card title="5. Ground truth" href="/courses/ml-system-design/monitoring/ground-truth">Label delay · Proxies · Feedback</Card>
+  <Card title="6. Architecture" href="/courses/ml-system-design/monitoring/architecture">Logging · Pipelines · Tooling</Card>
+  <Card title="7. Response" href="/courses/ml-system-design/monitoring/response">Diagnosis · Rollback · Retraining</Card>
+  <Card title="8. Operations" href="/courses/ml-system-design/monitoring/operations">SLOs · On-call · Runbooks</Card>
+</Cards>
+
+<Callout title="Interview tip">
+  Go through the layers bottom to top, name the drift types with one detection method each, raise the label delay problem, then describe the response loop with a canary deploy.
+</Callout>

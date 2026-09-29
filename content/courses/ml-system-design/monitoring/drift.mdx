@@ -1,0 +1,310 @@
+---
+title: 3. Drift
+description: The ways the world can move away from the training data.
+---
+
+## 3.1 Covariate shift
+
+### The problem it solves
+If `P(y|x)` truly stays fixed, a *perfect* model wouldn't care that inputs moved. Real models aren't perfect. They're accurate **where training data was dense** and they **extrapolate** where it was thin. Covariate shift pushes traffic into those thin regions.
+
+<Diagram src="monitoring/covariate-shift-into-sparse-region.svg" />
+
+The true curve (dashed) didn't move. That's what makes this covariate shift. But production traffic now sits largely in the region where the model saw few examples, so its **estimate** of that curve is poor there.
+
+### Why it hurts: three mechanisms
+1. **Extrapolation error**: the model is least reliable exactly where traffic now concentrates. Tree models (PayCo's GBDT) predict a **flat constant** beyond the edge of the training data. They don't extrapolate trends at all.
+2. **Mix shift**: even if accuracy for each value of x is unchanged, **aggregate** metrics change because the mix changed. More high-amount traffic means a higher block rate and different precision, and a threshold that was tuned for the old mix is no longer optimal.
+3. **Early warning**: covariate shift is often the first visible sign of something worse, such as a data-quality bug (2.2) or a concept change arriving with new traffic (3.2).
+
+### PayCo causes
+- **Planned**: new market launch, a new payment method (e.g. a wallet), marketing campaigns that bring in a different user base
+- **Seasonal**: holiday shopping, travel season (more foreign transactions)
+- **External**: a big merchant joins or leaves, economic changes
+- **Fake**: a data-quality bug that *looks* like shift, e.g. the cents bug. **Always rule out 2.2 first.**
+
+### How to detect it (preview of branch 4)
+1. **Univariate, per feature**: compare each feature's distribution with the reference (PSI, KS test). Simple and explainable. Misses **joint** shifts.
+2. **Multivariate: domain classifier** (the most useful technique here).
+   - Label reference rows `0` and current rows `1`. Train a classifier to tell them apart.
+   - **AUC ≈ 0.5** → the two are indistinguishable, no shift. **AUC ≫ 0.5** → shift.
+   - Its **feature importances** tell you *what* shifted, and its predicted probabilities tell you *which rows* are unlike training.
+   - It catches joint novelty that univariate tests miss: amount is normal, device is normal, country is normal, but a **high amount + new device + foreign country** combination never appeared in training.
+3. **Weight by importance**: a shift in a feature the model uses heavily matters more. Combine with output monitoring (2.3).
+
+### The important question: does it actually hurt?
+Most covariate shift is **harmless**. Before acting, estimate impact **without labels**:
+- **Output check (2.3)**: did scores or decisions move? If not → top-right cell, low priority.
+- **Support check**: are the shifted rows inside training coverage? Use the domain classifier's probability as a novelty score for each row.
+- **Importance-weighted evaluation**: reweight your labeled validation set by `w(x) = p_prod(x) / p_train(x)` (which you can get from the domain classifier: `w = p/(1−p)`). That gives you an **estimate of production accuracy** without new labels.
+  - This only works if `P(y|x)` truly hasn't changed **and** there's overlap. For inputs that never appeared in training, no amount of reweighting helps.
+
+### Responses
+| Situation | Response |
+|---|---|
+| Harmless shift (outputs stable, good support) | Log it, maybe update the reference. Don't retrain |
+| Mix shift moved decision rates | **Retune the threshold** (maybe per segment) |
+| Traffic in thin regions | **Collect labels there** (targeted manual review), then retrain with recent data |
+| Big persistent shift | Retrain, possibly **importance-weighted** toward the new distribution |
+| It's really a data-quality bug | **Fix the pipeline.** Never retrain on it |
+
+### Assumptions
+1. **`P(y|x)` is fixed.** This is the definition of covariate shift, and **you can't verify it without labels**. You're betting on it.
+2. **Overlap**: production inputs fall within the range training covered.
+3. Your features **capture** the shift. If the thing that changed isn't a feature, it's invisible here.
+
+### Trade-offs
+- **Univariate vs. multivariate**: univariate is explainable but blind to combinations. The domain classifier catches combinations but needs care, and when it says "AUC 0.71" you still have to find out *why*.
+- **Sensitivity vs. fatigue**: at PayCo's volume, almost every feature is *statistically* different every day (branch 4 will explain why). Statistical significance is not the same as practical impact.
+- **Retrain on recent data vs. keep history**: recent data adapts to the new mix but can **forget rare old fraud patterns** that haven't shown up lately.
+
+### Failure modes
+- **Alerting on every shift**: most are harmless, the team stops reading, and misses the real one.
+- **Treating a data-quality bug as covariate shift** → retraining bakes the bug into the weights.
+- **Univariate only**: joint novelty goes unnoticed.
+- **Assuming shift is harmless because `P(y|x)` "should" be fixed**: new markets often bring **new fraud behavior** too, which is concept drift, part 3.2.
+- **Forgetting mix shift**: accuracy for each x is fine, but block rate and precision moved and nobody retuned the threshold.
+
+### Connections
+- **1.2 / 1.3**: which reference and which window you compare against decides what counts as a shift.
+- **2.2**: rule out data-quality problems first. **2.3**: the output check is the relevance filter.
+- **Branch 4**: PSI, KS and domain classifiers in depth, plus the problem of statistical vs. practical significance.
+- **Branch 5**: targeted labeling in the new region.
+- **Branch 7**: retraining strategy and threshold retuning.
+
+<Callout title="Your exercise">
+
+> PayCo launches in **Brazil**. Within a month it's 15% of traffic: amounts in BRL (converted to USD at ingestion), new local merchant categories, and **Pix** (a new instant-payment method). The model was trained with **no Brazilian data**.
+>
+> 1. Name the drift type(s) involved. What check would you run first to make sure part of it isn't a **data-quality bug**, and which bug is most likely here?
+> 2. Explain, using **support/overlap** and how GBDTs behave outside their training range, why performance in Brazil could be poor **even if** `P(fraud | x)` were the same as elsewhere.
+> 3. Now argue why `P(fraud | x)` is probably **not** the same in Brazil. Which drift type does that add?
+> 4. You train a **domain classifier** (reference = pre-launch, current = this week). Predict its AUC range and its top 3 features. What does that tell you, and what doesn't it tell you?
+> 5. Give a **60-day response plan** when no Brazilian labels have matured yet.
+
+</Callout>
+
+<details>
+<summary>Answer key 3.1</summary>
+
+1. Covariate shift, and probably concept drift as well. Most likely data-quality bug: **currency conversion** (BRL not converted, converted twice, or at a stale rate, making amounts off by about 5×). Check the amount distribution for Brazil against the expected FX-adjusted range, the unseen-category rate, and whether Pix is mapped to null or "other".
+2. Brazilian rows land where training had **no support**: unseen categories go to an "unknown" bucket, and Pix was never seen. A GBDT outputs the **constant leaf value** of whatever region those rows fall into, so the risk estimate is arbitrary. Normal Pix usage is also high-frequency, which looks like a velocity attack.
+3. Brazil has **different fraud mechanics** (Pix social-engineering scams, local rings) and a different base rate. The same x means a different risk → **concept drift** plus **label shift**.
+4. AUC of about **0.95+**, since Brazilian rows are trivially separable. Top features: country, payment method/Pix, merchant category. It tells you **what is novel and how much**. It does *not* tell you whether the model is wrong there.
+5. Monitor Brazil as its own segment (count-based windows), use conservative policy (step-up/amount caps for high-risk Brazilian traffic, Pix rules), run **stratified manual review** for fast labels, keep a holdout, then retrain with Brazilian data and maybe set per-country thresholds.
+
+</details>
+
+## 3.2 Concept drift
+
+### The problem it solves
+Concept drift means **`P(y | x)` changes**. The same input now means something different. The model's learned mapping is wrong **even for inputs it has seen thousands of times**. It's the most dangerous kind of drift for two reasons:
+- **Inputs can look identical** → input monitors stay green.
+- **Scores can look identical** → output monitors stay green.
+
+This is the **bottom-right cell** of the 2.3 matrix: nothing looks wrong, and the model is wrong.
+
+In fraud there's an extra reason it's constant: **adversaries**. Fraudsters probe the model, learn what gets through, and move there. **The model's success causes the drift.** Assume concept drift is ongoing, not an occasional event.
+
+### Four temporal patterns
+
+<Diagram src="monitoring/concept-drift-temporal-patterns.svg" />
+
+| Pattern | PayCo example | Implication |
+|---|---|---|
+| **Sudden** | A new card-testing tool bypasses velocity limits. A regulation (e.g. mandatory 3DS) changes who attempts fraud | Needs **fast** detection and a fast patch (rules) |
+| **Gradual** | A fraud ring slowly moves from electronics to gift cards | Early labels are a noisy mix. Hard to call early |
+| **Incremental** | Fraudsters slowly learn to mimic normal velocity | No single moment to detect. Watch long-window trends |
+| **Recurring** | Holiday fraud patterns return every December | **Don't forget them.** Keep seasonal data and don't train only on recent windows |
+
+### How to detect it: you need labels or something close to them
+Because `x` and scores can look normal, detection has to use **outcomes**. Ordered from slowest/truest to fastest/noisiest:
+
+1. **Matured-label performance by cohort**: precision/recall/dollar-recall per transaction week (1.3). The truth, but PayCo sees it **30–90 days late**.
+2. **Early-label proxies** (branch 5 goes deeper):
+   - **Manual review outcomes**: hours to days
+   - **Customer fraud reports / dispute initiation**: days, before the chargeback is finalized
+   - **Issuer fraud alerts** (TC40/SAFE-style feeds): days
+3. **Calibration drift**: predicted fraud rate vs. observed rate **per segment**, using whatever labels have arrived and adjusting for maturity. If a segment's model predicted 0.1% and early reports already show 0.3%, investigate.
+4. **Streaming error-rate detectors** (DDM, EDDM, ADWIN, Page-Hinkley): track the error rate as labels arrive and alarm on a statistically significant rise. Useful when labels are fast, as in manual review streams.
+5. **Challenger disagreement**: train a model on the **most recent** matured data and score today's traffic with both it and production. If they disagree much more than two models on the same concept normally would, **the concept moved**.
+6. **Indirect hints**: volume anomalies in small segments (gift-card purchases under $50 at 12 merchants up 4×). The fraud itself is invisible, but the attacker's **activity** sometimes isn't. This is covariate shift in a niche that points to concept drift.
+
+**Key point: concept drift is usually local.** Adversaries target niches, so aggregate performance barely moves. Monitor segments wherever labels are dense enough, and prioritize high-dollar segments.
+
+### A trap: label-definition drift
+Sometimes **the label changes, not the world**:
+- An issuer changes its chargeback policy, and more "friendly fraud" (a customer disputing a real purchase) gets recorded as fraud.
+- PayCo's ops team changes what analysts mark as fraud in manual review.
+
+This looks exactly like concept drift in the metrics. Retraining on it teaches the model a **new definition**, which may be right or wrong. Always check **label-process changes** (policy, reason codes, labeling guidelines) before blaming the world.
+
+### Responses
+| Response | Speed | When |
+|---|---|---|
+| **Rules patch** (block pattern, cap amount, force step-up) | Hours | Immediate containment of a sudden attack |
+| **Threshold tightening** for the affected segment | Hours | While a better model is in progress |
+| **Retrain on recent data** (windowed or recency-weighted) | Days | The new pattern **is separable with existing features** |
+| **New features** | Weeks | The new fraud **isn't separable** with current features. Retraining alone won't help |
+| **Online / continual learning** | Continuous | Very fast drift, with fast reliable labels. Risky (poisoning, feedback) |
+
+The **new-features** row is important: retraining only helps if the features can tell the new fraud apart from normal traffic. If a fraud ring uses fresh cards with normal velocity and normal amounts, no amount of retraining on the same 200 features will find it. You need a new signal, such as merchant-level velocity, device-graph links, or BIN-range patterns.
+
+### Assumptions
+1. **Labels eventually arrive and are correct.** Friendly fraud, missing labels on blocked transactions (1.1), and review errors all violate this.
+2. **The label definition is stable.** See the trap above.
+3. **Some part of the drift is visible in time to matter.** For slow labels and fast adversaries, you may only see it afterwards. That's why fast rules exist.
+
+### Trade-offs
+- **Proxy speed vs. truth**: manual review gives labels in hours, but it's biased (analysts only see what's flagged) and small.
+- **Retrain frequency**: frequent means fresh, but costly, risks forgetting recurring patterns, and gives adversaries a fast feedback loop to exploit. Infrequent means stale.
+- **Detector sensitivity**: an ADWIN tuned tight catches small changes and false-alarms on label-arrival noise.
+- **Recency weighting vs. memory**: weight recent data heavily and the December patterns are forgotten by next December.
+
+### Failure modes
+- **Relying only on matured labels** → 90 days blind, and the loss has already happened.
+- **Aggregate-only performance** → the niche attack is hidden in the average.
+- **Retraining when features can't separate the new fraud** → nothing improves, and you conclude "the model is fine".
+- **Label-definition change mistaken for concept drift** → the model learns the wrong target.
+- **Forgetting recurring patterns** by training only on the last N weeks.
+- **Reacting only with retrains** → days of loss while a rules patch could have contained it in hours.
+
+### Connections
+- **2.3**: the bottom-right cell, i.e. concept drift is exactly what output monitoring can't catch.
+- **3.1**: covariate shift in a niche can be the visible trace of concept drift.
+- **Branch 4**: streaming error detectors and calibration tests.
+- **Branch 5**: label delay, proxies, feedback loops, label quality. That's where the tools against concept drift live.
+- **Branch 7**: rules patches, threshold changes, retraining strategy, new features.
+- **Stage 4 Features**: robust, hard-to-manipulate features are the long-term defense against adversarial drift.
+
+<Callout title="Your exercise">
+
+> Over 3 weeks, a fraud ring moves to **gift-card purchases under $50** at **12 merchants**, using **fresh stolen cards with normal velocity**.
+>
+> 1. Explain why the input monitors (3.1) and output monitors (2.3) stay green, globally and even for the gift-card segment.
+> 2. Which proxy signal gives the **earliest** evidence, and roughly how many days in? Which is the next one after that?
+> 3. Once confirmed: would **retraining on recent data** fix it? Explain using separability, and propose **one new feature** that would help.
+> 4. What would you do in the **first 24 hours** after confirmation?
+> 5. In the same month, a big issuer changes its **chargeback reason-code policy**. How would you tell that label-definition drift apart from this fraud ring in your metrics?
+
+</Callout>
+
+<details>
+<summary>Answer key 3.2</summary>
+
+1. Each transaction looks legitimate (small amount, normal velocity, clean new card), so scores are low and decisions don't change. The volume is tiny (12 merchants), so it's **diluted** even within the gift-card segment.
+2. Earliest: **merchant-level volume anomalies** (gift cards under $50 at those merchants up, days 1–7), though ambiguous. The first *outcome* signal: **cardholder fraud reports / dispute initiation** (about days 3–10). Then early chargebacks (weeks 2–4).
+3. **Probably not.** Per-transaction features can't separate these from legitimate buys, so retraining learns noise. New feature: **merchant-level first-seen-card rate** (share of never-seen cards at this merchant in the last hour), or card-age / device-graph links.
+4. **Rules**: step-up or cap for new cards buying gift cards under $50 at those merchants. Tighten the threshold for the segment, alert the merchants, label the confirmed cases, start the feature work.
+5. Label-definition drift: rises **across all segments for one issuer**, lines up with the **policy date**, and shows a **reason-code mix change**. The fraud ring: **concentrated by merchant/segment across all issuers**.
+
+</details>
+
+## 3.3 Label shift (prior shift)
+
+### The problem it solves
+**`P(y)` changes, but `P(x | y)` stays the same.** Fraud looks the same as before. There's just **more** (or less) of it.
+
+PayCo example: a breach dump of stolen cards appears. Fraud attempts double for two weeks. Each fraudulent transaction looks like previous card-testing fraud, and legitimate traffic is unchanged.
+
+It seems harmless ("same fraud, model knows it"), but it breaks three things:
+- **Calibration**: by Bayes, `P(y|x) = P(x|y)·P(y) / P(x)`. When the prior `P(y)` changes, the **true posterior changes too**, in a structured way. The model's scores are now **miscalibrated**.
+- **Precision at a fixed threshold**: precision depends on the base rate.
+- **The optimal threshold**: the cost trade-off from 2.4 depends on how likely fraud is.
+
+What it does **not** break: **AUC and recall**. Ranking is invariant to the prior. This is why "our AUC is fine" doesn't mean the system is fine.
+
+<Diagram src="monitoring/label-shift-class-conditional-scores.svg" />
+
+### PayCo numbers
+Per 1M transactions, model recall at the threshold is 70% and the false-positive rate on legitimate traffic is 0.73%:
+
+| | Fraud prior 0.1% | Fraud prior 0.2% (wave) |
+|---|---|---|
+| Fraud / legit | 1,000 / 999,000 | 2,000 / 998,000 |
+| Caught (TP) | 700 | 1,400 |
+| Good customers blocked (FP) | 7,293 | 7,285 |
+| **Block rate** | 0.80% | **0.87%** |
+| **Precision** | 8.8% | **16.1%** |
+| Recall / AUC | 70% / same | 70% / same |
+
+Two lessons:
+1. **Fraud doubled, and the block rate moved only 0.07 pp.** Fraud is a tiny share of volume, so aggregate outputs barely notice. You have to watch the **top score tail** (2.3). Mass above 0.95 is mostly fraud and roughly **doubles**.
+2. **Precision nearly doubled while the model didn't change.** The reverse happens too: when fraud falls, precision falls, and people conclude "the model got worse". **Precision is not a model property. It depends on the base rate.**
+
+### How to detect it
+- **Labels (slow)**: the fraud rate per matured cohort.
+- **Top-tail output mass (fast)**: share of scores above a high cutoff, compared with the reference.
+- **Prior estimation from outputs, without labels**: if `P(x|y)` is stable, a change in the output distribution can be **explained by** a prior change and solved for:
+  - **BBSE** (Black Box Shift Estimation): take the confusion matrix `C` from validation and the predicted-class rates `q` in production. Solve `q = C·π_new` for the new prior `π_new`.
+  - **EM prior re-estimation** (Saerens et al.): iteratively adjust the prior until the average adjusted posterior matches it.
+  - Both depend on the assumption that `P(x|y)` is fixed. If concept drift is happening too, the estimate is wrong.
+
+### Responses: usually cheap
+Since `P(x|y)` is unchanged, **you don't need to retrain**. You need to **correct probabilities**:
+
+**Prior correction** for a calibrated model trained at prior `π_old`, deployed at `π_new`:
+```
+odds_new = odds_model × [π_new / (1 − π_new)] / [π_old / (1 − π_old)]
+p_new    = odds_new / (1 + odds_new)
+```
+
+**Link to 1.2:** PayCo downsampled legitimate traffic 10× in training. That's a **built-in label shift**: the model learned at about a 1% fraud prior and is deployed at about 0.1%. Without this correction its raw scores overstate fraud risk by about 10× in odds. This is the same formula.
+
+### The design principle: separate estimating from deciding
+- **Model + calibration** → estimates `p = P(fraud | x)`. Correct it when the prior moves.
+- **Decision policy** → block if `p × C_fraud > (1 − p) × C_FP`, i.e. threshold `t = C_FP / (C_FP + C_fraud)`.
+  - `C_fraud` = amount at risk. `C_FP` = lost margin + churn risk. These costs are **per transaction** (a $2,000 purchase and a $5 purchase shouldn't share a threshold).
+
+If calibration stays correct, **the cost-based threshold stays valid automatically**, and label shift is handled by recalibration alone. A fixed score threshold like `0.9` hides all this and quietly becomes wrong whenever the prior moves.
+
+### Assumptions
+1. **`P(x|y)` is fixed.** Rarely exactly true. A fraud wave from a *new* group may bring new patterns too (concept + covariate).
+2. **The prior estimate is accurate.** Estimating it from **immature** cohorts **underestimates** fraud, because labels are still arriving (1.3).
+3. BBSE/EM need a trustworthy, invertible validation confusion matrix. With rare fraud and small segments, that's fragile.
+
+### Trade-offs
+- **Recalibrate often vs. stability**: frequent recalibration follows the prior but chases noise from immature labels. Infrequent recalibration stays miscalibrated for longer.
+- **Global vs. per-segment prior**: a fraud wave often hits specific BIN ranges or merchants. A global correction under-corrects there and over-corrects elsewhere.
+- **Fixed threshold (simple)** vs. **calibrated + cost policy (correct)**: the second needs calibration monitoring and cost inputs from finance, but it adapts correctly.
+
+### Failure modes
+- **Judging the model by precision**: "precision dropped 40%!" when the fraud rate simply fell.
+- **Never correcting training resampling**: every downstream consumer of scores (rules, analysts, the implied fraud rate in 2.3) is off by 10×.
+- **Retraining for a pure prior shift**: expensive and slow, and the new model is miscalibrated too once the wave ends.
+- **Prior estimated from immature cohorts** → systematically too low.
+- **Upstream filter change**: a rules team adds a pre-filter that removes easy fraud *before* the model, so the model's prior drops silently and calibration breaks. Nobody on the ML team changed anything.
+
+### Connections
+- **1.2**: resampled training data is a label shift you create yourself.
+- **2.3**: top-tail mass and the implied fraud rate are the early warning. **2.4**: the cost-based threshold and the metric tree.
+- **3.1 / 3.2**: real waves mix all three drift types. BBSE's assumption fails under concept drift.
+- **Branch 4**: calibration tests and prior-estimation methods.
+- **Branch 5**: label maturity makes observed priors biased.
+- **Branch 7**: recalibration as a response, cheaper and faster than retraining.
+
+<Callout title="Your exercise">
+
+> A breach dump hits: fraud prior goes from **0.1% → 0.3%** for 2 weeks, with patterns similar to known card-testing. Model recall = 70%, FPR on legit = 0.73%.
+>
+> 1. Compute **block rate** and **precision** after the shift. Which metrics stay the same?
+> 2. Retrain, recalibrate, or change the threshold? Justify using `P(x|y)`.
+> 3. A calibrated score is `p = 0.5` at prior 0.1%. Compute the **prior-corrected** `p` at 0.3%.
+> 4. The rules team deploys a **pre-filter** that removes 50% of obvious card-testing fraud before it reaches the model. What happens to the prior the model sees, to calibration, and to precision? Which monitor would catch it, and what should the deploy process have required?
+
+**Branch 3 is complete after this.** Options:
+- **(a)** Answer this exercise
+- **(b)** **Checkpoint**: 5 questions covering branches 1–3. Clears the ⚠️ marks.
+- **(c)** Move on to **branch 4: Detection** (statistical tests, thresholds, alerting)
+
+</Callout>
+
+<details>
+<summary>Answer key 3.3</summary>
+
+1. Per 1M: fraud 3,000 → TP 2,100. Legitimate 997,000 → FP 7,278. **Block rate 0.94%, precision 22.4%.** Unchanged: **recall, FPR, AUC.**
+2. **Recalibrate** with the prior correction and let the cost-based threshold follow. **Don't retrain**: `P(x|y)` is the same (known patterns). Revert when the wave ends.
+3. odds = 1 × (0.003/0.997) / (0.001/0.999) ≈ 3.006 → **p ≈ 0.75**.
+4. The model's prior **drops** (about half the fraud is gone). The fraud that remains is the *harder* kind, so `P(x|y)` changes as well. Scores overstate risk, **precision falls**, and the top-tail mass drops. Caught by **top-tail and decision-rate monitors**. The deploy process should have required **change notification + shadow evaluation + recalibration**, because upstream rules are part of the ML system.
+
+</details>

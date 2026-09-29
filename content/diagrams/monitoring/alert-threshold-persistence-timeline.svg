@@ -1,0 +1,15 @@
+<svg width="100%" viewBox="0 0 680 270" role="img"><title>Warn and page thresholds with persistence</title><desc>A drift metric over hourly windows. A single transient spike crosses the warn line for one window and is suppressed. Later a sustained rise crosses the page line and fires on the third consecutive window above it.</desc><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<text class="ts" x="40" y="56" dominant-baseline="central">PSI</text>
+<line x1="80" y1="110" x2="620" y2="110" stroke="#D85A30" stroke-width="1" stroke-dasharray="5 4"/>
+<text class="ts" x="84" y="100" dominant-baseline="central">Page</text>
+<line x1="80" y1="150" x2="620" y2="150" stroke="#888780" stroke-width="1" stroke-dasharray="5 4"/>
+<text class="ts" x="84" y="140" dominant-baseline="central">Warn</text>
+<polyline points="80,205 100,198 120,208 140,200 160,203 180,196 200,205 220,120 240,202 260,199 280,207 300,201 320,196 340,204 360,200 380,198 400,185 420,170 440,155 460,140 480,125 500,108 520,98 540,92 560,95 580,90 600,93 620,91" fill="none" stroke="#378ADD" stroke-width="1.5"/>
+<text class="ts" x="250" y="80" text-anchor="middle" dominant-baseline="central">Spike, 1 window: suppressed</text>
+<line class="leader" x1="224" y1="88" x2="221" y2="116"/>
+<circle cx="540" cy="92" r="5" fill="none" stroke="#D85A30" stroke-width="1.5"/>
+<text class="ts" x="540" y="60" text-anchor="middle" dominant-baseline="central">Page fires: 3rd window over</text>
+<line class="leader" x1="540" y1="68" x2="540" y2="86"/>
+<line class="arr" x1="80" y1="230" x2="636" y2="230" marker-end="url(#arrow)"/>
+<text class="ts" x="636" y="248" text-anchor="end" dominant-baseline="central">Time (hourly windows)</text>
+</svg>

@@ -1,0 +1,16 @@
+<svg width="100%" viewBox="0 0 680 250" role="img"><title>Reference choices on a timeline</title><desc>Today's window compared against three references: training data for train-serve skew, a fixed launch window for cumulative drift, and a rolling last 7 days for sudden change.</desc><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<path class="arr" d="M595 118 V52 H135 V116" fill="none" marker-end="url(#arrow)"/>
+<path class="arr" d="M595 118 V78 H320 V116" fill="none" marker-end="url(#arrow)"/>
+<path class="arr" d="M595 118 V104 H470 V116" fill="none" marker-end="url(#arrow)"/>
+<text class="ts" x="365" y="43" text-anchor="middle" dominant-baseline="central">Train-serve skew</text>
+<text class="ts" x="457" y="69" text-anchor="middle" dominant-baseline="central">Cumulative drift</text>
+<text class="ts" x="532" y="95" text-anchor="middle" dominant-baseline="central">Sudden change</text>
+<g class="c-teal"><rect x="40" y="120" width="190" height="56" rx="4" stroke-width="0.5"/><text class="th" x="135" y="139" text-anchor="middle" dominant-baseline="central">Training data</text><text class="ts" x="135" y="159" text-anchor="middle" dominant-baseline="central">12 mo, resampled</text></g>
+<g class="c-teal"><rect x="250" y="120" width="140" height="56" rx="4" stroke-width="0.5"/><text class="th" x="320" y="139" text-anchor="middle" dominant-baseline="central">Launch window</text><text class="ts" x="320" y="159" text-anchor="middle" dominant-baseline="central">2 weeks, healthy</text></g>
+<g class="c-teal"><rect x="410" y="120" width="120" height="56" rx="4" stroke-width="0.5"/><text class="th" x="470" y="139" text-anchor="middle" dominant-baseline="central">Last 7 days</text><text class="ts" x="470" y="159" text-anchor="middle" dominant-baseline="central">Rolling</text></g>
+<g class="c-coral"><rect x="550" y="120" width="90" height="56" rx="4" stroke-width="0.5"/><text class="th" x="595" y="139" text-anchor="middle" dominant-baseline="central">Today</text><text class="ts" x="595" y="159" text-anchor="middle" dominant-baseline="central">Current</text></g>
+<line class="arr" x1="40" y1="200" x2="636" y2="200" marker-end="url(#arrow)"/>
+<line class="leader" x1="240" y1="112" x2="240" y2="206"/>
+<text class="ts" x="240" y="222" text-anchor="middle" dominant-baseline="central">Model deployed</text>
+<text class="ts" x="640" y="222" text-anchor="end" dominant-baseline="central">Time</text>
+</svg>

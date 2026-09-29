@@ -1,0 +1,14 @@
+<svg width="100%" viewBox="0 0 680 310" role="img"><title>Label shift on score distributions</title><desc>Legitimate scores peak on the left. The fraud score distribution keeps the same shape but doubles in height after the shift. The threshold stays fixed, so more of the blocked region is fraud.</desc><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<text class="ts" x="460" y="42" text-anchor="middle" dominant-baseline="central">Threshold</text>
+<line x1="460" y1="52" x2="460" y2="240" stroke="#888780" stroke-width="1" stroke-dasharray="5 4"/>
+<text class="ts" x="545" y="66" text-anchor="middle" dominant-baseline="central">Blocked</text>
+<path d="M80 240 C120 240, 130 70, 180 70 C230 70, 250 225, 360 234 C450 238, 540 239, 620 240" fill="none" stroke="#888780" stroke-width="2"/>
+<path d="M380 240 C440 240, 470 200, 500 200 C530 200, 560 240, 620 240" fill="none" stroke="#1D9E75" stroke-width="2"/>
+<path d="M380 240 C440 240, 470 160, 500 160 C530 160, 560 240, 620 240" fill="none" stroke="#D85A30" stroke-width="2"/>
+<line class="arr" x1="80" y1="240" x2="636" y2="240" marker-end="url(#arrow)"/>
+<text class="ts" x="636" y="258" text-anchor="end" dominant-baseline="central">Model score</text>
+<line x1="80" y1="288" x2="104" y2="288" stroke="#888780" stroke-width="2"/><text class="ts" x="112" y="288" dominant-baseline="central">Legit</text>
+<line x1="170" y1="288" x2="194" y2="288" stroke="#1D9E75" stroke-width="2"/><text class="ts" x="202" y="288" dominant-baseline="central">Fraud before</text>
+<line x1="310" y1="288" x2="334" y2="288" stroke="#D85A30" stroke-width="2"/><text class="ts" x="342" y="288" dominant-baseline="central">Fraud after (same shape, 2×)</text>
+<text class="ts" x="636" y="288" text-anchor="end" dominant-baseline="central">Not to scale</text>
+</svg>

@@ -1,0 +1,22 @@
+<svg width="100%" viewBox="0 0 680 480" role="img"><title>PayCo metric tree</title><desc>Net fraud cost splits into fraud losses, lost good sales, and ops and friction. These are driven by recall, decline rate, and review rate, which are all set by one shared lever: the decision threshold.</desc><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<g class="c-coral"><rect x="240" y="40" width="200" height="56" rx="4" stroke-width="0.5"/><text class="th" x="340" y="59" text-anchor="middle" dominant-baseline="central">Net fraud cost</text><text class="ts" x="340" y="79" text-anchor="middle" dominant-baseline="central">Loss + FP + ops</text></g>
+<path class="arr" d="M132.5 148 V123 H532.5 V148" fill="none"/>
+<path class="arr" d="M332.5 148 V123" fill="none"/>
+<line class="arr" x1="340" y1="123" x2="340" y2="100" marker-end="url(#arrow)"/>
+<g class="c-coral"><rect x="45" y="150" width="175" height="56" rx="4" stroke-width="0.5"/><text class="th" x="132.5" y="169" text-anchor="middle" dominant-baseline="central">Fraud losses</text><text class="ts" x="132.5" y="189" text-anchor="middle" dominant-baseline="central">Chargebacks, bps</text></g>
+<g class="c-coral"><rect x="245" y="150" width="175" height="56" rx="4" stroke-width="0.5"/><text class="th" x="332.5" y="169" text-anchor="middle" dominant-baseline="central">Lost good sales</text><text class="ts" x="332.5" y="189" text-anchor="middle" dominant-baseline="central">False declines</text></g>
+<g class="c-coral"><rect x="445" y="150" width="175" height="56" rx="4" stroke-width="0.5"/><text class="th" x="532.5" y="169" text-anchor="middle" dominant-baseline="central">Ops and friction</text><text class="ts" x="532.5" y="189" text-anchor="middle" dominant-baseline="central">Review, step-up</text></g>
+<line class="arr" x1="132.5" y1="258" x2="132.5" y2="210" marker-end="url(#arrow)"/>
+<line class="arr" x1="332.5" y1="258" x2="332.5" y2="210" marker-end="url(#arrow)"/>
+<line class="arr" x1="532.5" y1="258" x2="532.5" y2="210" marker-end="url(#arrow)"/>
+<g class="c-teal"><rect x="45" y="260" width="175" height="56" rx="4" stroke-width="0.5"/><text class="th" x="132.5" y="279" text-anchor="middle" dominant-baseline="central">Recall</text><text class="ts" x="132.5" y="299" text-anchor="middle" dominant-baseline="central">Missed fraud $</text></g>
+<g class="c-teal"><rect x="245" y="260" width="175" height="56" rx="4" stroke-width="0.5"/><text class="th" x="332.5" y="279" text-anchor="middle" dominant-baseline="central">Decline rate</text><text class="ts" x="332.5" y="299" text-anchor="middle" dominant-baseline="central">Good txns blocked</text></g>
+<g class="c-teal"><rect x="445" y="260" width="175" height="56" rx="4" stroke-width="0.5"/><text class="th" x="532.5" y="279" text-anchor="middle" dominant-baseline="central">Review rate</text><text class="ts" x="532.5" y="299" text-anchor="middle" dominant-baseline="central">Analyst hours</text></g>
+<path class="arr" d="M332.5 368 V342 H132.5 V320" fill="none" marker-end="url(#arrow)"/>
+<path class="arr" d="M332.5 342 V320" fill="none" marker-end="url(#arrow)"/>
+<path class="arr" d="M332.5 342 H532.5 V320" fill="none" marker-end="url(#arrow)"/>
+<g class="c-gray"><rect x="232.5" y="370" width="200" height="56" rx="4" stroke-width="0.5"/><text class="th" x="332.5" y="389" text-anchor="middle" dominant-baseline="central">Threshold</text><text class="ts" x="332.5" y="409" text-anchor="middle" dominant-baseline="central">One knob, three costs</text></g>
+<g class="c-coral"><rect x="40" y="448" width="12" height="12" rx="2" stroke-width="0.5"/></g><text class="ts" x="60" y="454" dominant-baseline="central">Business KPI ($)</text>
+<g class="c-teal"><rect x="190" y="448" width="12" height="12" rx="2" stroke-width="0.5"/></g><text class="ts" x="210" y="454" dominant-baseline="central">Model / decision metric</text>
+<g class="c-gray"><rect x="380" y="448" width="12" height="12" rx="2" stroke-width="0.5"/></g><text class="ts" x="400" y="454" dominant-baseline="central">Policy lever</text>
+</svg>

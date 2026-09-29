@@ -1,0 +1,320 @@
+---
+title: 2. Signal layers
+description: What to watch at each level of the stack.
+---
+
+## 2.1 System health (the ML-specific version)
+
+### The problem it solves
+
+Before asking whether predictions are *good*, know whether they're **being produced, on time, by the full model**. That's standard SRE (latency, traffic, errors, saturation), plus ML twists standard dashboards miss, especially **silent fallbacks**.
+
+### ML twist #1: latency is mostly not the model
+
+In real-time ML, latency is usually **feature fetching** from the online store:
+
+<Diagram src="monitoring/latency-budget.svg" />
+
+At p50 everything is comfortable; at p99 **feature fetch alone takes 38 ms** and the request blows the budget.
+- **Measure latency per stage**, not just end to end.
+- **Watch the tail.** At 3,000 TPS, p99.9 is still 3 transactions per second, 250k+ per day.
+- The tail comes from **dependencies**: store hotspots, GC pauses, cold caches after deploys, noisy neighbors.
+
+### ML twist #2: silent fallbacks
+
+PayCo's fallback ladder, where **every step still returns HTTP 200**:
+
+| Trigger | Fallback | Effect on quality |
+|---|---|---|
+| One feature lookup times out | **Default-fill** (e.g. `txn_count_10min = 0`) | "Calm" card; risk **underestimated** |
+| Model times out or errors | **Rules engine only** | Much weaker detection |
+| Whole service down | **Fail-open** *or* **fail-closed** | Fraud losses *or* lost revenue |
+
+The key ML system-health metrics:
+- **Fallback rate by type.**
+- **Default-fill rate per feature**, where system health **meets data quality**.
+- **Full-model coverage** = 1 − all fallbacks: the real availability of your ML.
+
+> Fail-open vs fail-closed is a **business risk decision**. Engineering makes it explicit, monitored and tested.
+
+### ML twist #3: which model is actually serving?
+
+- **Version mix:** log the version on every prediction; stale replicas can serve v6 for hours after a rollout.
+- **Canary share:** confirm the canary really gets 5%.
+- **Score sanity:** NaN, inf or scores outside [0,1] count as **errors**.
+
+### The golden signals, adapted for ML
+
+| Signal | Standard | ML additions |
+|---|---|---|
+| **Latency** | End-to-end p50/p99 | Per stage, per feature group |
+| **Traffic** | QPS | By segment and model version; sudden drops often mean **upstream** breaks |
+| **Errors** | 5xx, exceptions | **Fallback rate**, default-fill rate, invalid scores |
+| **Saturation** | CPU, memory | GPU utilization, batch queue depth, feature-store pool, **stream consumer lag** |
+
+### Assumptions
+
+1. Fallbacks are **instrumented** in serving code.
+2. Per-stage timing exists (tracing or spans).
+
+### Trade-offs
+
+- **Tighter timeouts** meet the SLO but default-fill more; **looser** ones breach latency.
+- **Aggressive fallback** keeps availability high while hiding degradation.
+- **Tracing at 3k TPS is expensive:** sample traces, but **count fallbacks exhaustively**.
+
+### Failure modes
+
+- 99.99% availability while 8% of traffic uses a default-filled velocity feature.
+- The fail-open path never tested, so the first outage becomes a fraud event.
+- Averages only: mean 20 ms, p99.9 400 ms.
+- End-to-end latency alerts only; the one bad Redis shard stays invisible.
+
+### Connections
+
+- **2.2:** default-fill rate is a data-quality signal caused by a system problem. **Branch 3:** default-fills look like distribution shift. **Deployment:** version logging and canary checks. **Branch 8:** latency and full-model coverage become SLOs.
+
+<Callout title="Exercise 2.1">
+  Redis p99 has crept up for 2 weeks. An engineer set the **feature-fetch timeout to 20 ms** with **default-fill = 0**. Since then end-to-end p99 is a steady **45 ms** and every dashboard is green. What's quietly happening to detection quality, and which fraud gets through most (mechanism)? Name the one metric that would have revealed it, with an alert threshold and window. Is 0 a good default for `txn_count_10min`, and what's better? Bonus: fail-open or fail-closed for a full outage, and what do you need to decide?
+</Callout>
+
+<details>
+<summary>Answer key 2.1</summary>
+
+1. Timeouts set `txn_count_10min = 0`, so **high-velocity attacks** look calm. Worse than random: a card under attack is hammered with requests, its Redis key gets hot, and timeouts become *more* likely for exactly those cards.
+2. **Default-fill rate for `txn_count_10min`.** Baseline ~0.05%; warn above 1% over 5 minutes, page above 5%.
+3. `0` means "safe", the worst default for a risk feature. Better: an explicit **missing** value the model was trained on, the last cached value, or a conservative prior. The model must have **seen missingness in training**.
+4. It depends on fraud loss vs revenue loss per minute, rules coverage and card-network rules. Commonly a hybrid: fail-open with amount caps, fail-closed or step-up for high-risk segments.
+
+</details>
+
+## 2.2 Data quality
+
+### The problem it solves
+
+Pipeline failures are the most common ML incident: inputs that are *wrong*, scored confidently. Data quality checks inputs against a **contract**.
+
+**Data quality vs drift:**
+- **Data quality:** the data is *wrong* (renamed field, unit change, duplicates, stale values). → **Fix the pipeline.**
+- **Drift:** the data is *valid but different*. → **Adapt the model.**
+- **Check data quality first:** cheaper, more common, and retraining on broken data makes it worse.
+
+### Where checks go
+
+<Diagram src="monitoring/data-quality-checkpoints.svg" />
+
+Check at **every handoff**. Caught at the source it's cheap; at serving it's already cost money; via chargebacks at day 60 it's a post-mortem.
+
+### Six kinds of check
+
+| Check | Asserts | PayCo example that breaks it |
+|---|---|---|
+| **Schema** | Fields, names, types | `device_id` → `deviceId`; feature null for 40% of traffic |
+| **Completeness** | Null rate, default-fill rate, **row volume** | A join silently drops 30% of rows |
+| **Validity** | Ranges, allowed values, formats | `"UK"` instead of ISO `"GB"`, falling into "other" |
+| **Consistency** | Cross-field logic, units, online = offline | Amount in **cents**: $40 looks like $4,000 |
+| **Freshness** | Values recent enough | 20-min consumer lag; `txn_count_10min` describes the *previous* window |
+| **Uniqueness** | No duplicate events | Retries logged twice; velocity doubles; good users blocked |
+
+### Two kinds of rule
+
+1. **Hard constraints** (schema, type, `amount ≥ 0`, ISO codes): any violation is a bug.
+2. **Statistical expectations** ("null rate ≈ 0.1%", "median amount ≈ $38", unseen-category rate < 0.5%), compared against a reference over a window.
+
+Cents are still ≥ 0 and numeric, but the **median jumps 100×**. You need both kinds.
+
+### What happens on failure?
+
+| Where | Action | Why |
+|---|---|---|
+| **Pipeline / batch** | **Quarantine**, don't publish | Better stale than wrong |
+| **Training set** | **Block training** | Otherwise the bug spreads into the weights |
+| **Serving** | **Can't block**: treat as missing, fall back, alert | Links to 2.1's fallback ladder |
+
+At serving, run a few cheap hard checks inline (type, NaN) and everything statistical **asynchronously on prediction logs**.
+
+Tools: Great Expectations, TFDV, Deequ, Soda, dbt tests, Pandera. The hard part is **choosing which checks matter and who responds.**
+
+### Data contracts: the organizational fix
+
+Most data-quality bugs come from **another team**. A **data contract** (schema, semantics, units, change announcements) enforced in *their* CI moves detection **left**, before deploy.
+
+### Assumptions
+
+1. You know what correct looks like per feature (200 features = 200 small specs).
+2. Checks run on the **same data** the model sees.
+3. Each alert has an owner, often **upstream**.
+
+### Trade-offs
+
+- **Strict vs tolerant:** strict gates block valid changes (a new country's "unseen categories").
+- **Coverage vs maintenance:** stale checks nag or go silent.
+- **Inline vs async:** protects predictions vs costs latency.
+
+### Failure modes
+
+- **Checks only on training data** while serving receives cents.
+- **Only hard constraints:** unit and semantic changes pass.
+- **No volume checks:** dropped rows pass every per-row check.
+- **Checks duplicated** in training and serving code, drifting apart.
+- **Wrong owner:** ML on-call gets the alert, only mobile can fix it.
+
+### Connections
+
+- **2.1:** timeouts create default-fills (completeness failures). **Branch 3:** a unit change *looks like* massive drift. **Features:** one computation for online and offline removes a class of skew. **Branch 7:** quarantine and backfill.
+
+<Callout title="Exercise 2.2">
+  The mobile app starts sending `txn_amount` in **cents**. Mobile is 40% of traffic; the update rolls out over 3 days. Which checks catch it and which miss: (a) `amount ≥ 0`, (b) type = float, (c) global median vs reference, (d) median **per channel** vs reference, (e) train-serve skew check? Why does the gradual rollout make it harder, and what window/reference choice helps? What happens to the block rate? Where would a data contract have stopped it?
+</Callout>
+
+<details>
+<summary>Answer key 2.2</summary>
+
+1. (a) **Misses**; (b) **misses**; (c) **weak and late** (40% of traffic, gradual); (d) **catches it** (mobile median jumps ~100×); (e) **catches it**, most clearly per channel.
+2. Small per-window change is absorbed by a rolling reference (boiling frog). Use a **fixed reference** and segment by **app version**.
+3. Amounts look 100× bigger and high amounts are risky, so the **block rate rises** for mobile: false positives and lost revenue.
+4. In the **mobile team's CI**: the contract says `txn_amount` is USD dollars; changing units requires a new field (`amount_cents`) or a versioned contract change.
+
+</details>
+
+## 2.3 Outputs (prediction monitoring)
+
+### The problem it solves
+
+Labels are late (30–90 days), and inputs are many and noisy (200 features × segments). The model's output is **available immediately** and **compresses all inputs, weighted by how much the model relies on each**. Output monitoring is a **relevance filter** over input monitoring.
+
+### What to monitor
+
+| Signal | What it is | Why |
+|---|---|---|
+| **Score distribution** | Quantiles or histogram vs reference | The main output drift signal |
+| **Decision rate** | Block, step-up, approve % | What the business experiences; depends on the **threshold** |
+| **Mass near the threshold** | % of scores in e.g. [0.85, 0.95] | Crowded thresholds swing decisions |
+| **Score spread** | Std dev, entropy | **Collapse** usually means inputs are all defaults |
+| **Implied fraud rate** | Mean score, *if calibrated* | Reconciled with the real rate once labels mature |
+| **Attribution drift** | SHAP distributions over time | Which feature drives a score shift |
+
+For ranking: score spread and top-k diversity. Regression: prediction mean and quantiles. LLMs: response length, refusal rate, tool-call rate.
+
+### How to read it: inputs × outputs
+
+<Diagram src="monitoring/input-output-drift-matrix.svg" />
+
+- **Top-left** (inputs and outputs moved): most alerts that matter. Which features moved? Data bug or real change?
+- **Top-right** (inputs moved, outputs didn't): suppress or downgrade. This is how output monitoring **cuts input-drift noise**.
+- **Bottom-left** (outputs moved, inputs didn't): usually **inside your system**: new model, changed threshold, an unmonitored feature, or an interaction.
+- **Bottom-right** (nothing moved): the dangerous one. **Concept drift**: P(fraud | inputs) changed while everything looks identical. Only labels or proxies catch it.
+
+### Design choices
+
+1. **Binning scores.** ~99.5% of PayCo scores are below 0.05, so equal-width bins make **every tail change invisible**, and the tail is where blocking happens. Use **quantile bins from the reference** or **log-odds bins**, and monitor the top tail separately.
+2. **Model vs policy.** Decision rate = scores **+ threshold + rules**. Moving the threshold from 0.9 to 0.85 moves the block rate with no model change. Log **threshold and config version** and monitor scores and decisions separately.
+3. **Segments:** channel, country, merchant type, **model version**.
+4. **Shadow comparison:** score the same traffic with both models and compare agreement and block sets.
+
+### Assumptions
+
+1. Output shift correlates with quality problems (but a real fraud wave also shifts outputs).
+2. **Calibration** for the implied fraud rate; downsampled training breaks it unless corrected.
+3. Threshold and policy are logged and known.
+
+### Trade-offs
+
+- **Speed vs meaning:** immediate, but can't say whether the model is *right*.
+- **Tail sensitivity vs noise**, especially per segment.
+- **Relevance filter vs blind spot:** keep low-priority tracking of suppressed features.
+
+### Failure modes
+
+- **Watching only the mean score** while the tail doubles.
+- **Equal-width bins** hide the action.
+- **Threshold change mistaken for drift.**
+- **Score collapse missed:** a broken feature pulls every score to the prior, and the falling block rate looks like good news.
+- **Treating stable outputs as proof of health** (bottom-right).
+
+### Connections
+
+- **2.2:** score collapse points back to data quality. **Branch 3:** output shift is **prediction drift**. **Branch 5:** outputs are the **main proxy** until labels arrive. **2.4:** decision rate bridges to revenue. **Branch 7:** shadow and canary comparisons.
+
+<Callout title="Exercise 2.3">
+  Name the matrix cell and first action: (1) holiday season brings many new online merchants (input shift in `merchant_category`), block rate unchanged; (2) Friday, inputs stable, block rate jumps 0.8% → 1.1%, no new model deployed; (3) a fraud ring moves to gift cards under $50, aggregates look normal; (4) why would bins [0–0.1, 0.1–0.2, …] miss (3) even if scores moved slightly? Bonus: overnight the block rate **drops** 0.8% → 0.3% and score std dev falls 60%: good or bad, and what's your first check?
+</Callout>
+
+<details>
+<summary>Answer key 2.3</summary>
+
+1. **Top-right.** Low priority; confirm the seasonal reference and keep watching.
+2. **Bottom-left.** Check the **threshold/rules config change log** first, then unmonitored features.
+3. **Bottom-right.** Needs **segment-level** monitoring (gift cards × low amounts) plus fast proxies (disputes, manual review).
+4. ~99.5% of scores sit in the first bin; a 0.30% → 0.35% shift in the 0.85–0.95 tail vanishes in the chart and PSI, diluted further globally. Use quantile or log-odds bins plus segments.
+
+Bonus: **bad news**. Score collapse means inputs are defaulting, so fraud passes while the block rate looks better. Check default-fill and null rates and feature-store freshness first.
+
+</details>
+
+## 2.4 Business KPIs
+
+### The problem it solves
+
+Every signal so far is a **proxy**. Green system health, clean data, stable outputs and better AUC can still **lose money**. Business KPIs measure **why the system exists**, but they're **slow, noisy and confounded**: essential, and terrible as your only alarm.
+
+### How it works: a metric tree
+
+<Diagram src="monitoring/business-metric-tree.svg" />
+
+**One threshold drives all three costs.** Lower it: fraud losses down, lost sales and review load up. Business monitoring watches **the balance**.
+
+| KPI | Measures | Available | Early proxy |
+|---|---|---|---|
+| **Fraud loss (bps of volume)** | Missed fraud in $ | **30–90 days** | Customer fraud reports, issuer alerts, review hits |
+| **Approval rate** | Share approved | **Immediately** | n/a |
+| **False-decline rate** | Good customers blocked | **Never fully known** | Declines retried successfully with step-up; complaints; call-center contacts |
+| **Step-up completion** | 3DS passed vs abandoned | Minutes | n/a |
+| **Review queue** | Volume vs analyst capacity | Hourly | n/a |
+
+You never see the truth for blocked transactions: the **self-inflicted** class from 1.1, and why branch 5 exists.
+
+### Design choices
+
+1. **One objective with guardrails.** Minimize net fraud cost, subject to hard limits (approval rate ≥ 97.5%, review queue ≤ capacity, p99 ≤ 50 ms). A change that improves the objective but breaks a guardrail is **rolled back**.
+2. **Weight by dollars, not counts.** Catching 1,000 $5 frauds while missing one $20,000 fraud is 99.9% recall by count and a bad result in dollars.
+3. **A holdout for causal attribution.** Keep 0.5–1% on a baseline (rules-only or the previous model). It costs real money but buys **causal truth** (model value = KPI(model) − KPI(holdout)) and **unbiased labels**.
+4. **Alert routing matches the delay.** Approval-rate cliff (−2 pp in 15 min) → **page**. Fraud-loss trend → **weekly review**.
+
+### Assumptions
+
+1. KPIs are **defined the same way** everywhere (gross vs net fraud loss can differ 30%).
+2. You can **attribute** changes (segmentation, holdout, deploy and config logs).
+3. The metric tree reflects reality (unmodeled step-up churn skews it).
+
+### Trade-offs
+
+- **Truth vs speed:** you need both layers.
+- **Holdout cost vs knowledge:** ~1% with wide intervals is common.
+- **Goodhart:** minimize declines alone and fraud rises; guardrails prevent it.
+
+### Failure modes
+
+- **Only ML metrics:** AUC up, fraud loss up (better on small frauds, worse on big ones).
+- **Only KPIs:** the 2.1 velocity bug found **60 days later**.
+- **No holdout:** a merchant leaving gets credited to the new model.
+- **Simpson's paradox:** aggregate flat while every segment moves, due to mix change.
+- **Count-based metrics** hide dollar concentration.
+
+### Connections
+
+- **Requirements** define KPIs and guardrails. **2.3:** decision rate links to approval rate. **Branch 5:** label delay, the false-decline blind spot, the holdout as label source. **Branch 7:** rollback checks guardrails. **Branch 8:** which KPIs page and who owns them.
+
+<Callout title="Exercise 2.4">
+  Model **v8** is on a **10% canary** for 2 weeks; offline AUC was **+2%** vs v7. Canary: block rate same as v7; approval rate **−0.3 pp**; declined-card support contacts **+15%**; fraud loss not yet known. How can the block rate stay the same while approvals drop? Ship, extend, or roll back, using objective vs guardrails and what you can and can't know at week 2? Which early proxy estimates v8's fraud performance? Estimate a **1% holdout**'s yearly cost if fraud is 8 bps of $50B volume and the model prevents ~70% of it. Worth it?
+</Callout>
+
+<details>
+<summary>Answer key 2.4</summary>
+
+1. Decisions come from **model + rules + step-up**. v8 can send more transactions into step-up, where people **abandon**, or block a *different* set of the same size that contains more good customers. The block count stays the same while approvals fall.
+2. **Don't ship.** Extend the canary, or roll back if approval falls through its guardrail. The harm is measurable now (approval −0.3 pp, +15% complaints). The benefit (fraud loss) isn't. An offline AUC gain is not evidence of business value.
+3. **Disagreement set**: transactions v8 approves that v7 would have blocked (from shadow scores). Manually review a sample. Also use early fraud reports extrapolated with a **maturity curve**, since roughly half of chargebacks arrive in the first 2–3 weeks.
+4. Fraud attempted is 8 bps × $50B = $40M/yr. The model prevents 70% = $28M. A 1% holdout gives up about **$280k/yr**. In return you get causal proof of $28M in value and **unbiased labels** for retraining. That's usually worth it, and running the holdout on rules-only instead of nothing makes it cheaper.
+
+</details>

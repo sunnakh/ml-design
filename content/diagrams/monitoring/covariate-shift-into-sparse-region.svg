@@ -1,0 +1,12 @@
+<svg width="100%" viewBox="0 0 680 310" role="img"><title>Covariate shift</title><desc>Training traffic is concentrated at lower amounts. Production traffic has shifted to higher amounts, into a region with thin training data. The true fraud probability curve is unchanged.</desc><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="470" y="40" width="150" height="198" rx="4" fill="none" stroke="#888780" stroke-width="0.5" stroke-dasharray="4 3"/>
+<text class="ts" x="545" y="54" text-anchor="middle" dominant-baseline="central">Thin training data</text>
+<path d="M80 240 C180 240, 200 100, 260 100 C320 100, 340 240, 440 240" fill="none" stroke="#1D9E75" stroke-width="2"/>
+<path d="M200 240 C320 240, 350 120, 420 120 C490 120, 520 240, 620 240" fill="none" stroke="#D85A30" stroke-width="2"/>
+<path d="M80 228 C300 228, 380 90, 620 80" fill="none" stroke="#888780" stroke-width="1.5" stroke-dasharray="5 4"/>
+<line class="arr" x1="80" y1="240" x2="636" y2="240" marker-end="url(#arrow)"/>
+<text class="ts" x="636" y="258" text-anchor="end" dominant-baseline="central">Transaction amount</text>
+<line x1="80" y1="288" x2="104" y2="288" stroke="#1D9E75" stroke-width="2"/><text class="ts" x="112" y="288" dominant-baseline="central">Training traffic</text>
+<line x1="240" y1="288" x2="264" y2="288" stroke="#D85A30" stroke-width="2"/><text class="ts" x="272" y="288" dominant-baseline="central">Production now</text>
+<line x1="400" y1="288" x2="424" y2="288" stroke="#888780" stroke-width="1.5" stroke-dasharray="5 4"/><text class="ts" x="432" y="288" dominant-baseline="central">True P(fraud | amount)</text>
+</svg>

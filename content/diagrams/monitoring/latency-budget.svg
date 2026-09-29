@@ -1,0 +1,22 @@
+<svg width="100%" viewBox="0 0 680 235" role="img"><title>PayCo latency budget</title><desc>Stacked latency bars against a 50 ms budget. At p50 the request takes about 24 ms, mostly feature fetch. At p99 feature fetch grows to 38 ms and the total of 56 ms exceeds the budget.</desc><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<text class="ts" x="540" y="40" text-anchor="middle" dominant-baseline="central">Budget 50 ms</text>
+<text class="th" x="40" y="78" dominant-baseline="central">p50</text>
+<g class="c-gray"><rect x="90" y="60" width="27" height="36" stroke-width="0.5"/></g>
+<g class="c-coral"><rect x="117" y="60" width="108" height="36" stroke-width="0.5"/><text class="ts" x="171" y="78" text-anchor="middle" dominant-baseline="central">Features 12</text></g>
+<g class="c-gray"><rect x="225" y="60" width="54" height="36" stroke-width="0.5"/><text class="ts" x="252" y="78" text-anchor="middle" dominant-baseline="central">Model</text><rect x="279" y="60" width="27" height="36" stroke-width="0.5"/></g>
+<text class="th" x="40" y="128" dominant-baseline="central">p99</text>
+<g class="c-gray"><rect x="90" y="110" width="45" height="36" stroke-width="0.5"/><text class="ts" x="112.5" y="128" text-anchor="middle" dominant-baseline="central">Net</text></g>
+<g class="c-coral"><rect x="135" y="110" width="342" height="36" stroke-width="0.5"/><text class="ts" x="306" y="128" text-anchor="middle" dominant-baseline="central">Feature fetch 38 ms</text></g>
+<g class="c-gray"><rect x="477" y="110" width="81" height="36" stroke-width="0.5"/><text class="ts" x="517.5" y="128" text-anchor="middle" dominant-baseline="central">Model 9</text><rect x="558" y="110" width="36" height="36" stroke-width="0.5"/></g>
+<line class="leader" x1="540" y1="52" x2="540" y2="156" stroke-dasharray="4 3"/>
+<line class="arr" x1="90" y1="166" x2="636" y2="166"/>
+<text class="ts" x="90" y="182" text-anchor="middle" dominant-baseline="central">0</text>
+<text class="ts" x="180" y="182" text-anchor="middle" dominant-baseline="central">10</text>
+<text class="ts" x="270" y="182" text-anchor="middle" dominant-baseline="central">20</text>
+<text class="ts" x="360" y="182" text-anchor="middle" dominant-baseline="central">30</text>
+<text class="ts" x="450" y="182" text-anchor="middle" dominant-baseline="central">40</text>
+<text class="ts" x="540" y="182" text-anchor="middle" dominant-baseline="central">50</text>
+<text class="ts" x="630" y="182" text-anchor="middle" dominant-baseline="central">60 ms</text>
+<g class="c-coral"><rect x="40" y="206" width="12" height="12" rx="2" stroke-width="0.5"/></g><text class="ts" x="60" y="212" dominant-baseline="central">Feature fetch</text>
+<g class="c-gray"><rect x="170" y="206" width="12" height="12" rx="2" stroke-width="0.5"/></g><text class="ts" x="190" y="212" dominant-baseline="central">Network, model, rules</text>
+</svg>

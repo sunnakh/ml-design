@@ -1,0 +1,18 @@
+<svg width="100%" viewBox="0 0 680 390" role="img"><title>ML incident response loop</title><desc>Alert leads to diagnosis, which branches to fix data bug, retrain, or rollback; all converge to validation, then canary deploy, then back to monitoring.</desc><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<g class="c-gray"><rect x="110" y="40" width="200" height="56" rx="4" stroke-width="0.5"/><text class="th" x="210" y="59" text-anchor="middle" dominant-baseline="central">Detect</text><text class="ts" x="210" y="79" text-anchor="middle" dominant-baseline="central">Alert on threshold</text></g>
+<g class="c-gray"><rect x="370" y="40" width="200" height="56" rx="4" stroke-width="0.5"/><text class="th" x="470" y="59" text-anchor="middle" dominant-baseline="central">Diagnose</text><text class="ts" x="470" y="79" text-anchor="middle" dominant-baseline="central">Which layer broke?</text></g>
+<line class="arr" x1="312" y1="68" x2="366" y2="68" marker-end="url(#arrow)"/>
+<path class="arr" d="M470 98 V123 H132.5 V146" fill="none" marker-end="url(#arrow)"/>
+<path class="arr" d="M332.5 123 V146" fill="none" marker-end="url(#arrow)"/>
+<path class="arr" d="M470 123 H532.5 V146" fill="none" marker-end="url(#arrow)"/>
+<g class="node c-teal"><rect x="45" y="150" width="175" height="56" rx="4" stroke-width="0.5"/><text class="th" x="132.5" y="169" text-anchor="middle" dominant-baseline="central">Fix data bug</text><text class="ts" x="132.5" y="189" text-anchor="middle" dominant-baseline="central">Upstream pipeline</text></g>
+<g class="node c-teal"><rect x="245" y="150" width="175" height="56" rx="4" stroke-width="0.5"/><text class="th" x="332.5" y="169" text-anchor="middle" dominant-baseline="central">Retrain</text><text class="ts" x="332.5" y="189" text-anchor="middle" dominant-baseline="central">Fresh data</text></g>
+<g class="node c-teal"><rect x="445" y="150" width="175" height="56" rx="4" stroke-width="0.5"/><text class="th" x="532.5" y="169" text-anchor="middle" dominant-baseline="central">Rollback</text><text class="ts" x="532.5" y="189" text-anchor="middle" dominant-baseline="central">Last good model</text></g>
+<path class="arr" d="M132.5 208 V233 H532.5 V208" fill="none"/>
+<path class="arr" d="M332.5 208 V256" fill="none" marker-end="url(#arrow)"/>
+<g class="c-gray"><rect x="232.5" y="260" width="200" height="56" rx="4" stroke-width="0.5"/><text class="th" x="332.5" y="279" text-anchor="middle" dominant-baseline="central">Validate</text><text class="ts" x="332.5" y="299" text-anchor="middle" dominant-baseline="central">Offline + shadow</text></g>
+<line class="arr" x1="434.5" y1="288" x2="466" y2="288" marker-end="url(#arrow)"/>
+<g class="c-gray"><rect x="470" y="260" width="170" height="56" rx="4" stroke-width="0.5"/><text class="th" x="555" y="279" text-anchor="middle" dominant-baseline="central">Canary deploy</text><text class="ts" x="555" y="299" text-anchor="middle" dominant-baseline="central">Gradual rollout</text></g>
+<path class="arr" d="M555 318 V344 H28 V68 H106" fill="none" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+<text class="ts" x="290" y="362" text-anchor="middle" dominant-baseline="central">Back to monitoring</text>
+</svg>
