@@ -21,6 +21,12 @@ html > body[data-scroll-locked] {
   --border-strong: color-mix(in oklab, var(--color-fd-foreground) 30%, transparent);
   --surface-1: var(--color-fd-card);
   --surface-2: var(--color-fd-secondary);
+  --surface-0: var(--color-fd-background);
+  --border-stronger: color-mix(in oklab, var(--color-fd-foreground) 45%, transparent);
+  --border-danger: var(--color-fd-error);
+  --text-danger: var(--color-fd-error);
+  --text-success: var(--color-fd-success);
+  --radius: 8px;
 
   --d-gray-fill: #f1efe8;
   --d-gray-stroke: #5f5e5a;
@@ -34,6 +40,9 @@ html > body[data-scroll-locked] {
   --d-coral-fill: #faece7;
   --d-coral-stroke: #993c1d;
   --d-coral-text: #712b13;
+  --d-amber-fill: #faeeda;
+  --d-amber-stroke: #854f0b;
+  --d-amber-text: #633806;
 
   --bg-accent: var(--d-purple-fill);
   --border-accent: var(--d-purple-stroke);
@@ -55,6 +64,9 @@ html > body[data-scroll-locked] {
   --d-coral-fill: #4a1b0c;
   --d-coral-stroke: #f0997b;
   --d-coral-text: #f5c4b3;
+  --d-amber-fill: #412402;
+  --d-amber-stroke: #ef9f27;
+  --d-amber-text: #fac775;
 }
 
 .ml-diagram svg {
@@ -71,6 +83,11 @@ html > body[data-scroll-locked] {
 .ml-diagram .th {
   font-size: 14px;
   font-weight: 500;
+  fill: var(--text-primary);
+}
+
+.ml-diagram .t {
+  font-size: 14px;
   fill: var(--text-primary);
 }
 
@@ -91,8 +108,8 @@ html > body[data-scroll-locked] {
   stroke-dasharray: 3 3;
 }
 
-.ml-diagram :is(.c-gray, .c-purple, .c-teal, .c-coral):is(rect, circle, ellipse, path, polygon),
-.ml-diagram :is(.c-gray, .c-purple, .c-teal, .c-coral) :is(rect, circle, ellipse, path, polygon) {
+.ml-diagram :is(.c-gray, .c-purple, .c-teal, .c-coral, .c-amber):is(rect, circle, ellipse, path, polygon),
+.ml-diagram :is(.c-gray, .c-purple, .c-teal, .c-coral, .c-amber) :is(rect, circle, ellipse, path, polygon) {
   stroke-width: 0.75;
 }
 
@@ -130,6 +147,15 @@ html > body[data-scroll-locked] {
 }
 .ml-diagram .c-coral text {
   fill: var(--d-coral-text);
+}
+
+.ml-diagram .c-amber:is(rect, circle, ellipse, path, polygon),
+.ml-diagram .c-amber :is(rect, circle, ellipse, path, polygon) {
+  fill: var(--d-amber-fill);
+  stroke: var(--d-amber-stroke);
+}
+.ml-diagram .c-amber text {
+  fill: var(--d-amber-text);
 }
 
 .ml-diagram figcaption {
