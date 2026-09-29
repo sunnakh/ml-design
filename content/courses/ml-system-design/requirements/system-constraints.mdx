@@ -1,0 +1,406 @@
+---
+title: D. System constraints
+description: Limits the design must stay inside.
+---
+
+## D1 Latency budget, p50 vs p99
+
+### What problem this solves
+The fraud check runs **inside checkout**, and the buyer is waiting. Slow checkouts lose sales. The whole payment flow also has hard timeouts set by the payment processor and the card network. So "how fast must the model be?" is a requirement with a price, not a preference.
+
+D1 turns that into a **budget**: one number, split across components so each owner knows their limit, measured at the **tail** where users actually feel it.
+
+### How it works
+
+**1. Start from the end-to-end budget and work down.**
+```
+Buyer clicks "Pay" → confirmation         target ≤ 1.5 s
+  └ payment authorization (processor)     ~300–800 ms
+  └ fraud decision service                ≤ 50 ms at p99   ← our budget
+```
+
+**2. Price latency in dollars.** Run a **latency-injection experiment**: add artificial delay for a random slice of users and measure conversion. Illustratively, if +100 ms costs 0.3% of conversions, that's ~6,000 orders/day × $16 ≈ **$96k/day**. Now latency and accuracy use the same currency: a model that saves $20k/day but adds 100 ms is a net loss.
+
+**3. Budget at p99, not the average.**
+- The average hides the tail. 1% of 2M payments = **20,000 slow checkouts per day**.
+- Heavy users make many requests, so they hit the tail more often.
+- In fraud, the tail tends to involve **the most valuable customers**: long histories mean more lookups, which means slower responses.
+
+**4. Split the budget across components, and parallelize.** Here's a trace of one request:
+
+<Diagram src="requirements/service-latency-budget-waterfall.svg" />
+
+The trace shows three techniques:
+- **Parallelism:** the feature store and velocity counters run at the same time, so the critical path costs max(12, 5) = 12 ms instead of 17.
+- **Async logging:** the decision log is written off the critical path. Logging synchronously would cost 14 ms for nothing.
+- **Headroom:** 21 ms unused on purpose. It absorbs garbage-collection pauses, load spikes, and the next feature someone wants to add.
+
+### Why the tail gets worse: fan-out
+If feature assembly makes N parallel lookups, the request is as slow as the **slowest** one. If each lookup is slow 1% of the time:
+```
+P(request hits at least one slow lookup) = 1 − 0.99^N
+
+N =  1  →  1%        N = 20  → 18%
+N =  5  →  5%        N = 50  → 39%
+N = 10  → 10%        N = 100 → 63%
+```
+With 20 lookups, the "rare" 1% tail becomes almost 1 in 5 requests. What to do about it:
+- **Fewer calls:** batch lookups into one multi-get, and store features together by entity.
+- **Hedged requests:** if a lookup hasn't returned by its p95 time, send a duplicate and take whichever answers first.
+- **Per-lookup deadlines with a defined missing value:** the model was trained to handle missing lanes (C3), so a late lookup can simply be dropped.
+
+### Latency constrains the model
+| Model | Typical inference | Fits 50 ms on the checkout path? |
+|---|---|---|
+| Logistic regression | < 1 ms | Easily |
+| GBDT, ~500 trees | 1–5 ms on CPU | Yes, the usual choice |
+| Deep sequence model | 10–40 ms, often needs a GPU | Risky. GPU batching adds waiting time. |
+| Graph features, multi-hop | 20–200 ms at the tail | No, move it to the async re-score (C2) or precompute it |
+
+This is why D1 belongs in **requirements**. The latency budget rules out some model families before anyone trains anything.
+
+### Measuring latency correctly
+- **Measure at the caller**, not only the server. The payments service experiences network time, queueing and retries too.
+- **Use histograms and merge them.** Never average the p99 values from different hosts; that number means nothing.
+- **Break down by segment:** high-history users, specific countries, payment methods.
+- **Track latency during and right after deploys.** A newly started server has cold caches and a model still loading, so latency spikes briefly after every release.
+
+### Assumptions
+1. The component budgets sum safely. Adding up p99s gives a conservative upper bound, which is a safe way to plan.
+2. The conversion cost of latency was measured, not guessed.
+3. Load stays inside the planned range. Near saturation, latency rises steeply (the same queue curve as C4; D2 covers this).
+4. Dependencies meet **their** latency targets (the feature store has its own).
+
+### Design choices
+| Choice | Options | Trade-off |
+|---|---|---|
+| Budget target | p99 · p99.9 | p99.9 protects more users but costs much more infrastructure |
+| Where heavy features go | In the checkout path · precomputed · async | Accuracy vs latency (C2) |
+| Hardware | CPU with GBDT · GPU with a deep model | Predictable and cheap vs more accurate but with batching delays and higher cost (D5) |
+| Missing lookups | Wait · **drop at the deadline and use the missing value** | Completeness vs bounded latency |
+| Who owns latency | A shared pool · **a per-component budget with named owners** | Flexible vs accountable |
+
+### Failure modes
+- **Budgeting on the average.** The dashboard shows 15 ms, while 20k checkouts a day take 200 ms.
+- **p99s averaged across hosts.** It looks fine while one sick host serves 5% of traffic slowly.
+- **Latency creep.** Each release adds 2 ms, "just one more feature". After a year, the headroom is gone. A per-component budget with CI checks stops this.
+- **Synchronous logging or metrics calls** sitting on the critical path.
+- **Fan-out tails.** A model with 80 lookups has a terrible p99 even though each lookup is fast.
+- **Cold starts after deploys**, causing a burst of timeouts and fallbacks (C3) every release.
+- **Garbage-collection pauses or noisy neighbors**, causing periodic latency spikes. Headroom and fallback deadlines absorb them.
+- **Latency varies with value:** the slowest requests are the most valuable customers, so a timeout-based fallback hits exactly the wrong people.
+
+### How D1 connects to the rest
+- **A1:** a synchronous decision is what creates the budget.
+- **A2:** latency priced in conversion dollars.
+- **B3:** p99 is a guardrail.
+- **C1:** a thin request means lookups.
+- **C2:** heavy work moves to async.
+- **C3:** deadlines and fallback.
+- **D2:** latency rises with utilization.
+- **D5:** CPU vs GPU cost.
+- **E1:** feature design must fit the budget.
+
+<Callout title="Exercise (D1): one question, optional">
+
+The data science team wants a new **3-hop graph feature** ("how many chargebacks are within 3 links of this device?"). It measures **p50 15 ms, p99 60 ms**. The budget is **50 ms p99** with **21 ms of headroom**. **List at least two ways to get most of this feature's value without breaking the budget.**
+
+</Callout>
+
+## D2 Throughput and scale estimation
+
+### What problem this solves
+Before building anything, you need rough answers to a few questions. How many requests per second at peak? How much data per day? How many machines? Which component breaks first?
+
+If you get these wrong in one direction, the system falls over on Black Friday. In the other direction, you overbuild and pay for it in D5. The skill is **back-of-envelope estimation**: numbers accurate to within ~2×, done in minutes, before choosing an architecture.
+
+### How it works: estimate step by step
+Useful constants: **86,400 seconds/day ≈ 10⁵**, and the ratio of peak to average load, which you get from historical traffic.
+
+**1. Serving load**
+```
+2M payments/day ÷ 86,400 s      ≈ 23 requests/s   average
+× 3   evening daily peak        ≈ 70 requests/s
+× 10  Black Friday              ≈ 230 requests/s
+× 2   flash-sale bursts         ≈ 460 requests/s  ← design peak
+÷ 0.7 target utilization (D1)   ≈ 660 requests/s  capacity needed
+× 2   while a shadow model runs (A4)  ≈ 1,300 requests/s worth of scoring
+```
+
+**2. Compute for the model**
+```
+~8 ms of CPU per request (feature assembly + GBDT)
+→ 1 core ≈ 125 requests/s at 100% ≈ 90 requests/s at 70%
+1,300 ÷ 90 ≈ 15 cores; spread across 3 zones with N+1 redundancy ≈ 30 cores
+```
+That's small. **The model is not what's hard to scale here.** Let's find what is.
+
+**3. Every other component**
+```
+Feature store reads    460 requests/s × 20 lookups           ≈ 9,200 reads/s
+Streaming events       2M payments + 50M logins, sessions, device events/day
+                       ≈ 600 events/s average, × 10 peak     ≈ 6,000 events/s
+Velocity counters      each event updates 5 keys (card, device, IP, user, email)
+                       × 4 windows (1 min, 10 min, 1 h, 24 h)
+                       = 20 updates per event                 ≈ 120,000 updates/s
+```
+
+<Diagram src="requirements/system-peak-load-by-component.svg" />
+
+The streaming counters take about **260×** more operations than the model does. This is the typical pattern: in real ML systems, **the data plumbing scales harder than the model.**
+
+**4. Storage and training data**
+```
+Decision log      ~2 KB per decision (request + ~300 served features + response)
+                  × 2M/day ≈ 4 GB/day ≈ 1.5 TB/year raw, ~300 GB compressed (columnar)
+Online features   ~230M entities (50M users, 80M cards, 100M devices)
+                  × ~400 bytes ≈ 90 GB, × 2–3 for indexes and replicas ≈ 250 GB in memory
+Training set      12 months × 2M/day = 730M rows
+                  keep all ~2.2M fraud + 5% of good payments ≈ 38M rows
+                  → one large machine, or a small cluster, for GBDT
+                  (correct the odds afterwards, as in B1)
+```
+
+**5. Growth.** At +50% per year, plan for **2.25× in two years**. Architecture choices should survive that without a rewrite.
+
+### Two scale problems unique to fraud
+**Hot keys.** Load isn't spread evenly across keys. One corporate network, or one mobile carrier routing thousands of phones through a single IP, sends huge numbers of events to **one** counter key. It overloads a single shard while the average looks fine.
+
+**Attacks are load spikes.** A card-testing attack throws thousands of attempts per minute at one merchant or device. That's peak load **at exactly the moment the system matters most**, and if the overload tips the service into fail-open (C3), the attack succeeds twice. Requirements:
+- **Rate limiting upstream**, per device, IP and card.
+- **A priority order for shedding load** when overloaded: drop the shadow model first, then metrics, then optional features. **Never drop the decision itself.**
+- **Split hot keys** (spread one hot counter across several sub-counters).
+
+### Assumptions
+1. The peak-to-average ratio comes from **your own history**, not a guess. Include seasonal events.
+2. Retries, shadow traffic and replays are counted. People forget these all the time.
+3. Keys are spread roughly evenly. This fails exactly for hot keys and attacks.
+4. The growth forecast is known well enough to plan a year or two ahead.
+
+### Design choices
+| Choice | Options | Trade-off |
+|---|---|---|
+| Handling peaks | Autoscaling · provisioning for peak · **both, pre-scaled before known events** | Autoscaling takes minutes to react, and flash sales spike in seconds |
+| Under overload | Drop requests · slow everything · **shed by priority** | Protects the decision, sacrifices extras |
+| Sharding key | By user · by card · by device | Needs to match lookup patterns, and hot-key risk differs by key |
+| Training data size | All rows · **downsample good payments + correct the odds** | Cost and speed vs added complexity in calibration |
+| Log retention | Keep everything · tiered (hot / cold / delete) | Audit needs (F1, F3) vs storage cost and privacy law |
+
+### Failure modes
+- **Planning for the average.** 23 requests/s looks trivial, then Black Friday arrives at 20×.
+- **Forgetting the multipliers.** Retries, shadow scoring, backfill jobs hitting the same feature store.
+- **Hot shards.** One key melts one node while the cluster-wide graphs look healthy.
+- **Autoscaling too slow for bursts.** Timeouts, then fallback (C3), during peak revenue.
+- **An attack that causes fail-open** (C3 + D2 together).
+- **Logs grow without limit.** Storage costs climb, and you may break data-minimization rules (F1).
+- **Training outgrows its cadence.** Retraining takes 3 days, but the plan is to retrain every day.
+- **Never load-tested.** The estimate stays a guess until you replay 2× peak traffic in staging.
+
+### How D2 connects to the rest
+- **C2:** events per second for streaming, requests per second for online prediction.
+- **C3:** overload leads to fallback, and shedding priorities matter.
+- **C4:** the same queueing math applies to analysts.
+- **D1:** latency rises with utilization, hence 70% targets.
+- **D3:** freshness under load.
+- **D5:** cores, memory and storage turn into dollars.
+- **E3:** class imbalance and downsampling.
+- **F1:** retention.
+- **G2:** this estimation method is a core interview skill.
+
+<Callout title="Exercise (D2): one question, optional">
+
+Marketing plans a flash sale expected to bring **300,000 extra payments within 30 minutes**, on top of normal evening traffic (~70/s). Traffic in the **first 5 minutes** is expected to be **3× the sale's average rate**. **Estimate the peak scoring rate in requests per second, and list two things you'd do before the sale.**
+
+</Callout>
+
+## D3 Freshness of features, model, and labels
+
+### What problem this solves
+Everything in an ML system has an **age**: the feature values used in a decision, the patterns the model learned, the labels it learned them from. The world keeps changing, and in fraud the world is an **adversary** changing on purpose. Once an input is older than the thing it describes changes, its value drops.
+
+Freshness costs money: streaming infrastructure (D2), frequent retraining (D5), more lookups (D1). D3 asks: **how fresh does each part need to be, and how do we prove it?**
+
+### Four kinds of freshness, often confused
+| Kind | Question | Fraud example |
+|---|---|---|
+| **Feature freshness** | How old is this value when it's used? | Velocity counter is 3 s old; user profile is 20 h old |
+| **Model freshness** | How old are the learned patterns? | Model trained on data up to 60 days ago |
+| **Label freshness** | How long until the truth is known? | Chargebacks take 30–90 days |
+| **Policy freshness** | How fast can thresholds and rules change? | New rule live within 1 hour |
+
+### How it works: compare timescales
+Put **how fast the world changes** next to **how fast each lever can respond**. The mismatches are your requirements.
+
+<Diagram src="requirements/freshness-timescales-world-vs-levers.svg" />
+
+What the chart shows:
+- **Chargeback labels (1–3 months) arrive slower than fraud patterns shift (days to weeks).** A model trained only on chargebacks is **always fighting the last war**. That one mismatch explains most of the fraud architecture:
+  - **Fast labels** (analyst verdicts, issuer fraud alerts, customer reports) cover the gap, at the cost of noise (B4).
+  - **Fast levers** (rules and thresholds, updated in hours) respond before any retrain can.
+  - **Features that generalize to new attacks** (velocity counts, links between devices, cards and addresses) catch new patterns *without* retraining. A new ring still shares devices; a new card-testing script still produces a burst.
+- **Velocity counters must be fresher than the attack.** An attack that plays out in 10 minutes is invisible to counters that are 15 minutes behind.
+
+### Turning freshness into numbers
+**Feature freshness: measure how sensitive each feature is to delay.** Replay the evaluation set using *delayed* feature snapshots (values as of 10 s, 1 min, 15 min, 1 h earlier), and measure how much dollars or PR AUC drop. Set each lane's freshness target at the point where the drop starts to matter.
+
+**Model freshness: measure how fast the model decays.** Train on data up to day T−k, test on day T. Illustrative results:
+```
+Model age     0 d    7 d    30 d    90 d
+PR AUC        0.66   0.65   0.62    0.55
+```
+Retrain when **the cost of the decay (in A2 dollars) exceeds the cost of retraining plus validating** (D5). Here, weekly retraining is clearly worth it and daily probably isn't.
+
+**Freshness targets (SLOs), written as requirements:**
+```
+velocity feature age      p99 ≤ 10 s        (alert at 60 s)
+batch profile age         ≤ 26 h            (daily job + margin)
+model age                 ≤ 14 days         (weekly cadence + 1 missed run)
+rule deploy time          ≤ 1 h from approval
+label maturity for train  ≥ 60 days, OR maturity-corrected (below)
+```
+Every decision **logs its actual feature ages** (event time vs when each feature was computed), so these targets are measured, not assumed.
+
+### The label-delay trap when retraining
+A payment from 5 days ago with no chargeback **isn't "good" yet**. It's *unknown*. If you train on it as good, the newest attack gets labeled "not fraud", and the model learns the new attack is safe. Ways to handle this:
+- **Maturity cutoff:** only train on payments at least 60 days old. Correct, but always stale.
+- **Maturity weighting:** use recent rows, but model when labels usually arrive. If 70% of chargebacks come within 30 days, a clean 10-day-old row is treated as only partly "good". This is called *delayed feedback modeling*.
+- **Fast labels for recent rows:** analyst verdicts and issuer alerts for recent data, chargebacks for older data. They have different noise levels, so weight them accordingly.
+
+### Assumptions
+1. Decay curves are stable. But adversarial jumps (a new tool released on fraud forums) make decay sudden, not smooth.
+2. Label delay distributions are stable. If issuers slow their processing, maturity corrections go wrong.
+3. The model sees the same feature freshness in training as in serving. Training on perfectly fresh backfilled values while serving values that lag creates skew (E1).
+4. The retraining pipeline actually runs. Pipelines break silently.
+
+### Design choices
+| Choice | Options | Trade-off |
+|---|---|---|
+| Retrain trigger | Scheduled · **drift-triggered** · both | Predictable vs responsive. Drift triggers need reliable drift detection. |
+| Training window | Short, recent · long history · long with recent rows weighted more | Adapts fast vs remembers rare, old attack types |
+| Update style | Full retrain · incremental · online learning | Online learning adapts fastest but **fraudsters can poison it** by feeding crafted data |
+| Recent labels | Maturity cutoff · weighting · fast labels | Correct but stale vs fresh but noisy |
+| Training features | Recomputed backfill · **the logged, served values** | Clean but skewed vs faithful but only available from when logging started |
+
+### Failure modes
+- **Freshness assumed, never measured.** The stream lags 20 minutes during peak, and nobody knows until losses spike.
+- **Training on immature labels.** The newest attack is labeled good, and the model protects it (see the exercise).
+- **Training with fresher features than serving.** Offline says 0.66, online performs like 0.60.
+- **Retraining too often.** Scores churn from noise, calibration shifts each run, and the A2 thresholds break (B1). Every retrain needs an **automatic validation gate** (calibration, slice metrics, a shadow comparison) before promotion.
+- **Stale at birth.** A 5-day pipeline means the model is 5 days old the moment it deploys. Track time from data cutoff to live, not just training time.
+- **Online-learning poisoning.** Fraudsters send many low-value "good-looking" transactions to shift the model before a large attack.
+- **A retrain job fails silently.** The model is 60 days old, and nobody noticed because the service stayed healthy.
+
+### How D3 connects to the rest
+- **A4 and B4:** fast labels serve as proxies.
+- **B1:** recalibrate and validate on every retrain.
+- **C2:** freshness per lane.
+- **C3:** a stale lane triggers Tier 1.
+- **D1:** fresher features mean more lookups.
+- **D2:** streaming load.
+- **D5:** the cost of retraining.
+- **E1:** skew between training and serving.
+- **E2:** label delay and maturity.
+- **F4:** adversaries set the pace.
+
+<Callout title="Exercise (D3): one question, optional">
+
+The team retrains **daily** on the last 6 months, **including yesterday's payments**, and labels any payment without a chargeback as **"good."** A new attack pattern started **10 days ago**. **How will the retrained model treat this attack, and what would you change?**
+
+</Callout>
+
+## D4 Availability, SLOs, and error budgets
+
+### What problem this solves
+"The fraud service should be reliable" isn't a requirement, because it can't be tested and it has no price. D4 turns reliability into:
+- **SLIs (service level indicators):** what you measure.
+- **SLOs (service level objectives):** the target for each one.
+- **Error budgets:** how much failure is allowed, and what happens when that allowance runs out.
+- **SLAs (service level agreements):** only when there's a contract with penalties, e.g. to a merchant.
+
+ML adds a twist that ordinary services don't have. A model can be **up and wrong** (C3). Reliability for ML has to cover *correctness* as well as uptime.
+
+### The arithmetic of availability
+```
+99.9%   → 43.8 min down / month
+99.95%  → 21.9 min
+99.99%  →  4.4 min
+```
+**Components in series multiply**, because everything must work. **Fallbacks run in parallel**, and fail only if all of them fail:
+
+<Diagram src="requirements/availability-serial-vs-fallback.svg" />
+
+With fallbacks, the chance that *no* decision is possible is roughly 0.0035 × 0.0005 × ~0, which is essentially zero. So the **shared front door** becomes the limit. Two lessons:
+1. **Fallbacks must not share dependencies.** If the rules path reads the same config service or database as the model path, one bad config push kills both. That's a *common-mode failure*: parallel on paper, serial in reality.
+2. **Put the last-resort policy in the caller.** If Tier 3 (C3) lives inside the payments service itself, checkout still gets a decision even when the entire fraud service is unreachable.
+
+### How it works: define "good" per request, then set targets
+An SLI counts **good events ÷ all events**. For ML, "good" needs care. Here are the SLIs for the fraud system:
+```
+SLI 1  Decision availability   answered ≤ 50 ms with a valid action (any tier)    SLO 99.99%  / 28 days
+SLI 2  Model coverage          decided by Tier 0 or 1 (not rules or static)       SLO 99.5%
+SLI 3  Decision quality        hours where the decline rate stays within ±30%
+                               of the same hour's 7-day baseline                  SLO 99.9%
+SLI 4  Feature freshness       decisions with velocity feature age ≤ 10 s (D3)     SLO 99%
+SLI 5  Latency                 5-min windows with p99 ≤ 50 ms (D1)                 SLO 99.9%
+```
+SLI 1 alone would count a Tier 2 decision as a success, and the service could quietly run on rules for weeks (the silent-fallback failure from C3). **SLI 2 makes that visible.** SLI 3 catches "up but wrong".
+
+### Error budgets: the part that changes behavior
+```
+SLI 1: 56M decisions / 28 days × 0.01%  = 5,600 bad decisions allowed
+SLI 2: 56M × 0.5%                       = 280,000 decisions allowed on fallback
+```
+The budget is **spent on change**: deploys, experiments, new features. The **policy** attached to it is what gives it force:
+- Budget left: ship freely.
+- Budget burning fast: alert. The standard pattern is a **burn-rate alert**, e.g. page someone if the current rate would use up the whole 28-day budget within ~2 days.
+- Budget exhausted: **freeze model releases** and work on reliability until it recovers.
+
+### How many nines? Price it
+From A3, the rules cost about $268k/day more than the model, which is **≈ $186 per minute** of Tier 2. Moving the model path from 99.9% to 99.99% saves about 39 minutes a month × $186 ≈ **$7k/month**. If that extra nine costs more than that in infrastructure and engineering (D5), don't buy it. Fallbacks made the model's own availability **cheap to relax**.
+
+The front door is different. With Tier 3 in the caller, its downtime means capped static decisions, and the cost per minute is much higher. Spend the nines there.
+
+### Assumptions
+1. **Failures are independent.** They usually aren't: shared config, shared network, shared deploy pipeline. Check the parallel paths for things they have in common.
+2. SLIs are measured **from the caller's side**, which includes network time and timeouts.
+3. The baselines for quality SLIs are meaningful. Seasonality and holidays need their own baselines.
+4. People follow the budget policy. Without leadership backing, it gets ignored.
+
+### Design choices
+| Choice | Options | Trade-off |
+|---|---|---|
+| Where the last-resort policy lives | In the fraud service · **in the caller** | In the caller survives a total outage, but it's code owned by another team |
+| Do fallback decisions count as "good"? | Yes for availability, **tracked separately as coverage** | Honest about both |
+| SLO strictness | 99.9 · 99.99 · 99.999 | Each nine costs roughly 10× more; price the downtime per tier |
+| Deployment footprint | One zone · multiple zones · multiple regions | Cost and complexity vs resilience |
+| Quality SLIs | None · action-rate bands · calibration drift | Catches "up but wrong", but noisy and needs baselines |
+
+### Failure modes
+- **Measuring only uptime.** The service is 100% up while a broken model triples declines.
+- **A 100% target.** No budget for change, so nothing ships, and the model decays (D3).
+- **Budget without consequences.** It's exhausted every month and nothing changes.
+- **Common-mode failure.** "Independent" fallbacks die together from one config push.
+- **Fallback counted as success, forever.** The model is effectively gone, the availability dashboard is green, and losses climb. That's why SLI 2 exists.
+- **An SLO stricter than the dependencies allow.** 99.99% promised on top of a 99.9% feature store with no fallback is mathematically impossible.
+- **Alert fatigue.** Noisy quality SLIs page people all night, and pages start getting ignored. Use burn-rate alerting across multiple time windows.
+
+### How D4 connects to the rest
+- **A2 and A3:** cost per minute of each tier.
+- **B3:** guardrails become quality SLIs after launch.
+- **C1:** the `fallback_used` flag powers SLI 2.
+- **C3:** the ladder is what makes the parallel availability possible.
+- **D1:** latency SLI.
+- **D2:** overload is the most common cause of burning budget.
+- **D3:** freshness SLI.
+- **D5:** the cost of each nine.
+- **Monitoring:** SLIs are the core dashboards.
+
+<Callout title="Exercise (D4): one question, optional">
+
+The model path is at **99.65%**. A team proposes spending **two engineer-quarters** to raise it to **99.95%**. Using **$186 per minute** of Tier 2, **is it worth it? Show the math, and name one thing you'd check before approving.**
+
+</Callout>
+
+## D5 Cost of training and inference
+
+Inference runs on every request, so over time it usually costs more than training. Budget compute and GPUs for both.

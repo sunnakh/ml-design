@@ -1,0 +1,5 @@
+{
+  "title": "Requirements",
+  "icon": "ClipboardList",
+  "pages": ["index", "objectives", "metrics", "functional-requirements", "system-constraints", "data-and-label-requirements", "risk-and-compliance", "requirements-process"]
+}

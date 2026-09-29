@@ -1,0 +1,28 @@
+<svg width="100%" viewBox="0 0 680 380" role="img"><title>Timescales: how fast fraud changes versus how fast the system responds</title><desc>Log time axis from 1 second to 3 months. Card-testing attacks play out in minutes to an hour; fraud patterns shift over days to weeks. Velocity counters refresh in seconds, rules update in minutes to hours, batch profiles daily, model retrains daily to weekly. Fast labels arrive in hours to a week; chargeback labels in 30 to 90 days, slower than pattern shifts.</desc>
+<text class="t" x="40" y="60" dominant-baseline="central">Card-testing attack</text>
+<rect class="c-coral" x="326.7" y="53" width="106.7" height="14" rx="2" stroke-width="0.5"/>
+<text class="t" x="40" y="90" dominant-baseline="central">Pattern shift</text>
+<rect class="c-coral" x="544.9" y="83" width="50.4" height="14" rx="2" stroke-width="0.5"/>
+<text class="t" x="40" y="120" dominant-baseline="central">Velocity counters</text>
+<rect class="c-teal" x="220" y="113" width="60" height="14" rx="2" stroke-width="0.5"/>
+<text class="t" x="40" y="150" dominant-baseline="central">Rules, thresholds</text>
+<rect class="c-teal" x="386.7" y="143" width="82.8" height="14" rx="2" stroke-width="0.5"/>
+<text class="t" x="40" y="180" dominant-baseline="central">Batch profiles</text>
+<rect class="c-teal" x="497.8" y="173" width="18.4" height="14" rx="2" stroke-width="0.5"/>
+<text class="t" x="40" y="210" dominant-baseline="central">Model retrain</text>
+<rect class="c-teal" x="516.2" y="203" width="50.7" height="14" rx="2" stroke-width="0.5"/>
+<text class="t" x="40" y="240" dominant-baseline="central">Fast labels</text>
+<rect class="c-purple" x="451.4" y="233" width="115.5" height="14" rx="2" stroke-width="0.5"/>
+<text class="t" x="40" y="270" dominant-baseline="central">Chargeback labels</text>
+<rect class="c-purple" x="604.9" y="263" width="28.6" height="14" rx="2" stroke-width="0.5"/>
+<line x1="220" y1="292" x2="640" y2="292" stroke="var(--border-strong)" stroke-width="0.5"/>
+<text class="ts" x="220" y="306" text-anchor="middle" dominant-baseline="central">1 s</text>
+<text class="ts" x="326.7" y="306" text-anchor="middle" dominant-baseline="central">1 min</text>
+<text class="ts" x="433.4" y="306" text-anchor="middle" dominant-baseline="central">1 h</text>
+<text class="ts" x="516.2" y="306" text-anchor="middle" dominant-baseline="central">1 day</text>
+<text class="ts" x="604.8" y="306" text-anchor="middle" dominant-baseline="central">1 month</text>
+<text class="ts" x="430" y="328" text-anchor="middle" dominant-baseline="central">Timescale (log)</text>
+<rect class="c-coral" x="40" y="352" width="12" height="12" rx="2" stroke-width="0.5"/><text class="ts" x="60" y="358" dominant-baseline="central">How fast fraud changes</text>
+<rect class="c-teal" x="220" y="352" width="12" height="12" rx="2" stroke-width="0.5"/><text class="ts" x="240" y="358" dominant-baseline="central">Our levers</text>
+<rect class="c-purple" x="340" y="352" width="12" height="12" rx="2" stroke-width="0.5"/><text class="ts" x="360" y="358" dominant-baseline="central">When truth arrives</text>
+</svg>

@@ -1,0 +1,26 @@
+<svg width="100%" viewBox="0 0 680 400" role="img"><title>Fraud service degradation ladder</title><desc>A request checks if the model is healthy and in time. If yes and features are fresh, full model; if features stale, degraded model with a wider challenge band. If the model is unhealthy and rules are up, rules plus cached score; otherwise a static policy with caps by amount.</desc><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<g class="c-gray"><rect x="260" y="30" width="160" height="44" rx="4" stroke-width="0.5"/><text class="th" x="340" y="52" text-anchor="middle" dominant-baseline="central">Payment request</text></g>
+<line class="arr" x1="340" y1="76" x2="340" y2="98" marker-end="url(#arrow)"/>
+<g class="c-gray"><rect x="230" y="100" width="220" height="50" rx="4" stroke-width="0.5"/><text class="th" x="340" y="125" text-anchor="middle" dominant-baseline="central">Model healthy, in time?</text></g>
+<path class="arr" d="M300 152 L300 170 L185 170 L185 188" fill="none" marker-end="url(#arrow)"/>
+<path class="arr" d="M380 152 L380 170 L495 170 L495 188" fill="none" marker-end="url(#arrow)"/>
+<text class="ts" x="242" y="161" text-anchor="middle" dominant-baseline="central">yes</text>
+<text class="ts" x="438" y="161" text-anchor="middle" dominant-baseline="central">no</text>
+<g class="c-gray"><rect x="85" y="190" width="200" height="50" rx="4" stroke-width="0.5"/><text class="th" x="185" y="215" text-anchor="middle" dominant-baseline="central">All features fresh?</text></g>
+<g class="c-gray"><rect x="395" y="190" width="200" height="50" rx="4" stroke-width="0.5"/><text class="th" x="495" y="215" text-anchor="middle" dominant-baseline="central">Rules engine up?</text></g>
+<path class="arr" d="M150 242 L150 258 L107.5 258 L107.5 278" fill="none" marker-end="url(#arrow)"/>
+<path class="arr" d="M220 242 L220 258 L262.5 258 L262.5 278" fill="none" marker-end="url(#arrow)"/>
+<path class="arr" d="M460 242 L460 258 L417.5 258 L417.5 278" fill="none" marker-end="url(#arrow)"/>
+<path class="arr" d="M530 242 L530 258 L572.5 258 L572.5 278" fill="none" marker-end="url(#arrow)"/>
+<text class="ts" x="129" y="249" text-anchor="middle" dominant-baseline="central">yes</text>
+<text class="ts" x="241" y="249" text-anchor="middle" dominant-baseline="central">no</text>
+<text class="ts" x="439" y="249" text-anchor="middle" dominant-baseline="central">yes</text>
+<text class="ts" x="551" y="249" text-anchor="middle" dominant-baseline="central">no</text>
+<g class="c-teal"><rect x="40" y="280" width="135" height="56" rx="4" stroke-width="0.5"/><text class="th" x="107.5" y="298" text-anchor="middle" dominant-baseline="central">Tier 0: full</text><text class="ts" x="107.5" y="319" text-anchor="middle" dominant-baseline="central">Normal policy</text></g>
+<g class="c-amber"><rect x="195" y="280" width="135" height="56" rx="4" stroke-width="0.5"/><text class="th" x="262.5" y="298" text-anchor="middle" dominant-baseline="central">Tier 1: degraded</text><text class="ts" x="262.5" y="319" text-anchor="middle" dominant-baseline="central">Wider challenge</text></g>
+<g class="c-amber"><rect x="350" y="280" width="135" height="56" rx="4" stroke-width="0.5"/><text class="th" x="417.5" y="298" text-anchor="middle" dominant-baseline="central">Tier 2: rules</text><text class="ts" x="417.5" y="319" text-anchor="middle" dominant-baseline="central">Plus cached score</text></g>
+<g class="c-coral"><rect x="505" y="280" width="135" height="56" rx="4" stroke-width="0.5"/><text class="th" x="572.5" y="298" text-anchor="middle" dominant-baseline="central">Tier 3: static</text><text class="ts" x="572.5" y="319" text-anchor="middle" dominant-baseline="central">Caps by amount</text></g>
+<rect class="c-teal" x="40" y="366" width="12" height="12" rx="2" stroke-width="0.5"/><text class="ts" x="60" y="372" dominant-baseline="central">Normal</text>
+<rect class="c-amber" x="130" y="366" width="12" height="12" rx="2" stroke-width="0.5"/><text class="ts" x="150" y="372" dominant-baseline="central">Degraded</text>
+<rect class="c-coral" x="230" y="366" width="12" height="12" rx="2" stroke-width="0.5"/><text class="ts" x="250" y="372" dominant-baseline="central">Emergency</text>
+</svg>

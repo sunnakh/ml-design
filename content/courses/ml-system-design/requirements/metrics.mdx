@@ -1,0 +1,358 @@
+---
+title: B. Metrics
+description: Turning the objective into numbers.
+---
+
+## B1 Offline metrics and calibration
+
+### What problem this solves
+
+Before any user sees a model, you compare candidates. Online tests are slow (weeks) and risky, so offline metrics give a fast, cheap estimate of which model is worth more. The catch: an offline metric is only useful if it **predicts the dollar outcome from A2**.
+
+### How it works: four families of offline metrics
+
+| Family | Question | Metrics | Fraud use |
+|---|---|---|---|
+| Ranking | Does fraud score higher than good payments? | ROC AUC, **PR AUC**, partial AUC | Comparing models in development |
+| Operating point | How good are decisions at our threshold? | Precision, recall, **recall at a fixed false-decline rate** | Matches the A4 guardrails |
+| Probability quality | When the model says 10%, is it 10%? | Log loss, Brier score, **calibration error** | Required for A2 thresholds |
+| Business-weighted | How many dollars does it save? | **Expected cost under the A2 value table**, dollar-weighted recall | The main offline decision metric |
+
+The best offline metric is the A2 policy replayed on held-out data: apply the thresholds, sum each cell's dollar value, compare to the champion. The other families explain *why* that total moved.
+
+### Trap 1: ROC AUC misleads when fraud is rare
+
+2M payments/day: 6k fraud, 1.994M good. A model with **80% recall at 1% FPR** looks excellent on a ROC curve:
+
+| | Count |
+|---|---|
+| Fraud caught | 4,800 |
+| Good payments flagged | 1% × 1.994M = **19,940** |
+| Precision | 4,800 / 24,740 = **19%** |
+
+Four of five flags hit good customers. Decisions happen at the far left of the ROC curve (FPR below ~0.5%), while ROC AUC averages over the whole range. Instead use **PR AUC**, **recall at FPR = 0.1%**, and **dollar-weighted recall** (80% of fraud *count* can be 50% of fraud *dollars*).
+
+### Trap 2: calibration, the metric everyone forgets
+
+A2's thresholds assume **p is a real probability**. Many training choices break that, including the class-weight trick from the A2 exercise:
+
+<Diagram src="requirements/reliability-diagram.svg" />
+
+Bin predictions and plot each bin's average prediction against its observed fraud rate. Calibrated models sit on the diagonal. A model trained with a 1:300 class weight hugs the floor: when it says **50%, the real rate is 0.3%**. Behind a 0.5 threshold it declines huge numbers of good customers.
+
+Weighting positives by k (or keeping 1/k of negatives) multiplies the model's odds by k. Undo it exactly:
+
+```
+p_true = q / (q + k · (1 − q))        q = model output, k = 300
+q = 0.50 → p = 0.0033
+q = 0.99 → p = 0.25
+```
+
+**Measuring calibration:** ECE = Σ over bins of (bin share) × |mean predicted − observed rate|. Trap: 99% of payments land in the lowest bin, so ECE looks tiny even when the decision region is badly off. Use **equal-count bins**, or compute it only where decisions happen (p > 1%).
+
+**Fixing calibration** on recent held-out data with mature labels:
+
+| Method | How | Good for | Risk |
+|---|---|---|---|
+| Platt scaling | Logistic regression on the score | Little data, sigmoid distortion | Can't fix odd shapes |
+| Isotonic regression | Monotone step function | Lots of data, any shape | Overfits with few fraud examples |
+| Odds correction | The formula above | Known class weight or downsampling rate | Fixes only that cause |
+
+All three are **monotone**, so AUC and PR AUC don't change. Order: **choose on ranking and dollars, then calibrate, then set thresholds.**
+
+### Trap 3: how the evaluation dataset is built
+
+1. **Split by time**, not at random.
+2. **Use only fully arrived labels.** Test on a window that ended at least 90 days ago.
+3. **Point-in-time features.** "Chargebacks on this card" computed today leaks the answer (E1).
+4. **Selective labels.** Payments the incumbent declined have no label. Use holdout traffic, reweight, or treat offline results as optimistic.
+5. **Look at slices**: country, order value, new vs returning.
+6. **Report uncertainty.** Bootstrap confidence intervals; a slice may hold only ~2k fraud cases.
+
+### Assumptions
+
+1. The past guides the future. Adversaries break this, so test on the most recent mature window.
+2. Labels are right. Friendly fraud looks the same as stolen-card fraud.
+3. Offline gains move with online gains (B4).
+
+### Design choices
+
+| Choice | Recommendation | Trade-off |
+|---|---|---|
+| Primary offline metric | Expected dollar cost at the policy | Needs A2 values and calibration, but the only business-aligned one |
+| Development metric | PR AUC, plus recall at 0.1% FPR | Fast to iterate, no dollars |
+| Calibration gate | ECE in the decision region below a limit | Extra step per release, keeps thresholds valid |
+| Handling imbalance | Downsample negatives, then correct the odds | Cheaper training, one more step to get right |
+
+### Failure modes
+
+- **Improving the wrong metric.** ROC AUC 0.95 → 0.96 while decision-region precision worsens.
+- **Uncalibrated scores reach production.** A retrain shifts scores and the decline rate jumps overnight. One of the most common real incidents.
+- **Leakage.** Offline recall 95%, online 60%.
+- **Immature labels** make the model look better than it is.
+- **Tail-blind ECE.** Fine on average, wrong where decisions happen.
+- **A slice regresses** quietly.
+- **Declaring a win on noise.**
+
+### Connections
+
+- **A2:** thresholds need calibration; the value table is the offline metric. **A3:** same metric and window for champion and challenger. **A4:** calibration gate at the shadow stage. **B4:** do offline gains predict online ones? **E1, E2:** leakage and label maturity. **F2:** per-slice metrics.
+
+<Callout title="Exercise B1">
+  On the same time-split test set: **Model A** PR AUC 0.62, decision-region ECE 0.02. **Model B** PR AUC 0.66, decision-region ECE 0.15. The policy uses the A2 thresholds. Which do you take forward, what step comes next, and why?
+</Callout>
+
+## B2 Online metrics and the north star
+
+### What problem this solves
+
+B1 gave *estimates* from past data. Reality has things no offline dataset contains: **customers react** (abandon, retry, leave), **fraudsters adapt**, **latency changes behavior**, and **declines hide truth**. You also need **one north star**, or every review turns into "approvals went up but losses went up too, is that good?"
+
+### How it works: a tree of metrics
+
+One number at the top, drivers below it, diagnostics below those:
+
+<Diagram src="requirements/online-metric-tree.svg" />
+
+**The north star is A2's value table measured on live traffic**, the *overall evaluation criterion* (OEC):
+
+```
+OEC per 1k payments = Σ over cells (count in cell × value from A2) / payments × 1000
+
+  + 16    × good approved        − 95   × fraud approved
+  + 14    × good challenged      − 28.5 × fraud challenged
+  + 11.5  × good reviewed        − 8.75 × fraud reviewed
+  − 36    × good declined        + 0    × fraud declined
+  − operating cost
+```
+
+The weights are already agreed, so risk and growth read the same number.
+
+### What makes a good online metric
+
+| Property | Question | Fraud example |
+|---|---|---|
+| Aligned | If it goes up, does long-term value? | Net profit: yes. Decline rate: direction-ambiguous. |
+| Sensitive | Can it detect a real change in the window? | Decline rate: yes. Chargebacks: very noisy. |
+| Timely | How soon can it be measured? | Approval rate: instantly. Fraud loss: 30–90 days. |
+| Attributable | Does only this change move it? | Randomize by user (B5). |
+| Hard to game | Can a team improve it without creating value? | "Fraud blocked $" is easy to game. |
+| Understandable | Can an executive act on it? | "Basis points of GMV" is the industry standard. |
+
+The central tension is **alignment vs sensitivity and timeliness**, hence A4's split: fast **leading** metrics decide the ramp, the slow **lagging** metric confirms it.
+
+### The hardest measurement: the declined cell
+
+"Good customer declined" costs $36, but you **never see it**. Options:
+1. **Random holdout.** Approve a random ~0.5% of low-value payments that would be declined. Ground truth, at a cost.
+2. **Behavioral signals.** Retry with another card that goes through cleanly, a support contact, a later purchase. Cheap but biased.
+3. **Reject inference.** Model declined outcomes from similar approved ones. Needs its own assumptions.
+
+Without one of these, the OEC silently omits false-decline cost and the system drifts toward over-declining.
+
+### Short-term vs long-term
+
+The $36 churn cost appears weeks later as lost repeat purchases. You need **user-level randomization** and **30- or 60-day retention per arm**. A 14-day per-payment test misses it.
+
+### Assumptions
+
+1. A2 values still hold. 2. Short-term moves predict long-term ones (check against the holdback). 3. The declined-good cell can be estimated. 4. Arms don't interfere (B5).
+
+### Design choices
+
+| Choice | Options | Recommendation |
+|---|---|---|
+| Primary metric | One dollar OEC, or several metrics | A dollar OEC; its weights exist in A2 |
+| Normalization | Per payment, user, GMV dollar | Fraud per GMV (bps), approvals per payment, retention per user |
+| Horizon | 14-day proxy, 90-day truth | Both (A4) |
+| False-decline measurement | Holdout, signals, inference | Holdout for truth, signals for daily monitoring |
+
+### Failure modes
+
+- **Optimizing approval rate alone.** Great for 60 days, then the chargebacks arrive: **fraud debt**.
+- **Optimizing fraud loss alone.** False declines are invisible and revenue leaks.
+- **Vanity metrics** like "$ fraud prevented".
+- **Mix shift.** Holiday traffic moves basis points with no model change. Compare arms in the same period.
+- **Metric definitions drift.** Version-control definitions and give them owners.
+- **A north star the team can't move.** Pick the lowest metric that still captures the value.
+
+### Connections
+
+- **A2:** OEC weights. **A4:** OEC is the primary launch metric. **B3:** non-dollar metrics become guardrails. **B4:** do B1 metrics predict the OEC? **B5:** sensitivity, duration, randomization unit. **E2:** label delay shapes the horizon. **Monitoring:** the same tree becomes the production dashboard.
+
+<Callout title="Exercise B2">
+  The fraud team's quarterly report says **"$12M fraud prevented"**, the total amount of all declined payments. Why is this a bad metric, and what would you report instead?
+</Callout>
+
+## B3 Guardrail metrics
+
+### What problem this solves
+
+The OEC can rise while something important breaks: **not everything converts to dollars**, **some harms are unacceptable at any profit** (checkout down for 5 minutes), and **averages hide damage**. A guardrail is a **constraint, not a goal**: it must **not get worse beyond a stated margin**, or the ramp stops.
+
+### Five types of guardrail
+
+| Type | Protects | Fraud examples |
+|---|---|---|
+| Business | Customers and revenue the OEC underweights | False-decline rate, "card declined" support contacts |
+| Capacity | Downstream humans and systems | Reviews ≤ 2,000/day, challenge rate ≤ 3% |
+| System | Service reliability | p99 latency ≤ 50 ms, timeout and fallback rate |
+| Fairness and compliance | Segments, regulators | Approval rate per country, reason-code coverage |
+| Trust | Validity of the experiment itself | **Sample ratio mismatch (SRM)**, feature null rates, score distribution |
+
+Trust guardrails get forgotten. A configured 50/50 split observed as 50.6/49.4 over a million users means a bug, and **every other metric from that test is invalid**. Check the split with a chi-square test before reading any result.
+
+### Each guardrail is a full specification
+
+| Guardrail | Margin | Test | On breach | Owner |
+|---|---|---|---|---|
+| False-decline rate | ≤ champion + 0.02 pp | Non-inferiority | Stop the ramp | Growth |
+| Approval rate per country | Drop ≤ 0.5 pp in any top-20 country | Per segment, Holm-corrected | Stop, review | Risk |
+| Review volume | ≤ 2,000/day, absolute | Daily threshold | Auto-narrow the review band | Fraud ops |
+| Challenge rate | ≤ 3%, absolute | Daily threshold | Stop | Payments |
+| p99 latency | ≤ 50 ms, absolute | 5-minute windows | **Automatic rollback** | Engineering |
+| Fallback/timeout rate | ≤ 0.1% | 5-minute windows | Page on-call | Engineering |
+| "Declined" support contacts | ≤ champion + 5% | Relative | Investigate | Customer service |
+| Sample ratio mismatch | Chi-square p > 0.001 | Chi-square | Invalidate the test | Experimentation |
+
+**Relative** margins (vs champion) suit business metrics; **absolute** ones suit hard limits like 50 ms.
+
+### Non-inferiority: reading a guardrail correctly
+
+A guardrail passes when the **whole confidence interval** sits below the margin, not merely because the result "wasn't significant":
+
+<Diagram src="requirements/guardrail-confidence-intervals.svg" />
+
+- **B is the dangerous one.** "Not significantly worse" isn't "safe"; the interval still includes harm beyond the margin. Run longer.
+- **D surprises people.** Statistically significantly worse, yet it passes: the margin is harm the business agreed to accept for the OEC gain.
+
+**Where the margin comes from:** A2 dollars. +0.02 pp of false declines is 400 extra wrongly declined customers/day × $52 regret ≈ **$21k/day**, acceptable against a ~$270k/day OEC gain, too loose against a $15k/day one.
+
+### Many guardrails, many false alarms
+
+With 15 guardrails at a 5% false-alarm rate: P(at least one false breach) = 1 − 0.95¹⁵ ≈ **54%**. Fixes: **few, tiered guardrails** (≤ 5 hard ones auto-stop; soft ones trigger investigation), **multiple-testing correction** (Holm, Bonferroni), and **persistence** (a system breach must last 2 consecutive windows before rollback, which also stops flapping).
+
+### Assumptions
+
+1. The margin reflects real harm tolerance, anchored in A2.
+2. The guardrail is measurable in the window (churn isn't; use proxy + holdback).
+3. The segments checked are the ones that matter, chosen up front with F2.
+4. Guardrails compare against a **fixed reference**, not a moving one.
+
+### Design choices
+
+| Choice | Options | Trade-off |
+|---|---|---|
+| Relative or absolute | vs champion, or a fixed limit | Relative adapts but allows slow drift; absolute is strict but ignores context |
+| Action on breach | Auto-rollback, page, human review | Fast but can flap vs careful but slow |
+| Number | Few hard + many soft | Coverage vs false alarms |
+| Margin size | Tight or loose | Blocks good launches vs lets harm through; anchor to dollars |
+
+### Failure modes
+
+- **Guardrail sprawl**: 30 guardrails, constant false alarms, ignored.
+- **"Not significant" read as "safe".**
+- **Global-only checks**: flat globally while one country doubles.
+- **SRM ignored.**
+- **Degrading one small slice at a time**: every launch uses up the margin and harm accumulates.
+- **Guardrails without owners.**
+- **Auto-rollback without persistence**: one latency spike rolls back a good model, repeatedly.
+
+### Connections
+
+- **A2:** margins in the same dollars. **A4:** part of the launch spec. **B2:** OEC and guardrails work as a pair. **B5:** non-inferiority needs power. **C3:** fallback on breach. **D1, D4:** system guardrails are SLOs. **F2:** per-segment fairness. **Monitoring:** guardrails become production alerts.
+
+<Callout title="Exercise B3">
+  Over one year the team ships **8 launches**, each passing the false-decline guardrail (≤ champion + 0.02 pp). Yet the false-decline rate went from **0.20% to 0.35%**. How did this happen, and how would you redesign the guardrail?
+</Callout>
+
+## B4 Metric alignment, proxies, Goodhart
+
+### What problem this solves
+
+What you care about (long-term dollars) is slow to measure, so you optimize a **chain of stand-ins**: training loss → offline metric → online proxy → OEC → long-term value. Every link can break silently. **Goodhart's law**: *when a measure becomes a target, it stops being a good measure.*
+
+### How it works: the proxy chain
+
+Left to right, each measurement is slower, costlier and closer to the truth. Every arrow is a place alignment can break:
+
+<Diagram src="requirements/proxy-chain.svg" />
+
+| Gap | What breaks | Fraud example |
+|---|---|---|
+| Wrong target | Training loss treats every error the same | Log loss weights an $8 and an $800 fraud equally |
+| Replay bias | Offline data can't show reactions to a new policy | No labels for blocked payments; no fraudster adaptation or abandonment |
+| Proxy drift | A fast signal loses its link to the truth | Analyst verdicts improve because the model sends easier cases |
+| Horizon gap | Harm appears after the window | Churn from false declines shows up 30–60 days later |
+
+### Four tools to check alignment
+
+**1. Meta-analysis of past experiments.** Compare each past A/B test's offline change with its online change:
+
+```
+Last 20 launches     predicted OEC sign correctly
+Offline $ replay     17 / 20   (85%)
+PR AUC               12 / 20   (60%)
+ROC AUC               9 / 20   (45%)  ← near coin flip
+```
+
+This is how you **choose** the offline metric from evidence.
+
+**2. Validate each proxy against the truth.** It must (a) correlate with the true outcome per unit, and (b) **move in the same direction when you change the system**. (b) is the one that fails. Track proxy-said vs truth-later on the holdback.
+
+**3. A surrogate index.** A small model combining short-term signals (review verdicts, issuer alerts, retries, support contacts) into a *predicted* 90-day loss. More robust than any single signal, but it needs re-checking against the holdback.
+
+**4. Keep measuring the truth.** The holdback and the random approval slice are what let you catch proxy drift.
+
+### Goodhart in four forms
+
+| Form | Mechanism | Fraud example |
+|---|---|---|
+| Regressional | Optimizing a noisy proxy selects for noise | Best PR AUC among 50 variants overfit the test set |
+| Extremal | Proxy and truth diverge at extremes | A very low decline threshold: fraud loss keeps falling, false declines explode |
+| Causal | Move the proxy without moving its cause | Refunding disputes early cuts **chargeback count** without cutting losses |
+| Adversarial | Someone optimizes against you | Accounts older than 90 days look safe, so fraudsters create "sleeper" accounts |
+
+**People are part of the system.** Analysts measured on review hit rate pick obvious cases; a team measured on decline rate shifts risky payments to "challenge".
+
+### Countermeasures
+
+- **Pair every metric with its opposite** (decline rate ↔ fraud loss, approval ↔ chargebacks).
+- **Keep the truth measured** (holdback, random audits).
+- **Randomly audit approved payments** to measure missed fraud directly.
+- **Don't expose exact thresholds or features** (F4).
+- **Re-validate proxies on a schedule.**
+- **Don't tie compensation to a single proxy.**
+
+### Assumptions
+
+1. Past proxy–truth relationships still hold. 2. Enough past experiments exist for a meta-analysis (new teams lean on the holdback). 3. The truth measurement is sound (friendly fraud adds noise).
+
+### Design choices
+
+| Choice | Options | Trade-off |
+|---|---|---|
+| Proxy type | Single signal or surrogate index | Simple vs robust but opaque |
+| Trust in offline | Offline gate only, or offline + online | Speed vs replay-bias risk |
+| Truth budget | Holdback size, audit rate | Money now vs blindness later |
+| Re-validation | Every launch, quarterly | Cost vs time to detect drift |
+
+### Failure modes
+
+- **Offline wins that never show up online**, repeatedly.
+- **Proxy validated once, trusted forever.**
+- **Truth measurement cut to save money.**
+- **Gaming**, by fraudsters or your own teams.
+- **Uninterpretable metrics** nobody can question.
+
+### Connections
+
+- **A1:** selective labels cause replay bias. **A4:** proxy/truth split and holdback. **B1:** meta-analysis picks the offline metric. **B2:** OEC and random approval slice. **E2:** label delay forces proxies. **F4:** adversarial Goodhart.
+
+<Callout title="Exercise B4">
+  The team proposes **challenge failure rate** (share of challenged payments that fail the OTP) as the 14-day proxy for "fraud caught". Name one way this proxy could improve while true fraud loss gets worse.
+</Callout>
+
+## B5 Experiment design
+
+Randomization unit (payment, user, card or device), statistical power and sample size, and interference between arms. A4 and B3 rely on these: a fraud ring that moves between arms makes per-payment randomization dishonest.

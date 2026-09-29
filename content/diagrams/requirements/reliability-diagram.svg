@@ -1,0 +1,22 @@
+<svg width="100%" viewBox="0 0 680 400" role="img"><title>Reliability diagram</title><desc>Predicted probability on x, observed fraud rate on y. A model trained with 1 to 300 class weight sits far below the diagonal: predicting 50 percent corresponds to 0.3 percent real fraud. After isotonic recalibration the points follow the diagonal.</desc>
+<text class="ts" x="90" y="24" dominant-baseline="central">Observed fraud rate</text>
+<line x1="90" y1="40" x2="90" y2="340" stroke="var(--border-strong)" stroke-width="0.5"/>
+<line x1="90" y1="340" x2="390" y2="340" stroke="var(--border-strong)" stroke-width="0.5"/>
+<text class="ts" x="80" y="340" text-anchor="end" dominant-baseline="central">0</text>
+<text class="ts" x="80" y="190" text-anchor="end" dominant-baseline="central">0.5</text>
+<text class="ts" x="80" y="40" text-anchor="end" dominant-baseline="central">1</text>
+<text class="ts" x="90" y="356" text-anchor="middle" dominant-baseline="central">0</text>
+<text class="ts" x="240" y="356" text-anchor="middle" dominant-baseline="central">0.5</text>
+<text class="ts" x="390" y="356" text-anchor="middle" dominant-baseline="central">1</text>
+<text class="ts" x="240" y="380" text-anchor="middle" dominant-baseline="central">Predicted probability</text>
+<line x1="90" y1="340" x2="390" y2="40" stroke="var(--text-muted)" stroke-width="1" stroke-dasharray="4 4"/>
+<polyline points="90,340 240,339 330,336 360,331 375,322 381,311 387,266" fill="none" stroke="#D85A30" stroke-width="2" stroke-dasharray="7 4"/>
+<circle cx="240" cy="339" r="3.5" fill="#D85A30"/>
+<polyline points="105,322 135,301 180,244 240,199 300,124 360,76" fill="none" stroke="#1D9E75" stroke-width="2"/>
+<circle cx="105" cy="322" r="3" fill="#1D9E75"/><circle cx="135" cy="301" r="3" fill="#1D9E75"/><circle cx="180" cy="244" r="3" fill="#1D9E75"/><circle cx="240" cy="199" r="3" fill="#1D9E75"/><circle cx="300" cy="124" r="3" fill="#1D9E75"/><circle cx="360" cy="76" r="3" fill="#1D9E75"/>
+<line x1="430" y1="80" x2="460" y2="80" stroke="#D85A30" stroke-width="2" stroke-dasharray="7 4"/><text class="t" x="470" y="80" dominant-baseline="central">Class weight 1:300</text>
+<line x1="430" y1="110" x2="460" y2="110" stroke="#1D9E75" stroke-width="2"/><text class="t" x="470" y="110" dominant-baseline="central">Recalibrated (isotonic)</text>
+<line x1="430" y1="140" x2="460" y2="140" stroke="var(--text-muted)" stroke-width="1" stroke-dasharray="4 4"/><text class="t" x="470" y="140" dominant-baseline="central">Perfect calibration</text>
+<circle cx="445" cy="190" r="3.5" fill="#D85A30"/><text class="ts" x="470" y="190" dominant-baseline="central">Model says 50%</text>
+<text class="ts" x="470" y="208" dominant-baseline="central">Real fraud rate 0.3%</text>
+</svg>

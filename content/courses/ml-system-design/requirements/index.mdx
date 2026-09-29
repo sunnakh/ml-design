@@ -1,0 +1,50 @@
+---
+title: Requirements
+description: What the system must achieve, and within which limits.
+icon: ClipboardList
+---
+
+Requirements split into two concerns. **Metrics** say what "good" means. **System constraints** say what limits the design must stay inside. Every later decision depends on both.
+
+<Diagram src="requirements/requirements-tree.svg" />
+
+## Metrics come in three types
+
+| Type | Measured when | Example (feed ranking) | Why it matters |
+|---|---|---|---|
+| Offline | Before launch, on held-out data | NDCG, AUC | Fast and cheap. Used to compare models. |
+| Online | After launch, on live users | Engagement, session time | This is what the business actually cares about. |
+| Guardrail | During the A/B test | Latency, crash rate, report rate | If one gets worse, the launch is blocked even when the online metric wins. |
+
+The key insight is that **offline and online metrics often disagree**. Pick one online **north star** metric, then choose offline metrics that correlate with it.
+
+## Constraints change the whole design
+
+- **Latency**: a 50 ms p99 budget rules out a big transformer on every request. That pushes you toward a two-stage design: cheap candidate retrieval, then heavy ranking on only the top few hundred items.
+- **Scale**: 100M users at 10k QPS is a different system from 1k users. Do rough back-of-envelope math before you pick an architecture.
+- **Cost**: inference cost usually outweighs training cost over time, because it runs on every request.
+- **Freshness**: if predictions can be computed in batches overnight, the system is much simpler. Real-time needs streaming features.
+- **Privacy and fairness**: using PII or protected attributes limits which features you're allowed to use at all.
+
+## Running example: checkout fraud at an online marketplace
+
+- About 2M card payments per day, average order $80.
+- About 0.3% of payments are fraud: roughly 6k fraud attempts and ~$480k at risk per day.
+- A stolen card is used, the real cardholder disputes it, and the marketplace loses the goods, the money and a fee (a chargeback).
+- The fraud ops team has 20 analysts who can manually review about 2,000 payments per day.
+
+## Topic map
+
+<Cards>
+  <Card title="A. Objectives" href="/courses/ml-system-design/requirements/objectives">Decision and stakeholders · Cost of errors · Baseline · Success criteria</Card>
+  <Card title="B. Metrics" href="/courses/ml-system-design/requirements/metrics">Offline · Online and north star · Guardrails · Alignment and Goodhart</Card>
+  <Card title="C. Functional requirements" href="/courses/ml-system-design/requirements/functional-requirements">API contract · Online vs batch · Fallbacks · Human in the loop</Card>
+  <Card title="D. System constraints" href="/courses/ml-system-design/requirements/system-constraints">Latency · Throughput · Freshness · Availability · Cost</Card>
+  <Card title="E. Data and label requirements" href="/courses/ml-system-design/requirements/data-and-label-requirements">Prediction-time data · Labels · Volume and imbalance</Card>
+  <Card title="F. Risk and compliance" href="/courses/ml-system-design/requirements/risk-and-compliance">Privacy · Fairness · Explainability · Adversaries</Card>
+  <Card title="G. Requirements process" href="/courses/ml-system-design/requirements/requirements-process">Clarifying questions · Estimation · Negotiation · Writing the spec</Card>
+</Cards>
+
+<Callout title="Interview tip">
+  Spend the first 5 minutes asking: How many users? What's the latency SLA? Batch or real-time? What's the business goal? Is there a baseline system today?
+</Callout>

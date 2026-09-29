@@ -1,0 +1,18 @@
+<svg width="100%" viewBox="0 0 680 305" role="img"><title>Peak operations per second by component</title><desc>Log-scale bars at peak: scoring requests 460 per second, streaming events 6,000, feature store reads 9,200, velocity counter updates 120,000, the largest by far.</desc>
+<text class="ts" x="40" y="30" dominant-baseline="central">Peak load per component, flash-sale estimate</text>
+<text class="th" x="40" y="66" dominant-baseline="central">Scoring requests</text><text class="ts" x="40" y="84" dominant-baseline="central">The model itself</text>
+<rect class="c-teal" x="200" y="60" width="69.6" height="26" rx="2" stroke-width="0.5"/><text class="t" x="278" y="73" dominant-baseline="central">460/s</text>
+<text class="th" x="40" y="116" dominant-baseline="central">Streaming events</text><text class="ts" x="40" y="134" dominant-baseline="central">Payments, logins</text>
+<rect class="c-gray" x="200" y="110" width="186.7" height="26" rx="2" stroke-width="0.5"/><text class="t" x="395" y="123" dominant-baseline="central">6,000/s</text>
+<text class="th" x="40" y="166" dominant-baseline="central">Feature reads</text><text class="ts" x="40" y="184" dominant-baseline="central">20 per request</text>
+<rect class="c-gray" x="200" y="160" width="206.2" height="26" rx="2" stroke-width="0.5"/><text class="t" x="415" y="173" dominant-baseline="central">9,200/s</text>
+<text class="th" x="40" y="216" dominant-baseline="central">Counter updates</text><text class="ts" x="40" y="234" dominant-baseline="central">Real scale driver</text>
+<rect class="c-coral" x="200" y="210" width="323.3" height="26" rx="2" stroke-width="0.5"/><text class="t" x="532" y="223" dominant-baseline="central">120,000/s</text>
+<line x1="200" y1="250" x2="620" y2="250" stroke="var(--border-strong)" stroke-width="0.5"/>
+<text class="ts" x="200" y="264" text-anchor="middle" dominant-baseline="central">100</text>
+<text class="ts" x="305" y="264" text-anchor="middle" dominant-baseline="central">1k</text>
+<text class="ts" x="410" y="264" text-anchor="middle" dominant-baseline="central">10k</text>
+<text class="ts" x="515" y="264" text-anchor="middle" dominant-baseline="central">100k</text>
+<text class="ts" x="620" y="264" text-anchor="middle" dominant-baseline="central">1M</text>
+<text class="ts" x="410" y="288" text-anchor="middle" dominant-baseline="central">Peak operations per second (log scale)</text>
+</svg>

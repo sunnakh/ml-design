@@ -1,0 +1,16 @@
+---
+title: E. Data and label requirements
+description: What must exist to learn anything.
+---
+
+## E1 Data available at prediction time
+
+Only data that exists at the moment of prediction can be a feature. Anything known later causes leakage.
+
+## E2 Label source, quality, delay
+
+Identify where labels come from, how noisy they are, and how long they take. Fraud chargebacks arrive 30–90 days late, and declined payments never get a label.
+
+## E3 Volume and class imbalance
+
+Check there are enough examples, especially positives. At 0.3% fraud, most data is negative, which affects sampling, metrics and training.

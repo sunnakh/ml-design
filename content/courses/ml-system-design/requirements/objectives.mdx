@@ -1,0 +1,307 @@
+---
+title: A. Objectives
+description: What success means for the business.
+---
+
+## A1 The decision and its stakeholders
+
+Every prediction feeds a decision. For checkout fraud, a payment attempt is scored by the **fraud model** (risk score 0 to 1), then a separate **decision policy** (thresholds and rules) maps the score to one of four actions. Outcomes become labels as chargebacks arrive 30 to 90 days later. **Declined payments produce no label.**
+
+<Diagram src="requirements/decision-flow.svg" />
+
+Two things in that flow matter more than the model: the **policy layer** is separate from the model, and **decline has no path to labels**.
+
+### Stakeholders: each one brings a requirement
+
+| Stakeholder | What they want | Requirement it creates |
+|---|---|---|
+| Risk and finance | Lower fraud losses | A loss target, e.g. fraud under 0.1% of sales |
+| Product and growth | Conversion | A maximum false-decline rate, and a maximum challenge rate (friction) |
+| Fraud analysts | A queue they can clear | At most ~2,000 reviews per day |
+| Customers | Fast checkout, no wrongful blocks | A latency limit and a way to appeal |
+| Legal and compliance | Lawful decisions | Stated reasons for declines, limits on data use (PCI DSS, GDPR) |
+| Engineering on-call | Reliability | An availability target, and fallback behavior when the model is down |
+
+**These stakeholders conflict.** Risk wants more declines and growth wants more approvals. That conflict isn't a bug to smooth over. It is the requirement. Resolve it by putting everything in one currency, money (A2).
+
+### Assumptions to check out loud
+
+1. **There is a decision point where a prediction can still change the outcome.** If fraud only becomes detectable after the goods ship, a model can't prevent anything.
+2. **The set of possible actions is fixed.** Often it isn't. In real fraud systems, adding a "challenge" action has been worth more than a better model.
+3. **Someone owns the decision**, meaning someone owns the thresholds.
+4. **The actions don't change the data you'll learn from.** This one is false (see failure modes).
+
+### Design choices
+
+1. **Output a score or a decision?** Have the model output a calibrated probability, and a separate policy layer map it to an action. The business changes thresholds weekly but you retrain monthly; keeping them separate means you can tune without retraining, A/B test policies on their own, and add hard rules. Cost: the score must be calibrated, and there are two artifacts to version.
+2. **How many actions?** Graded actions make uncertainty cheaper. A real customer passes an OTP in about 10 seconds; a fraudster usually can't. Cost: more states to track and more metrics (challenge pass rate, friction).
+3. **Synchronous or asynchronous?** Synchronous runs inside the payment request: hard latency limit, small model, needs a fallback. Asynchronous runs after authorization but before shipping: heavier model and more data, but only works if you can still void the payment. Real systems often do both.
+4. **How much automation?** Fully automatic, human in the loop, or human-only for high-value orders. Humans add accuracy but are slow, expensive and capacity-limited.
+
+### Failure modes
+
+- **Wrong decision point.** The model scores at signup, but the fraud comes from takeovers of old, trusted accounts at payment time.
+- **Ignoring downstream capacity.** The model sends 8,000 reviews/day to a team that handles 2,000. Good orders get delayed 3 days and customers cancel.
+- **Selective labels.** Declined payments never get an outcome, so the next model trains only on approved payments and never learns what it blocked. Fix it at requirements time, because it costs money: randomly approve a small slice (~0.5%) of low-value payments that would have been declined, or use challenge outcomes as labels.
+- **Adversaries adapt.** Fraudsters probe thresholds, so the policy must be changeable within hours.
+- **Nobody owns the decision.** Thresholds drift and nobody notices.
+- **Optimizing for one stakeholder.** Tune only on fraud loss and the decline rate creeps up. Wrongly declined customers don't complain; they just leave.
+
+### Connections
+
+- **A2:** the actions define what the error types are.
+- **B (metrics):** action rates become guardrail metrics.
+- **C (functional):** the API returns a score, an action and reason codes.
+- **D (latency):** running synchronously sets the latency budget.
+- **E (labels):** the decision hides some labels; the rest arrive 30–90 days late.
+- **F (compliance):** declines need explainable reasons.
+
+<Callout title="Exercise A1">
+  A food delivery app's PM says: *"Build a model that predicts whether an order will arrive late."* Write the decision statement (trigger, at least 2 actions, timing, consumer, outcome and its owner). Name two stakeholders whose wants conflict and the requirement each creates. Name one way your actions will change the labels you train on later.
+</Callout>
+
+## A2 Cost of errors
+
+### What problem this solves
+
+A1 ended with a conflict: risk wants more declines, growth wants more approvals. Arguing gets nowhere until both sides use **one currency**. A2 turns every outcome into money, so there's a single number to optimize.
+
+There's a second problem. Plain accuracy treats every mistake as equal. With 0.3% fraud, a model that approves everything is **99.7% accurate** and loses about $480k a day.
+
+### How it works: four steps
+
+**Step 1. Enumerate every outcome.** Each outcome is one action combined with the ground truth: 4 actions × 2 truths = 8 cells. A confusion matrix generalized to more than two actions.
+
+**Step 2. Put a dollar value on each cell.** For an $80 order with a $16 margin:
+
+| Action | Good buyer | Fraudster | Where the numbers come from |
+|---|---|---|---|
+| Approve | **+16** | **−95** | Margin earned. Or: the $80 is charged back, plus a $15 fee. |
+| Challenge | **+14** | **−28.5** | Some good buyers abandon at the OTP step. 30% of fraudsters pass it. |
+| Review | **+11.5** | **−8.75** | $4 analyst cost, some cancellations from the delay. Analysts catch 95%. |
+| Decline | **−36** | **0** | No sale, and 30% of wrongly declined customers never return (×$120 future value). |
+
+**Step 3. Compute the expected value of each action.** The model gives p = P(fraud):
+
+```
+EV(a) = (1 − p) · V(a, good) + p · V(a, fraud)
+```
+
+Pick the action with the highest EV. Each EV is a straight line in p, and the best action switches where two lines cross. Those crossing points are your thresholds.
+
+**Step 4. Read off the policy.** With the default costs: approve below **2.9%**, challenge from 2.9% to 11.2%, review from 11.2% to 84.4%, and decline above 84.4%.
+
+1. **Thresholds come from the costs, not from the model.** A default cutoff of 0.5 has no basis. Even with only approve and decline, the right threshold is **35.4%**:
+   ```
+   decline if  p > regret_false_decline / (regret_false_decline + regret_missed_fraud)
+                 = (16 + 36) / ((16 + 36) + 95) = 0.354
+   ```
+2. **Cheap middle actions take over the uncertain zone.** Challenge and review cover most of the range from 3% to 84%. That's why adding an action can beat building a better model.
+3. **Most traffic sits near the 0.3% base rate**, well inside the approve zone. The model's job is to pull out the thin tail of risky payments.
+
+### Assumptions
+
+1. **Probabilities are calibrated.** If the model says 10%, about 10% of those payments really are fraud. Otherwise every threshold is meaningless (B1).
+2. **Costs are known and stable.** The $36 churn cost is the weakest number; it's estimated from retention studies.
+3. **Each decision is independent.** That ignores capacity: the review band might hold 5,000 payments a day when analysts handle 2,000.
+4. **Every cost fits into dollars.** Regulatory, reputational and fairness harms don't.
+5. **Everything is short-term.** Churn is counted once; real lifetime value varies a lot.
+
+### Design choices
+
+1. **Where do costs live?** **In the policy layer (recommended):** a calibrated model plus cost-derived thresholds, updated without retraining. **In the training loss:** class weights or a cost-sensitive loss bake today's costs into the model and distort calibration; recalibrate afterwards if you do it.
+2. **One threshold, or one per payment?** Missed-fraud cost grows with order value, so the threshold should fall as orders get bigger.
+3. **Costs or constraints?** Anything you can't turn into dollars becomes a hard constraint: maximize EV subject to decline rate ≤ 2%, reviews ≤ 2,000/day, per-country false-decline rate ≤ X. These become the B3 guardrails.
+4. **Limited capacity.** Rank payments by EV(review) − EV(next best action), send the top 2,000 to analysts, give the rest their next-best action. One extra analyst is worth whatever the 2,001st case would have gained (the shadow price).
+
+### Failure modes
+
+- **Accuracy or a 0.5 threshold.** The system approves almost everything and hemorrhages fraud losses.
+- **Invisible costs.** False declines leave no trace; the customer just leaves. Estimate churn cost explicitly, e.g. with a holdout experiment.
+- **Stale costs.** Fees and margins change and thresholds silently go wrong. Schedule a cost review with an owner.
+- **Thresholds carried over after retraining.** A new model has a different score distribution, so the same threshold gives a different decline rate. Recalibrate every release, and alert when action rates shift.
+- **Ignoring capacity.** The review queue explodes.
+- **Adversaries shift the costs.** SIM-swapping lifts the challenge pass rate for fraudsters from 30% to 70%, and the challenge band quietly stops protecting you.
+
+### Connections
+
+- **A3, A4:** baseline and launch bar are measured in the same dollars.
+- **B1:** calibration and cost-weighted metrics; the operating point comes from here.
+- **B3:** non-monetizable costs become guardrails.
+- **C4:** review capacity is part of the policy.
+- **E2:** every cell needs an observable outcome, or its value can't be estimated.
+- **F2:** the cost-optimal policy can concentrate false declines in one group.
+
+<Callout title="Exercise A2">
+  The same system sells laptops: a **$1,000 order** with a $200 margin. Missed fraud costs **$1,015**; false-decline churn cost is still **$36**. With only approve and decline, calculate the decline threshold and compare it with 35.4% for an $80 order. What does this imply for the policy layer? The modeling team says: *"Skip the thresholds. Train with class weight 1:300 and use 0.5."* Give two concrete problems.
+</Callout>
+
+## A3 Baseline, and is ML needed
+
+### What problem this solves
+
+ML is expensive to own, not just to build: pipelines, retraining, monitoring, on-call, explanations. Before paying for that, show that something simpler can't do the job. A baseline also gives a **reference point**: "AUC 0.92" means nothing; "$270k/day cheaper than the current rules" does.
+
+### How it works: the baseline ladder
+
+Climb one rung at a time, only while the **extra value** exceeds the **extra cost of owning it**.
+
+| Rung | What it is | Fraud example |
+|---|---|---|
+| 0. Status quo | Whatever happens today, or nothing | Approve every payment |
+| 1. Non-ML fix | Change the product or process | 3-D Secure for all payments, hold shipping for first-time buyers, block prepaid cards |
+| 2. Heuristic rules | Rules from domain experts | "3+ cards on one device within 1h → review"; "billing ≠ shipping country and order > $300 → challenge" |
+| 3. Simple model | Logistic regression or GBDT on solid features | GBDT on ~100 features, rules kept alongside |
+| 4. Complex model | Deep, sequence or graph models | Graph of cards, devices and addresses, plus session sequence models |
+
+Illustrative daily totals (fraud losses + false-decline regret + operating cost):
+
+<Diagram src="requirements/baseline-ladder.svg" />
+
+- **Rung 1 isn't shown because it would break the scale.** 3-D Secure on every payment catches ~70% of fraud, but if 5% of good buyers abandon, that's 100k lost sales × $16 ≈ **$1.6M/day**, about 3× worse than doing nothing. A **targeted** fix (3DS only above $500) can be a strong baseline.
+- **Rules → GBDT saves about $268k/day.** Fraud patterns combine dozens of weak signals that hand-written rules can't capture.
+- **GBDT → deep/graph saves about $34k/day, but operating cost rises $15k.** Net ~$20k/day: real, but a judgment call once latency risk and engineering burden are counted. Returns diminish.
+
+### When is ML actually needed?
+
+ML makes sense when **most** of these hold:
+- The pattern depends on many interacting signals that are hard to write as rules.
+- The pattern changes over time, so the system must relearn.
+- There are too many decisions for humans (2M per day).
+- Labels exist, with enough positives.
+- Some errors are acceptable, and A2 has priced them.
+- The prediction can change an action in time (A1).
+
+Skip or delay ML when a deterministic rule solves it, there are no labels, you need guarantees, every decision must be explainable in a rulebook, volume is small, or the objective isn't agreed.
+
+### Assumptions
+
+1. **The baseline is measured like the candidate:** same period, traffic and dollar accounting.
+2. **Operating cost can be estimated.** It's routinely underestimated; most production ML code isn't the model.
+3. **Rungs are independent.** In reality they stack: rules stay on as a guardrail layer.
+
+### Design choices
+
+1. **Hybrid, not replacement.** Keep rules for hard constraints (sanctions, known-bad devices, regulatory blocks) and emergency responses that ship in minutes. Order: hard rules → model score → policy.
+2. **Build or buy.** A vendor fraud score reaches rung 3 in weeks, at the cost of control, per-transaction fees, data leaving your systems (F1), and no marketplace-specific signals. Common path: buy first, build when volume justifies it.
+3. **Champion and challenger.** The challenger runs first in **shadow mode**, then on a slice of live traffic.
+4. **Report against the real incumbent**, never "random" or "approve all".
+
+### Failure modes
+
+- **No baseline.** Six months later nobody can prove the model's worth, and it's cut.
+- **Strawman baseline.** "Beats random" proves nothing.
+- **Biased offline comparison.** Labels exist only for payments the incumbent approved (A1), so fraud the rules blocked is missing from evaluation. Settle it online.
+- **Removing rules at launch.** No hard constraints, no fast lever when a new attack arrives.
+- **Rule sprawl.** 500 overlapping, contradictory rules that slow every request. Often what honestly justifies ML.
+- **ML for the résumé.** Complexity where a threshold would do.
+- **Hidden operating cost** missing from the business case.
+
+### Connections
+
+- **A2:** same dollars. **A4:** launch bar = beat the incumbent by X. **B2:** A/B or holdout against the incumbent. **C3:** rules double as the fallback. **D5:** operating cost. **E2:** the incumbent shapes which labels exist. **F3:** rules are the explainable layer.
+
+<Callout title="Exercise A3">
+  The rules decline 0.2% of payments. A new GBDT, evaluated offline on last month's labeled payments, shows **80% fraud recall vs 50% for the rules**. The PM wants to announce "the model catches 60% more fraud". Why might this be misleading, and what would you do before claiming the win?
+</Callout>
+
+## A4 Success criteria and launch bar
+
+### What problem this solves
+
+Without a bar agreed **before** results arrive, teams fall into **moving goalposts**, **sunk-cost launches**, **never shipping**, or **peeking** and stopping on a lucky day. A4 turns A1–A3 into a written contract: **what result, measured how, over what time, means ship, iterate, or kill.**
+
+### How it works: five parts of a launch bar
+
+1. **Primary metric and minimum effect.** E.g. total fraud cost per 1k payments **at least 20% lower** than the champion, with the 95% confidence interval excluding zero. The minimum must cover A3's operating cost.
+2. **Guardrails.** Metrics that must not get worse beyond a tolerance: a *non-inferiority* test, not superiority.
+3. **Operational readiness.** Fallback tested, rollback working, dashboards, runbook, reason codes approved by legal.
+4. **A decision rule and an owner.**
+5. **A staged rollout**, each stage with an exit gate:
+
+<Diagram src="requirements/staged-rollout-gates.svg" />
+
+Write the bar down **before** the test starts:
+
+```
+Launch spec: fraud model v1 (challenger) vs rules (champion)
+
+Primary      total fraud cost per 1k payments: −20% vs champion, 95% CI excludes 0
+  measured   proxy at 14 days: review verdicts + issuer fraud alerts + "not me" reports
+  confirmed  chargebacks on a 2% holdback, at 90 days
+
+Guardrails   (any breach → stop the ramp)
+  false-decline rate        ≤ champion + 0.02 pp
+  challenge rate            ≤ 3.0%
+  review volume             ≤ 2,000 / day
+  p99 scoring latency       ≤ 50 ms
+  approval rate per country drop ≤ 0.5 pp
+
+Readiness    fallback to rules tested · rollback < 5 min · dashboards · runbook
+             · reason codes approved by legal
+Owner        Head of Risk decides
+Kill         no primary win after 2 iterations → stay on rules (or buy a vendor service)
+```
+
+### The hard part in fraud: labels arrive late
+
+Chargebacks take 30–90 days, and nobody waits 90 days to ramp. So split the evidence:
+- **Leading proxies** decide the ramp within days: review verdicts, issuer fraud alerts, "that wasn't me" reports, challenge failure rates.
+- **Lagging truth** confirms or reverses later: chargebacks on a **holdback**, a small slice that stays on the champion after launch.
+
+The holdback costs 2% × ~$270k/day ≈ **$5.4k/day to keep measuring the truth**, and it's worth it: without it you can't tell when a proxy stops matching reality.
+
+### Sample size: how long must the test run?
+
+Rule of thumb for 80% power at α = 0.05:
+
+```
+n per arm ≈ 16 · σ² / δ²     for a rate p, σ² ≈ p(1 − p)
+```
+
+To detect a false-decline rise from 0.20% to 0.22% (δ = 0.0002):
+
+```
+n ≈ 16 × 0.002 / 0.0002² = 800,000 payments per arm
+```
+
+A 10% arm getting 200k payments/day needs **about 4 days** for this guardrail alone. Dollar-weighted metrics are much noisier. Plan for weeks.
+
+### Assumptions
+
+1. **Proxies track the truth**, checked historically and kept checked with the holdback.
+2. **The arms are independent.** Often false in fraud: a ring blocked in one arm moves to the other (**interference**).
+3. **Conditions stay stable** during the test.
+4. **The metric is measurable inside the window**, or you need a proxy.
+
+### Design choices
+
+| Choice | Options | Trade-off |
+|---|---|---|
+| Randomization unit | payment · user · card or device | Finer gives more samples but more interference; coarser is cleaner but slower |
+| Guardrail test | superiority · non-inferiority | Guardrails only need "not worse by more than m", a smaller sample |
+| Proxy vs truth | decide on proxy, confirm on truth | Faster, but risk launching on a drifted proxy |
+| Holdback size | 1–5% | Clearer long-term truth vs daily cost |
+| Ramp speed | days vs weeks per stage | Value sooner vs time to catch rare failures |
+
+### Failure modes
+
+- **Metric changed after seeing results.** The spec prevents this.
+- **Stopping early on a lucky day.** Use a fixed length or sequential testing.
+- **Averages hide harm.** One country gets 3× worse; per-segment guardrails catch it (F2).
+- **Proxy drifts from truth.** Review verdicts improve because analysts get easier cases. The holdback catches it.
+- **Gains decay** as fraudsters adapt. Measure after launch too.
+- **Bar set impossibly high.** Nothing ships.
+- **Interference between arms** makes the comparison dishonest.
+
+### Connections
+
+- **B2, B3:** primary metric and guardrails formalized. **B4:** proxies stay aligned. **B5:** randomization, power, interference. **C3:** rollback and fallback. **D1, D4:** latency and availability gates. **E2:** label delay forces proxy + holdback. **F2:** per-segment guardrails. **G4:** the launch spec is part of the requirements doc.
+
+<Callout title="Exercise A4">
+  The team randomizes **each payment** 50/50 between model and rules. A fraud ring tests 200 stolen cards; the model blocks them in treatment, the rules approve them in control. Why could this make the A/B result wrong, and what randomization unit would you choose instead?
+</Callout>
+
+## Branch A checkpoint
+
+> *A food delivery app wants a model that flags orders likely to arrive late, so it can offer a $5 voucher in advance.* In ~5 lines: the decision statement (A1), the two main error costs (A2), a non-ML baseline (A3), and one guardrail for the launch bar (A4).

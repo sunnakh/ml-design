@@ -1,0 +1,348 @@
+---
+title: C. Functional requirements
+description: What the system does, and its contract.
+---
+
+## C1 Inputs, outputs, and the API contract
+
+### What problem this solves
+Branches A and B defined *what* the system should achieve. C defines *what it does*, starting with its boundary. The fraud model isn't a standalone thing. It's a **service that other systems call**, and most production incidents in ML happen at that boundary:
+- Callers misread what a score means.
+- Fields are missing or arrive in the wrong units.
+- Retries produce different answers.
+- Nobody logged what was actually served.
+
+A contract written up front prevents all of these.
+
+### How it works: the service boundary
+
+<Diagram src="requirements/decision-service-api-boundary.svg" />
+
+The core rule: **the caller sends raw facts that only it knows at request time. The service fetches everything else.** The caller never computes features.
+
+### The contract, concretely
+**Request:**
+```json
+{
+  "schema_version": "2.1",
+  "payment_id": "pay_8f3a…",          // idempotency key
+  "event_time": "2026-09-30T14:02:11.402Z",
+  "user_id": "u_1932…",
+  "card_token": "tok_…",              // never the raw card number (PCI DSS)
+  "device_id": "dev_…",
+  "ip": "203.0.113.7",
+  "amount_minor": 8000,               // integer minor units: 8000 = $80.00
+  "currency": "USD",
+  "merchant_category": "electronics",
+  "shipping_address_hash": "…",       // null allowed: digital goods
+  "billing_address_hash": "…"
+}
+```
+**Response:**
+```json
+{
+  "decision_id": "dec_51c9…",         // key for label join and audit
+  "action": "challenge",              // AUTHORITATIVE; the caller obeys this
+  "score": 0.064,                     // calibrated P(fraud chargeback within 90d)
+  "reason_codes": ["R12_NEW_DEVICE", "R31_ADDR_MISMATCH"],
+  "model_version": "fraud-gbdt-2026-09-14",
+  "policy_version": "policy-47",
+  "fallback_used": false,             // true = rules only, model unavailable
+  "latency_ms": 23
+}
+```
+
+### What each part of the contract promises
+| Element | Requirement | Why |
+|---|---|---|
+| **Semantics of `score`** | Documented as "calibrated P(fraud chargeback within 90 days)" | Otherwise every consumer invents their own meaning |
+| **`action` is authoritative** | Callers must never threshold the score themselves | Keeps the policy layer from A2 the single source of truth |
+| **Idempotency** | Same `payment_id` → same decision, with no side effects on retry | Retries are normal (see the exercise) |
+| **Units** | Integer minor units plus currency code | "8000" should never be read as $8,000 |
+| **Missing values** | Each nullable field has a defined meaning ("null = digital goods") | Otherwise defaults silently bias the model |
+| **Versioning** | `schema_version` in the request; only additive, optional changes | Old callers keep working |
+| **Traceability** | `decision_id`, `model_version`, `policy_version` in every response | Audit, debugging, joining labels |
+| **Logging** | The service logs the request, **the features exactly as served**, and the response | Training data without training/serving skew (E1), audit trail (F3) |
+| **Reason codes** | Drawn from a fixed, legal-approved catalog | Explanations for declines (F3) that don't leak internals (F4) |
+
+### Assumptions
+1. The caller has every field at request time. If the shipping address only arrives at a later step, you've chosen the wrong decision point (A1).
+2. IDs are stable across systems: the same `user_id` in payments, orders and chargebacks, otherwise labels can't be joined.
+3. Clocks agree. `event_time` drives point-in-time features, so a skewed clock can leak the future (E1).
+4. Callers respect the contract: they obey the action, respect the timeout, and handle `fallback_used`.
+
+### Design choices
+| Choice | Options | Trade-off |
+|---|---|---|
+| What to return | Score only · action only · **both, with action authoritative** | Score-only invites callers to build their own policies. Action-only loses analytics. Both needs clear rules about which one callers use. |
+| Request size | Fat (caller sends features) · **thin (raw facts; the service fetches history)** | Fat is faster but couples callers to the model's features and causes skew. Thin keeps the model free to change but needs lookups, which costs latency (D1). |
+| Explanations | Raw feature names · **coded catalog** · none | Raw names leak model internals to fraudsters. None fails legal requirements. |
+| Schema evolution | Strict versioned · loose JSON | Strict is safe but slower to change. Loose is fast but breaks silently. |
+| Identity data | Raw card number · **token or fingerprint** | Handling raw card numbers pulls the whole service into full PCI DSS compliance scope (F1). |
+
+### Failure modes
+- **Callers building their own thresholds.** The checkout team hardcodes `if score > 0.5: decline`. It bypasses the policy layer and breaks the first time the model is recalibrated. Only the action should be acted on.
+- **Unit mismatch.** One caller sends dollars, another sends cents, and declines spike by 100× for one channel. This is a classic.
+- **Undefined nulls.** Digital goods have no shipping address. The model reads the null as "missing = suspicious", and every digital purchase gets challenged.
+- **Non-idempotent retries.** The first attempt increments the velocity counters, and the retry looks like an attack (see the exercise).
+- **Logs don't match what was served.** Training later recomputes the features differently, so the model trains on different data than it served on (training/serving skew).
+- **No `decision_id`.** Labels can't be joined, so the OEC (B2) can't be computed.
+- **Breaking schema change.** A renamed field silently becomes null for old callers.
+
+### How C1 connects to the rest
+- **A1:** the action set is part of the response.
+- **A2:** the score must be calibrated.
+- **B2:** decision logs are needed to compute the OEC.
+- **C2:** decides whether this contract is a synchronous RPC, a batch job, or a stream.
+- **C3:** `fallback_used` and the behavior on timeout.
+- **D1:** feature lookups consume the latency budget.
+- **E1:** point-in-time features and the served-feature log.
+- **E2:** the label join.
+- **F1, F3, F4:** PCI scope, reason codes, not leaking internals.
+
+<Callout title="Exercise (C1): one question, optional">
+
+The checkout service **retries the fraud call on timeout** with the same payment. One feature is "payments attempted on this card in the last 10 minutes," and the first attempt already incremented that counter before it timed out. **What goes wrong, and which requirement in the contract prevents it?**
+
+</Callout>
+
+## C2 Online, batch, or streaming
+
+### What problem this solves
+C1 defined *what* the service returns. C2 decides *when the computation happens*. That one choice drives latency (D1), freshness (D3), cost (D5), and how complex the system is to build and run.
+
+Teams often default to "real-time everything" and pay a lot of complexity for no value. Others default to a nightly batch job and miss attacks that play out in minutes.
+
+### The key insight: two separate questions
+People mix these up, but they're independent:
+1. **When is the *prediction* computed?** Ahead of time in a batch, on each request, or on each event in a stream.
+2. **How fresh are the *features*?** Hours old, seconds old, or known only at request time.
+
+The fraud system combines all of them:
+
+<Diagram src="requirements/feature-freshness-lanes-online-async.svg" />
+
+### The three prediction modes
+| Mode | How it works | Use when | Costs | Fraud use |
+|---|---|---|---|---|
+| **Batch** | A scheduled job scores every entity and writes to a key-value store; serving is a lookup | The set of entities is known, inputs change slowly, heavy models are fine | Scores are stale, **new entities have no score**, compute is spent on entities nobody requests | A nightly risk profile per merchant and per user |
+| **Online** (per request) | Computed when the request arrives, on fresh inputs | Some input **exists only at request time** | Tight latency budget, high availability required, serving infrastructure | The payment decision at checkout |
+| **Streaming** (per event) | An event triggers asynchronous scoring; the result is stored or acted on | You must react within seconds or minutes, **but nobody is waiting on the answer** | A stream processor to operate, event ordering, backfill is hard | Re-scoring an account after a suspicious login; re-scoring a payment before fulfillment |
+
+### How to decide: four questions in order
+1. **Does a key input exist only at request time?** Amount, device and IP for *this* payment do. That forces **online** prediction.
+2. **Can you list every entity ahead of time, and does it change slowly?** User and merchant profiles qualify, so **batch** them and look them up.
+3. **Does a pattern play out in minutes?** A card-testing attack of 20 cards in 10 minutes does, so you need **streaming features**. Daily batch features would never see it.
+4. **Is the action worth taking, but not while the user is waiting?** A heavy graph model before shipping qualifies, so run it **async on the stream**, after the fast decision.
+
+**Cost check at our scale:** batch-scoring 50M users nightly, when only ~2M transact per day, wastes about 96% of that compute. Batch is still fine for cheap models. It isn't for heavy ones.
+
+### Assumptions
+1. Streaming features can be **recomputed exactly** for training (backfilled from the event log). If they can't, you get training/serving skew (E1).
+2. The stream processor keeps up. Lag silently turns "seconds-old" features into "minutes-old" ones.
+3. The async result arrives **before** it's too late to act. The order must not ship before the re-score finishes.
+4. Batch jobs finish on schedule, and it's detected when they don't.
+
+### Design choices
+| Choice | Options | Trade-off |
+|---|---|---|
+| Velocity features | Streaming counters · computed on request from raw events | Streaming is fast at serve time but needs infrastructure to operate. Computing on request is simpler but a scan per request blows the latency budget. |
+| Heavy model placement | Inside checkout · **async before fulfillment** | Inside checkout is simple but breaks the latency budget. Async needs a hold window before shipping. |
+| Profile scores | Nightly batch · streaming updates | Batch is cheap but up to 24h stale. Streaming is fresh but complex. Decide from how fast profiles actually change. |
+| One pipeline or two | Separate batch and streaming code paths · one streaming path that also backfills | Two code paths are easy to start but drift apart. One path has a single definition but is harder to build. |
+
+### Failure modes
+- **Real-time everything.** User profiles recomputed on every request: huge complexity and cost for freshness nobody needed.
+- **Batch where minutes matter.** A card-testing attack finishes before the nightly job runs.
+- **New entities.** A user who signed up today has no batch profile, and a naive default (0, or the average) scores them as safe. That's exactly the population fraudsters come from. The contract needs an **explicit "no profile yet"** value, and the model must be trained on it.
+- **Streaming lag goes unnoticed.** The processor falls 15 minutes behind, velocity counters read low, and the attack gets through. The requirement is to **monitor feature age** and alert when it passes a freshness limit (D3).
+- **A batch job fails silently.** Last week's scores keep being served. The requirement is a TTL on stored scores, plus alerting when they're stale.
+- **Skew between streaming and training.** The live counters use a sliding window while the backfill uses fixed buckets, so the model sees different values in production than in training.
+- **The async decision loses the race.** Re-scoring takes 8 minutes, and fulfillment ships in 5. The requirement: fulfillment **waits** for the async decision, or holds orders above a risk level.
+
+### How C2 connects to the rest
+- **A1:** the synchronous gate plus asynchronous re-check pattern.
+- **C1:** the contract is an RPC for online prediction and an event schema for streaming.
+- **C3:** what to do when one feature lane is missing or stale.
+- **D1:** online prediction sets the latency budget.
+- **D2:** requests per second vs events per second.
+- **D3:** freshness requirements per lane.
+- **D5:** cost of batch compute vs always-on serving.
+- **E1:** point-in-time correctness and backfill.
+
+<Callout title="Exercise (C2): one question, optional">
+
+The marketplace now wants to score **sellers** for fraud risk (fake shops) to decide whether to **hold their payouts**, which happen **weekly**. **Which prediction mode fits, and why? What one change to the business would make you add streaming?**
+
+</Callout>
+
+## C3 Fallback and degraded modes
+
+### What problem this solves
+The fraud service sits **in the checkout path**, and it *will* fail at some point: the feature store slows down, a deploy ships a broken model, the stream processor falls behind, a zone goes offline. Checkout must keep working anyway.
+
+What the system does in each failure is a **requirement**, and it's a business decision priced with A2's dollars. It isn't something the on-call engineer should improvise during an outage.
+
+There are two kinds of failure, and both need a plan:
+- **Down:** timeouts, errors, a dependency that's unreachable. Health checks catch these.
+- **Up but wrong:** a bad model, stale features, broken calibration. Health checks see a green service. Only guardrails (B3) catch it.
+
+### How it works: a ladder of degradation
+
+<Diagram src="requirements/service-degradation-ladder.svg" />
+
+| Tier | Trigger | Behavior | Why this behavior |
+|---|---|---|---|
+| 0: Full | Everything healthy | Model + A2 policy | Normal operation |
+| 1: Degraded | Streaming lane stale or missing | Model with that lane marked missing (**trained to handle it**), plus a **wider challenge band** | Less information means more uncertainty, so shift risk toward the cheap challenge action |
+| 2: Rules | Model timeout, error, or bad deploy | The A3 rules engine plus the last batch risk score | This is why A3 said never delete the rules |
+| 3: Static | Rules are down too | Approve below $X, challenge from $X to $Y, hold above $Y | A pre-agreed policy nobody has to invent under pressure |
+
+### Fail open or fail closed? Price it with A2
+Take the extreme case where nothing works. Compare two choices per 1,000 payments:
+```
+Fail open  (approve all):  extra fraud ≈ 3 fraud × 80% normally caught × $95  ≈   $228
+Fail closed (decline all): 997 good × $52 regret                              ≈ $51,844
+```
+Failing closed costs about **200×** more, so the default is **fail open with limits**. But there's an adversarial catch. If fraudsters learn that an outage means "approve everything", then **overloading the fraud service becomes an attack**. So Tier 3 is never pure fail-open:
+- It caps exposure by amount.
+- It challenges new accounts.
+- Its behavior is never visible from outside (F4).
+
+### Mechanisms the requirements must name
+| Mechanism | Requirement | Prevents |
+|---|---|---|
+| **Deadlines** | The caller has a hard deadline (e.g. 50 ms). Inside the service, each dependency gets its own budget (feature store 10 ms). | One slow dependency eating the whole budget |
+| **Circuit breaker** | After N failures, stop calling the dependency for a cool-down period, and go straight to the next tier | Retry storms that pile load onto a sick service |
+| **Retry budget** | At most ~10% extra calls from retries, with jitter | An outage multiplied 3× by every caller retrying 3 times |
+| **Missing-feature training** | Randomly drop feature lanes during training so the model learns to handle them missing | Tier 1 producing garbage scores |
+| **Warm fallback** | Run the rules engine on every request, even in Tier 0 | A fallback that has rotted when you finally need it |
+| **Previous model loaded** | Keep model version N−1 in memory, with one-click rollback | "Up but wrong" deploys |
+| **Kill switch** | A human can force any tier within seconds | Unexpected failures and new attacks |
+| **`fallback_used` flag** | Returned (C1) and logged with each decision | Losing track of which decisions were degraded |
+
+### A key architecture point
+With fallbacks, **the system can be more available than the model**. The checkout decision needs 99.99% availability. The model alone might only reach 99.9%. The ladder covers the difference, so you can run a simpler model service without putting checkout at risk (D4).
+
+### Assumptions
+1. The fallbacks really work. That's only true if they're **tested regularly**: planned failure drills, or injecting failures on purpose (chaos testing).
+2. Tier 1 is valid only if the model was trained with lanes missing.
+3. Outages are short. The static policy is priced for minutes to hours, not weeks.
+4. Detection is fast. Guardrails with persistence checks (B3) catch "up but wrong" within minutes.
+
+### Design choices
+| Choice | Options | Trade-off |
+|---|---|---|
+| Default on total failure | Fail open · fail closed · **capped by amount** | Priced by A2; capping also limits the adversarial risk |
+| Degraded model | Same model with missing lanes · separate smaller model | One model is simpler to keep up. A separate one is more accurate but is another model to maintain. |
+| Rollback trigger | Automatic on guardrail breach · human | Fast vs the risk of flapping (B3) |
+| Fallback freshness | Rules computed live · cached decisions | Live is correct but uses compute. Cached is cheap but goes stale. |
+
+### Failure modes
+- **The fallback was never tested.** It's triggered for the first time during Black Friday. The rules reference a feature deleted months ago and crash.
+- **Silent permanent fallback.** A config error leaves 30% of traffic on rules for three weeks, and nobody notices until chargebacks arrive. The requirement is **fallback rate as a guardrail** with an alert (e.g. > 1% for 10 minutes pages someone).
+- **Cascading timeouts.** Without per-dependency deadlines, a slow feature store makes every request time out.
+- **Retry storms.** Callers retry, load triples, and the fraud service stays down.
+- **An exploitable fail-open.** An attacker overloads the fraud service and walks through the gate.
+- **"Up but wrong" is invisible to health checks.** A deploy with swapped feature columns returns 200 OK while declines triple. Only action-rate guardrails catch this.
+- **Poisoned training data.** Decisions made in fallback periods were produced by a different policy. If they're mixed into training without the `fallback_used` flag, labels and selection bias get distorted (E2).
+
+### How C3 connects to the rest
+- **A2:** prices fail open vs fail closed.
+- **A3:** the rules engine is the Tier 2 fallback.
+- **B3:** guardrails trigger rollbacks and alert on fallback rate.
+- **C1:** timeouts and the `fallback_used` flag.
+- **C2:** each feature lane can fail on its own.
+- **D1:** per-dependency deadlines.
+- **D4:** the system can be more available than the model.
+- **E2:** handling labels from degraded periods.
+- **F4:** attackers who deliberately trigger fallbacks.
+
+<Callout title="Exercise (C3): one question, optional">
+
+Your Tier 3 policy is **"approve everything under $200 when the fraud service is down."** A fraud ring learns this. **How might they exploit it, and what two changes would you make to the requirement?**
+
+</Callout>
+
+## C4 Human-in-the-loop actions
+
+### What problem this solves
+Some payments are too uncertain or too high-stakes to automate. A human analyst brings context, judgment, accountability, and **labels that arrive in hours rather than 90 days**. But humans are scarce, slow, expensive, inconsistent, and easily influenced by the model's score.
+
+So "send it to review" isn't a design. The requirements have to specify:
+- **which** cases go to people,
+- **how many** per hour,
+- **how fast** they must be handled,
+- **what** analysts see,
+- **what happens** when the queue overflows,
+- **how** analyst decisions feed back into the system.
+
+### How it works: a review queue is a production system
+
+**1. Route by value, within capacity.** The review band from A2 (11–84%) might contain 5,000 payments a day, but analysts can handle 2,000. So you rank by the **marginal value of review**, EV(review) − EV(best automated action), and send the top cases (A2, design choice 4). Cases that don't make it get their next-best automatic action, usually a challenge.
+
+**2. Staff by the hour, not by the day.** "2,000 per day" hides a problem, because arrivals peak in the evening at about 3× the average. Queueing theory explains why that breaks things:
+
+<Diagram src="requirements/review-queue-wait-vs-utilization.svg" />
+
+In a simple queue, the wait grows like ρ / (1 − ρ), where ρ is utilization. A team that is "90% busy" has **9×** the wait of one review. Above 100%, the queue grows without limit. The requirements that follow:
+- Plan staffing for about **70–80% utilization in the peak hour**.
+- Define an **overflow policy**: when the predicted wait exceeds the SLA, the lowest-value cases in the queue switch to challenge.
+
+**3. Set an SLA and a timeout action.** For example: 95% of held orders reviewed within 2 hours, and if not, a **default action by risk level** runs. The delay has a cost too: the 3% of good buyers who cancel while waiting are already priced into A2's value for "review".
+
+**4. Decide what analysts see.** The score, the reason codes (C1), the order and account history, and entities linked to this one (the same device or address on other accounts). Analysts get more options than the model: approve, decline, ask for documents, escalate.
+
+**5. Close the loop.**
+- Analyst verdicts become **fast labels**. They're the A4 proxy, and they're checked later against chargebacks.
+- Analysts who spot a new pattern can **propose a rule** that ships in hours. This is the fast lever from A3.
+- A small **exploration slice** of capacity (~5%) goes to cases chosen for **label value**: uncertain or unusual ones, not just the highest EV. This helps the next model learn things the current one doesn't know.
+
+### The biggest trap: automation bias
+Analysts shown a score of 0.91 tend to anchor on it. Their verdicts then **repeat the model's opinion**, those verdicts become training labels, and the model learns from itself. It's a hidden feedback loop, and it's why the requirements need:
+- **Blind audits:** a sample of cases reviewed with the score hidden.
+- **Agreement metrics:** agreement between analysts on double-reviewed cases (Cohen's kappa), and agreement between analysts and the model. If analysts agree with the model 99% of the time, they're rubber-stamping.
+- **Analyst accuracy measured against chargebacks**, per analyst and per case type.
+
+### Assumptions
+1. **Humans beat the model on the cases they get.** Check this with data. For some case types, analysts do worse than the model.
+2. Capacity is stable. Holidays, sick days and staff turnover break this.
+3. Customers accept a hold. That holds for physical goods shipping tomorrow, but not for instant digital delivery.
+4. Analysts judge independently of the score. This fails without blind audits.
+5. **Regulation.** Some laws (e.g. GDPR Article 22) give people rights around decisions made *solely* by automation that significantly affect them. Legal must say whether yours qualify, and whether human review is a legal requirement rather than an optimization (F3).
+
+### Design choices
+| Choice | Options | Trade-off |
+|---|---|---|
+| Routing | Fixed score band · **ranked by value within capacity** · plus an exploration slice | A fixed band overflows. Value ranking is optimal now. Exploration costs a little today to improve the next model. |
+| Show the score? | Show it · hide it · hide it on a random sample | Showing makes analysts faster but anchors them. Hiding makes them independent but slower. The sample gives you both. |
+| SLA timeout action | Approve · challenge · decline, by risk | A single default gets exploited (see failure modes) |
+| High-value orders | One reviewer · two reviewers | Accuracy vs capacity |
+| Rules written by analysts | Allowed, with expiry dates · central team only | Fast response to attacks vs rule sprawl (A3) |
+
+### Failure modes
+- **Queue overflow.** Peak arrivals exceed capacity, SLAs fail, and good orders get delayed or cancelled.
+- **A timeout default that can be exploited.** If "unreviewed after 2 hours = approve", fraudsters attack at 3 a.m. when staffing is thin. The timeout action must depend on risk, and night staffing must reflect the attack pattern.
+- **Automation bias.** Labels repeat the model, the model stops improving, and its blind spots become permanent.
+- **Case mix shifts silently.** A better model sends harder cases, and analyst metrics look worse even though nothing is wrong (see the exercise).
+- **Rubber-stamping.** A "human in the loop" handling 400 cases an hour isn't reviewing anything. If humans are there for accountability, set a floor on time per case.
+- **Fatigue and inconsistency.** Error rates rise late in a shift, and different analysts apply different standards. Monitor accuracy per analyst and per hour.
+- **Rules from analysts that never expire.** Hundreds of one-off rules pile up into the sprawl from A3.
+
+### How C4 connects to the rest
+- **A1:** "hold for review" is one of the actions.
+- **A2:** ranking by marginal value, and the shadow price of capacity.
+- **A4:** analyst verdicts are the leading proxy.
+- **B3:** review volume is a capacity guardrail.
+- **B4:** hit-rate metrics and case-mix drift.
+- **C3:** what to do when the review tool is down.
+- **D2:** staffing is capacity planning, just like servers.
+- **E2:** analyst verdicts as labels, with known noise.
+- **F2:** analyst bias across customer groups.
+- **F3:** rights to human review.
+
+<Callout title="Exercise (C4): one question, optional">
+
+Model v2 is much better, so it sends **fewer and harder** cases to review. The analysts' **hit rate** (the share of reviewed cases they decline) drops from **40% to 25%**. Management concludes: "Analysts are getting worse." **What's actually happening, and what would you measure instead?**
+
+</Callout>
