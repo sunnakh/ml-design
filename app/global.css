@@ -10,3 +10,131 @@ html > body[data-scroll-locked] {
   margin-right: 0px !important;
   --removed-body-scroll-bar-size: 0px !important;
 }
+
+/* Diagrams ported from teaching sessions (components/diagram.tsx).
+   Maps the session diagram classes and variables onto the site theme. */
+.ml-diagram {
+  --text-primary: var(--color-fd-foreground);
+  --text-secondary: var(--color-fd-muted-foreground);
+  --text-muted: var(--color-fd-muted-foreground);
+  --border: var(--color-fd-border);
+  --border-strong: color-mix(in oklab, var(--color-fd-foreground) 30%, transparent);
+  --surface-1: var(--color-fd-card);
+  --surface-2: var(--color-fd-secondary);
+
+  --d-gray-fill: #f1efe8;
+  --d-gray-stroke: #5f5e5a;
+  --d-gray-text: #2c2c2a;
+  --d-purple-fill: #eeedfe;
+  --d-purple-stroke: #534ab7;
+  --d-purple-text: #3c3489;
+  --d-teal-fill: #e1f5ee;
+  --d-teal-stroke: #0f6e56;
+  --d-teal-text: #085041;
+  --d-coral-fill: #faece7;
+  --d-coral-stroke: #993c1d;
+  --d-coral-text: #712b13;
+
+  --bg-accent: var(--d-purple-fill);
+  --border-accent: var(--d-purple-stroke);
+  --text-accent: var(--d-purple-text);
+
+  color: var(--text-primary);
+}
+
+.dark .ml-diagram {
+  --d-gray-fill: #2c2c2a;
+  --d-gray-stroke: #b4b2a9;
+  --d-gray-text: #e8e6de;
+  --d-purple-fill: #26215c;
+  --d-purple-stroke: #afa9ec;
+  --d-purple-text: #cecbf6;
+  --d-teal-fill: #04342c;
+  --d-teal-stroke: #5dcaa5;
+  --d-teal-text: #9fe1cb;
+  --d-coral-fill: #4a1b0c;
+  --d-coral-stroke: #f0997b;
+  --d-coral-text: #f5c4b3;
+}
+
+.ml-diagram svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  font-family: inherit;
+}
+
+.ml-diagram svg text {
+  fill: var(--text-primary);
+}
+
+.ml-diagram .th {
+  font-size: 14px;
+  font-weight: 500;
+  fill: var(--text-primary);
+}
+
+.ml-diagram .ts {
+  font-size: 12px;
+  fill: var(--text-secondary);
+}
+
+.ml-diagram .arr,
+.ml-diagram .leader {
+  fill: none;
+  stroke: var(--text-secondary);
+  stroke-width: 1.5;
+}
+
+.ml-diagram .leader {
+  stroke-width: 0.75;
+  stroke-dasharray: 3 3;
+}
+
+.ml-diagram :is(.c-gray, .c-purple, .c-teal, .c-coral):is(rect, circle, ellipse, path, polygon),
+.ml-diagram :is(.c-gray, .c-purple, .c-teal, .c-coral) :is(rect, circle, ellipse, path, polygon) {
+  stroke-width: 0.75;
+}
+
+.ml-diagram .c-gray:is(rect, circle, ellipse, path, polygon),
+.ml-diagram .c-gray :is(rect, circle, ellipse, path, polygon) {
+  fill: var(--d-gray-fill);
+  stroke: var(--d-gray-stroke);
+}
+.ml-diagram .c-gray text {
+  fill: var(--d-gray-text);
+}
+
+.ml-diagram .c-purple:is(rect, circle, ellipse, path, polygon),
+.ml-diagram .c-purple :is(rect, circle, ellipse, path, polygon) {
+  fill: var(--d-purple-fill);
+  stroke: var(--d-purple-stroke);
+}
+.ml-diagram .c-purple text {
+  fill: var(--d-purple-text);
+}
+
+.ml-diagram .c-teal:is(rect, circle, ellipse, path, polygon),
+.ml-diagram .c-teal :is(rect, circle, ellipse, path, polygon) {
+  fill: var(--d-teal-fill);
+  stroke: var(--d-teal-stroke);
+}
+.ml-diagram .c-teal text {
+  fill: var(--d-teal-text);
+}
+
+.ml-diagram .c-coral:is(rect, circle, ellipse, path, polygon),
+.ml-diagram .c-coral :is(rect, circle, ellipse, path, polygon) {
+  fill: var(--d-coral-fill);
+  stroke: var(--d-coral-stroke);
+}
+.ml-diagram .c-coral text {
+  fill: var(--d-coral-text);
+}
+
+.ml-diagram figcaption {
+  margin-top: 0.5rem;
+  text-align: center;
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+}
