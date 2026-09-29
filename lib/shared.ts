@@ -1,6 +1,6 @@
 import { createGetUrl } from 'fumadocs-core/source';
 
-export const appName = 'My App';
+export const appName = 'tech-design';
 export const docsRoute = '/courses';
 export const docsImageRoute = '/og/courses';
 export const docsContentRoute = '/llms.mdx/courses';
