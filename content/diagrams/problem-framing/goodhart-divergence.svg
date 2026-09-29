@@ -1,0 +1,12 @@
+<svg width="100%" viewBox="0 0 680 380" role="img"><title>Proxy and goal diverge under optimization pressure</title><desc>As decline rate rises, the proxy fraud dollars caught keeps rising, while the goal TCF saved rises, peaks near a moderate decline rate, then falls as good customers are declined. A dashed line marks the best point for the goal.</desc>
+<line x1="80" y1="300" x2="610" y2="300" stroke="var(--text-secondary)" stroke-width="0.5"/>
+<line x1="80" y1="60" x2="80" y2="300" stroke="var(--text-secondary)" stroke-width="0.5"/>
+<path d="M80 300 C 200 150, 350 100, 600 80" fill="none" stroke="#1D9E75" stroke-width="2"/>
+<path d="M80 300 C 150 190, 210 165, 255 165 S 450 225, 600 290" fill="none" stroke="#D85A30" stroke-width="2" stroke-dasharray="6 4"/>
+<line x1="255" y1="60" x2="255" y2="300" stroke="var(--text-muted)" stroke-width="0.5" stroke-dasharray="3 3"/>
+<text class="ts" x="255" y="48" text-anchor="middle" dominant-baseline="central">Best for goal</text>
+<text class="ts" x="80" y="48" text-anchor="start" dominant-baseline="central">Value</text>
+<text class="ts" x="345" y="320" text-anchor="middle" dominant-baseline="central">Optimization pressure (decline rate) →</text>
+<line x1="80" y1="355" x2="112" y2="355" stroke="#1D9E75" stroke-width="2"/><text class="ts" x="120" y="355" dominant-baseline="central">Proxy: fraud $ caught</text>
+<line x1="320" y1="355" x2="352" y2="355" stroke="#D85A30" stroke-width="2" stroke-dasharray="6 4"/><text class="ts" x="360" y="355" dominant-baseline="central">Goal: TCF saved</text>
+</svg>

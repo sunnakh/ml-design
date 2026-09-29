@@ -1,0 +1,203 @@
+---
+title: 5. Framing constraints
+description: The limits that shape which framings are possible in production.
+---
+
+## 5.1 Latency and serving mode
+
+### What problem it solves
+
+The decision point (1.1) comes with a **time budget**. ShopFast's checkout API has an overall p99 target, and fraud gets **100 ms** of it. That budget decides:
+- which features you can use,
+- which models you can run,
+- which tasks run online and which run in batch,
+- and what happens when time runs out.
+
+If you discover the budget *after* building a 2-second graph model, you rebuild. That's why latency is a framing question.
+
+### How it works
+
+**Step 1: pick a serving mode for each decision.**
+
+| Mode | How it works | ShopFast use |
+|---|---|---|
+| **Online, synchronous** | Scored inside the request, with a strict budget | Checkout: approve / step-up / decline |
+| **Online, asynchronous** | Triggered by an event; result used seconds to hours later | Pre-shipment hold and review |
+| **Batch** | Precomputed on a schedule, looked up at decision time | Account risk (daily), ring scores (nightly) |
+| **Streaming features** | Aggregates updated continuously, read by online models | Velocity: cards per device in the last 24h |
+
+**Step 2: break the budget into parts.** Measure p99, not averages. Here's ShopFast's checkout path:
+
+<Diagram src="problem-framing/checkout-fraud-latency-budget.svg" />
+
+Reading it:
+- **The common path** (no vendor call, about 85% of orders) takes roughly 47 ms, which is comfortable.
+- **The worst path** (the uncertain band triggers the vendor call) takes about 87 ms, leaving **13 ms of headroom**.
+- The vendor call is by far the biggest piece. That's why the value-of-information cascade from 4.4 is a latency tool, not just a cost tool.
+- Feature fetches run **in parallel**. Done one after another, they'd blow the budget alone.
+
+### How latency reshapes the formulation
+
+1. **Heavy features move to batch or streaming.** "Fraud rate among orders sharing this device over 90 days" is computed ahead of time, not per request. The cost is **staleness**, and a fraud ring can strike in minutes.
+2. **Heavy tasks become features.** The graph model (4.1) can't run in 100 ms, so it runs nightly and its output becomes a checkout feature.
+3. **Model size is capped.** A few hundred trees fit. A large sequence model may need to be distilled into a smaller one, or moved to an async decision.
+4. **Split the decision.** When the budget really binds, make a **fast provisional decision now and a richer one later**: approve at checkout, then run the heavy model before shipping and hold the order if needed. This is 1.1's multi-decision-point design, forced by latency. The trade-off from the 1.1 timeline applies: acting later means more information and less preventable loss.
+5. **Plan for timeouts.** What happens at 100 ms is a *policy decision*, not an engineering accident:
+
+| Timeout default | Risk |
+|---|---|
+| Approve (fail-open) | Fraud gets through on slow days |
+| Decline (fail-closed) | Revenue lost on slow days |
+| **Rules fallback, step-up for high amounts** (ShopFast) | Some friction, bounded loss |
+
+### Assumptions
+
+- The budget is **real**. Negotiate it: sometimes 100 ms is inherited folklore and 150 ms is fine.
+- Upstream services (feature store, vendor) **meet their p99 targets**, including at peak.
+- **Traffic peaks are known**: Black Friday brings about 10× normal load.
+
+### Design choices
+
+1. **Serving mode per decision** (table above).
+2. **Budget allocation**: how many ms go to features vs model vs vendor.
+3. **Precompute vs compute per request**: freshness against latency.
+4. **Timeout default action**: a cost-matrix question (1.4), decided ahead of time.
+5. **Model size limit**: set it before the modeling team picks an architecture.
+
+### Trade-offs
+
+- **Freshness vs latency vs cost**: streaming counters are fresh and fast but need infrastructure (5.2). Batch is cheap but stale.
+- **Model richness vs budget**: a bigger model is more accurate and slower, and tail latency grows with load.
+- **Synchronous vs async**: acting at checkout prevents more loss with less information; pre-shipment has more information and prevents less.
+
+### Failure modes
+
+- **Thinking in averages.** p50 is 30 ms, but p99 on Black Friday is 140 ms. Eight percent of requests time out, the fallback handles them, and fraud spikes on your highest-volume day.
+- **Silent fail-open.** A timeout returns "approve" by default because that's what the HTTP client did. Nobody decided it.
+- **Adversarial slowness.** Fraudsters notice that huge carts or odd inputs slow scoring down past the timeout, and they exploit the fail-open path. Timeouts are an attack surface (6.4).
+- **Stale batch features during an attack.** A ring strikes at 2 PM, and the nightly ring score catches it tomorrow.
+- **Offline–online feature mismatch.** Training uses precise, fresh warehouse aggregates while serving uses cached or approximate ones. Skew (2.3) caused by latency shortcuts.
+- **Retry storms.** Timeouts trigger retries, which double the load, which causes more timeouts.
+
+### Connections
+
+- **← 1.1**: the decision point sets the budget, and splitting decisions is the escape hatch.
+- **← 2.3**: the serving path for each data source.
+- **← 4.3**: event-triggered vs batch cadence.
+- **← 4.4**: the cascade saves latency.
+- **← 2.1**: the rules fallback is the timeout path.
+- **→ 5.2**: streaming and serving infrastructure costs.
+- **→ 6.4**: timeouts as an attack surface.
+- **→ Stages 7–8**: serving infrastructure, p99 monitoring, load testing before peak season.
+
+<Callout title="Exercise 5.1 (includes checks)">
+
+1. A strong feature, "fraud rate among orders sharing this device over the last 90 days," takes **300 ms** to compute per request. Give **two options** and the trade-off of each.
+2. On Black Friday, p99 hits **140 ms** and **8%** of requests time out. The current timeout behavior is **approve**. What's the risk? Propose a better default, and use **1.4** to justify making it amount-dependent.
+3. **(1.1 check)** A graph model catches rings very well but needs **2 seconds**. Where in the order lifecycle can it act, and what does that cost you?
+
+</Callout>
+
+## 5.2 Scale and cost
+
+### What problem it solves
+
+Every prediction costs something: compute, data, vendor fees, labels, people. At scale, **cost per decision** has to stay well below **value at stake per decision**, or the system loses money no matter how accurate it is.
+
+This is a framing question because it decides *which units get scored, how heavy each model can be, and where ML shouldn't run at all*.
+
+### The key idea: scale differs by unit
+
+Part 4.3 split ShopFast into units. Each unit has a very different volume, so each can afford a very different cost per item. "Fraud" isn't one scale problem; it's a funnel:
+
+<Diagram src="problem-framing/volume-funnel-by-unit.svg" />
+
+Reading the funnel:
+- **Orders are only about 10M/yr**, roughly 0.3/sec on average and about 5/sec at peak. Serving the checkout model is **not** where the scale problem is.
+- The real volume sits **upstream**: clickstream feeding streaming features, logins for the takeover model, and payment attempts, which spike during card-testing attacks.
+- **Downstream, items are rare and expensive**: each review costs $3 of human time, and each chargeback is a label worth a lot.
+
+### How it works: unit economics per decision
+
+**The rule: cost per decision ≪ value at stake per decision.**
+
+| Unit | Value at stake per item | Affordable cost per item | Implication |
+|---|---|---|---|
+| Order | ~$200 × 0.2% fraud ≈ **$0.40+** expected fraud, plus false-decline risk | Cents | Full model, vendor call in the uncertain band |
+| Login | Takeover losses ~$1.5M ÷ 150M logins ≈ **$0.01** | Fractions of a cent | Light model; score fully only on risk triggers (new device, new geography) |
+| Payment attempt | Tiny per attempt; bursts of thousands | ~$0 | Rate limits and rules. No ML per attempt, no paid calls. |
+| Review | ~$25–200 of savings on flagged orders | $3 | Spend human time only on the top-savings orders (4.4) |
+
+### Where the cost actually goes
+
+A typical ML fraud system's run costs, from largest to smallest:
+1. **People**: maintenance, retraining, on-call, investigations. Often the **largest** line, and the most forgotten one (2.4). Each extra model in the portfolio (4.1) adds a lasting fraction of a person.
+2. **Streaming feature infrastructure**: continuous aggregates over billions of events.
+3. **Human labeling**: reviews at $3 each. That's real money, *and* a label source.
+4. **Third-party data**: vendor calls.
+5. **Experimentation**: the fraud dollars lost to exploration and holdouts (3.4, 6.2).
+6. **Serving and training compute**: usually *smaller* than people expect for tabular fraud models.
+7. **Logging and storage**: a feature snapshot for every decision (4.4) is cheap for orders and expensive for clickstream.
+
+### Framing choices driven by scale
+
+1. **Match model weight to value per decision**: a heavy model on orders, a light one on logins, rules on payment attempts.
+2. **Score on triggers, not everything**: a full takeover score only when a login shows a new device or location. That's roughly 10% of logins, so a 10× saving.
+3. **Put cheap filters before paid calls**: rate limits and rules run *before* any vendor call or heavy feature.
+4. **Size for peak, not average**: Black Friday brings about 10× load, and attacks bring spikes on top.
+5. **Plan for growth**: design for 3–5× volume. Costs that grow in step with volume (vendor per call) behave very differently from roughly fixed ones (a model).
+6. **Label budget as a design lever**: part of the review capacity can go to orders chosen for **label value** (where the model is most uncertain), not just immediate savings. This is where 6.2 picks up.
+
+### Assumptions
+
+- **Volume forecasts** hold, including attack spikes.
+- **Unit prices** (vendor, compute, reviewer wages) stay stable, or have contract caps (2.4).
+- **Value-at-stake estimates** per unit are right. Takeover losses might be underestimated because of silent fraud (4.2).
+
+### Design choices
+
+1. **Which units get ML, rules, or nothing.**
+2. **Triggered vs exhaustive scoring** per unit.
+3. **Retraining cadence**: monthly retraining on 2 years of data vs weekly incremental updates. Freshness against compute and people cost.
+4. **Build vs buy infrastructure**: a managed feature store vs your own.
+5. **How review time is split** between immediate savings and label value.
+
+### Trade-offs
+
+- **Coverage vs cost**: scoring every login catches more takeovers and may cost more than the takeovers do.
+- **Freshness vs cost**: streaming everything is fresh and expensive; batch is cheap and stale (5.1).
+- **Portfolio breadth vs team capacity**: seven specialized models cost more to maintain than three good ones. Maintenance is forever.
+
+### Failure modes
+
+- **Cost per decision above value**: a heavy takeover model on every login costs $1.2M/yr to prevent $1.5M in losses, and it only catches half of them.
+- **Denial-of-wallet**: a card-testing attack sends 200k attempts an hour, and each one triggers a paid vendor call. **The attacker runs up your bill** even when every attempt fails. Cheap filters must come before paid calls.
+- **Unbounded logging**: feature snapshots for clickstream-level events, with storage costs growing faster than traffic.
+- **Sizing for the average**: autoscaling limits set for normal days, and Black Friday latency collapses (5.1).
+- **Ignoring people cost**: the ROI (2.4) counted compute and forgot the three engineers keeping it alive.
+
+### Connections
+
+- **← 2.4**: run costs and ROI.
+- **← 4.3**: units define the scale per unit.
+- **← 4.4**: the cascade and value-of-information logic are cost tools too.
+- **← 5.1**: freshness, latency and cost form a triangle.
+- **→ 6.2**: review budget as a labeling and exploration budget.
+- **→ 6.4**: denial-of-wallet and attack spikes.
+- **→ Stage 7**: capacity planning, autoscaling, cost monitoring.
+
+<Callout title="Exercise 5.2">
+
+1. The takeover model is proposed with a **vendor call on every login**: 150M logins × $0.01. What's the annual cost, compared with takeover losses of about **$1.5M/yr**? Propose a design that keeps most of the benefit.
+2. A card-testing burst sends **200k attempts/hour**, and each triggers the $0.01 vendor call. What does the attack cost *you* per hour? What's the one-line fix?
+3. **(2.4 check)** Which cost line is usually the **largest and most forgotten** in ML run costs? Why does adding a fourth model to the portfolio make it worse?
+
+</Callout>
+
+## 5.3 Explainability, regulation
+
+Some decisions must be explained to users or regulators, such as credit or declines under EU strong customer authentication. This can rule out some model types or require reason codes.
+
+## 5.4 Fairness and privacy
+
+Check whether the model could treat groups unfairly and whether you are allowed to use each input. Sensitive attributes and personal data may be restricted by law or policy.

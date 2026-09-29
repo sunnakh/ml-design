@@ -1,0 +1,18 @@
+<svg width="100%" viewBox="0 0 680 520" role="img"><title>Policy layer cascade</title><desc>A cheap model scores in 5 ms. If the score is in an uncertain band near a threshold, the order is enriched with a vendor call and rescored; otherwise it goes straight to the cost policy. The cost policy picks the minimum expected cost action, then constraints apply capacity and guardrails, with a small randomized exploration slice feeding in. The final action is logged with policy version and propensity.</desc><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<g class="c-purple"><rect x="60" y="40" width="280" height="56" rx="4" stroke-width="0.5"/><text class="th" x="200" y="58" text-anchor="middle" dominant-baseline="central">Cheap model</text><text class="ts" x="200" y="80" text-anchor="middle" dominant-baseline="central">p₁ in about 5 ms</text></g>
+<g class="c-gray"><rect x="60" y="130" width="280" height="56" rx="4" stroke-width="0.5"/><text class="th" x="200" y="148" text-anchor="middle" dominant-baseline="central">Uncertain band?</text><text class="ts" x="200" y="170" text-anchor="middle" dominant-baseline="central">Near an action threshold</text></g>
+<g class="c-purple"><rect x="400" y="130" width="240" height="56" rx="4" stroke-width="0.5"/><text class="th" x="520" y="148" text-anchor="middle" dominant-baseline="central">Enrich and rescore</text><text class="ts" x="520" y="170" text-anchor="middle" dominant-baseline="central">Vendor call, +40 ms</text></g>
+<g class="c-teal"><rect x="60" y="250" width="280" height="56" rx="4" stroke-width="0.5"/><text class="th" x="200" y="268" text-anchor="middle" dominant-baseline="central">Cost policy</text><text class="ts" x="200" y="290" text-anchor="middle" dominant-baseline="central">Minimum expected cost</text></g>
+<g class="c-teal"><rect x="60" y="340" width="280" height="56" rx="4" stroke-width="0.5"/><text class="th" x="200" y="358" text-anchor="middle" dominant-baseline="central">Constraints</text><text class="ts" x="200" y="380" text-anchor="middle" dominant-baseline="central">Capacity, guardrails, budgets</text></g>
+<g class="c-coral"><rect x="400" y="340" width="240" height="56" rx="4" stroke-width="0.5"/><text class="th" x="520" y="358" text-anchor="middle" dominant-baseline="central">Exploration slice</text><text class="ts" x="520" y="380" text-anchor="middle" dominant-baseline="central">About 1% randomized</text></g>
+<g class="c-teal"><rect x="60" y="430" width="280" height="56" rx="4" stroke-width="0.5"/><text class="th" x="200" y="448" text-anchor="middle" dominant-baseline="central">Action and log</text><text class="ts" x="200" y="470" text-anchor="middle" dominant-baseline="central">Policy version, propensity</text></g>
+<line class="arr" x1="200" y1="98" x2="200" y2="126" marker-end="url(#arrow)"/>
+<line class="arr" x1="200" y1="188" x2="200" y2="246" marker-end="url(#arrow)"/>
+<text class="ts" x="210" y="217" text-anchor="start" dominant-baseline="central">No</text>
+<line class="arr" x1="342" y1="158" x2="396" y2="158" marker-end="url(#arrow)"/>
+<text class="ts" x="369" y="146" text-anchor="middle" dominant-baseline="central">Yes</text>
+<path d="M520 188 L520 278 L344 278" fill="none" class="arr" marker-end="url(#arrow)"/>
+<line class="arr" x1="200" y1="308" x2="200" y2="336" marker-end="url(#arrow)"/>
+<line class="arr" x1="398" y1="368" x2="344" y2="368" marker-end="url(#arrow)"/>
+<line class="arr" x1="200" y1="398" x2="200" y2="426" marker-end="url(#arrow)"/>
+</svg>

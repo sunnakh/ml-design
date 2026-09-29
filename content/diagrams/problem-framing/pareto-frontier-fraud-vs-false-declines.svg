@@ -1,0 +1,16 @@
+<svg width="100%" viewBox="0 0 680 370" role="img"><title>Pareto frontier of fraud loss versus false-decline cost</title><desc>Axes: false-decline cost to the right, fraud loss upward; lower-left is better. A curved frontier shows the best achievable trade-offs. Current rules sit above and right of the frontier, meaning they are dominated; a dashed arrow shows a free improvement to the frontier. A dashed iso-TCF line touches the frontier at the minimum-TCF point. The region below the curve is not achievable.</desc><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<line x1="100" y1="300" x2="610" y2="300" stroke="var(--text-secondary)" stroke-width="0.5"/>
+<line x1="100" y1="60" x2="100" y2="300" stroke="var(--text-secondary)" stroke-width="0.5"/>
+<path d="M130 80 C 150 230, 250 280, 590 285" fill="none" stroke="#534AB7" stroke-width="2"/>
+<line x1="120" y1="142" x2="280" y2="287" stroke="#888780" stroke-width="1" stroke-dasharray="5 4"/>
+<circle cx="187" cy="203" r="5" fill="#534AB7"/>
+<circle cx="330" cy="200" r="5" fill="#D85A30"/>
+<line x1="324" y1="203" x2="230" y2="224" stroke="#D85A30" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+<text class="ts" x="340" y="194" text-anchor="start" dominant-baseline="central">Current rules (dominated)</text>
+<text class="ts" x="178" y="224" text-anchor="end" dominant-baseline="central">Min TCF</text>
+<text class="ts" x="112" y="284" text-anchor="start" dominant-baseline="central">Not achievable</text>
+<text class="ts" x="100" y="46" text-anchor="start" dominant-baseline="central">Fraud loss ↑</text>
+<text class="ts" x="355" y="318" text-anchor="middle" dominant-baseline="central">False-decline cost →</text>
+<line x1="100" y1="348" x2="132" y2="348" stroke="#534AB7" stroke-width="2"/><text class="ts" x="140" y="348" dominant-baseline="central">Pareto frontier</text>
+<line x1="280" y1="348" x2="312" y2="348" stroke="#888780" stroke-width="1" stroke-dasharray="5 4"/><text class="ts" x="320" y="348" dominant-baseline="central">Equal-TCF line</text>
+</svg>

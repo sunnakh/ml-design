@@ -1,0 +1,13 @@
+{
+  "title": "Problem Framing",
+  "icon": "Target",
+  "pages": [
+    "index",
+    "objective-and-decision",
+    "feasibility",
+    "ml-objective",
+    "task-formulation",
+    "framing-constraints",
+    "feedback-and-dynamics"
+  ]
+}

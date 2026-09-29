@@ -1,0 +1,27 @@
+<svg width="100%" viewBox="0 0 680 456" role="img"><title>Labeling function for true fraud</title><desc>Four questions in sequence. Not approved: unknown, declined, excluded. Not matured to 120 days: unknown, immature. No true-fraud signal: negative, legit order. Friendly fraud evidence present: friendly-fraud label, a separate target. Otherwise: positive, true fraud.</desc><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<g class="c-purple"><rect x="60" y="40" width="280" height="56" rx="4" stroke-width="0.5"/><text class="th" x="200" y="58" text-anchor="middle" dominant-baseline="central">Order approved?</text><text class="ts" x="200" y="80" text-anchor="middle" dominant-baseline="central">Outcome can be observed</text></g>
+<g class="c-purple"><rect x="60" y="120" width="280" height="56" rx="4" stroke-width="0.5"/><text class="th" x="200" y="138" text-anchor="middle" dominant-baseline="central">Label matured?</text><text class="ts" x="200" y="160" text-anchor="middle" dominant-baseline="central">At least 120 days old</text></g>
+<g class="c-purple"><rect x="60" y="200" width="280" height="56" rx="4" stroke-width="0.5"/><text class="th" x="200" y="218" text-anchor="middle" dominant-baseline="central">True-fraud signal?</text><text class="ts" x="200" y="240" text-anchor="middle" dominant-baseline="central">Fraud code, alert, confirmed ATO</text></g>
+<g class="c-purple"><rect x="60" y="280" width="280" height="56" rx="4" stroke-width="0.5"/><text class="th" x="200" y="298" text-anchor="middle" dominant-baseline="central">Friendly-fraud evidence?</text><text class="ts" x="200" y="320" text-anchor="middle" dominant-baseline="central">Delivered, known buyer</text></g>
+<g class="c-teal"><rect x="60" y="360" width="280" height="56" rx="4" stroke-width="0.5"/><text class="th" x="200" y="378" text-anchor="middle" dominant-baseline="central">Positive</text><text class="ts" x="200" y="400" text-anchor="middle" dominant-baseline="central">True fraud</text></g>
+<g class="c-gray"><rect x="400" y="40" width="240" height="56" rx="4" stroke-width="0.5"/><text class="th" x="520" y="58" text-anchor="middle" dominant-baseline="central">Unknown: declined</text><text class="ts" x="520" y="80" text-anchor="middle" dominant-baseline="central">Excluded, see 6.2</text></g>
+<g class="c-gray"><rect x="400" y="120" width="240" height="56" rx="4" stroke-width="0.5"/><text class="th" x="520" y="138" text-anchor="middle" dominant-baseline="central">Unknown: immature</text><text class="ts" x="520" y="160" text-anchor="middle" dominant-baseline="central">Wait, or use proxy label</text></g>
+<g class="c-teal"><rect x="400" y="200" width="240" height="56" rx="4" stroke-width="0.5"/><text class="th" x="520" y="218" text-anchor="middle" dominant-baseline="central">Negative</text><text class="ts" x="520" y="240" text-anchor="middle" dominant-baseline="central">Legit order</text></g>
+<g class="c-teal"><rect x="400" y="280" width="240" height="56" rx="4" stroke-width="0.5"/><text class="th" x="520" y="298" text-anchor="middle" dominant-baseline="central">Friendly-fraud label</text><text class="ts" x="520" y="320" text-anchor="middle" dominant-baseline="central">Separate target</text></g>
+<line class="arr" x1="200" y1="98" x2="200" y2="116" marker-end="url(#arrow)"/>
+<line class="arr" x1="200" y1="178" x2="200" y2="196" marker-end="url(#arrow)"/>
+<line class="arr" x1="200" y1="258" x2="200" y2="276" marker-end="url(#arrow)"/>
+<line class="arr" x1="200" y1="338" x2="200" y2="356" marker-end="url(#arrow)"/>
+<text class="ts" x="210" y="107" text-anchor="start" dominant-baseline="central">Yes</text>
+<text class="ts" x="210" y="187" text-anchor="start" dominant-baseline="central">Yes</text>
+<text class="ts" x="210" y="267" text-anchor="start" dominant-baseline="central">Yes</text>
+<text class="ts" x="210" y="347" text-anchor="start" dominant-baseline="central">No</text>
+<line class="arr" x1="342" y1="68" x2="396" y2="68" marker-end="url(#arrow)"/>
+<line class="arr" x1="342" y1="148" x2="396" y2="148" marker-end="url(#arrow)"/>
+<line class="arr" x1="342" y1="228" x2="396" y2="228" marker-end="url(#arrow)"/>
+<line class="arr" x1="342" y1="308" x2="396" y2="308" marker-end="url(#arrow)"/>
+<text class="ts" x="369" y="56" text-anchor="middle" dominant-baseline="central">No</text>
+<text class="ts" x="369" y="136" text-anchor="middle" dominant-baseline="central">No</text>
+<text class="ts" x="369" y="216" text-anchor="middle" dominant-baseline="central">No</text>
+<text class="ts" x="369" y="296" text-anchor="middle" dominant-baseline="central">Yes</text>
+</svg>

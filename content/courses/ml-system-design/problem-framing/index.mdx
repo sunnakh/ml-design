@@ -1,0 +1,61 @@
+---
+title: Problem Framing
+description: Turn a vague ask into a precise, valuable, buildable ML task.
+icon: Target
+---
+
+Problem framing turns a vague business wish into a precise ML task. It has 5 steps, including one gate where you check whether ML is needed at all. Framing badly means everything after it gets built on the wrong target.
+
+<Diagram src="problem-framing/problem-framing-steps.svg" />
+
+## Worked example: "Increase engagement on a video platform"
+
+| Step | Answer |
+|---|---|
+| Business objective | Grow daily watch time and retention |
+| ML needed? | Yes: millions of videos, personal taste, too complex for hand-written rules |
+| ML objective | Maximize P(user watches more than 30s). Don't use clicks, because optimizing clicks rewards clickbait. |
+| Task type | Ranking (a pointwise classifier scores each candidate, then candidates are sorted) |
+| Input → output | (user, video, context) → relevance score. Label = watched or not. |
+
+## Running example: ShopFast
+
+ShopFast is an online marketplace with about $2B/year in orders. Payment fraud (stolen cards, account takeovers) comes back as chargebacks, costing roughly 0.9% of volume, about $18M/year. The Head of Risk says: *"Use ML to stop fraud."*
+
+That sentence isn't a problem you can build against yet. Every part of this topic uses ShopFast to show how it becomes one.
+
+## Topic map
+
+<Diagram src="problem-framing/problem-framing-topic-map.html" />
+
+<Cards>
+  <Card title="1. Objective and decision" href="/courses/ml-system-design/problem-framing/objective-and-decision">
+    Find the decision · Stakeholders and success · Metric hierarchy · Cost of errors
+  </Card>
+  <Card title="2. Feasibility" href="/courses/ml-system-design/problem-framing/feasibility">
+    Non-ML baseline · Learnable signal · Data and label access · ROI and risk
+  </Card>
+  <Card title="3. ML objective" href="/courses/ml-system-design/problem-framing/ml-objective">
+    Proxy metrics · Goodhart and misalignment · Multiple objectives · Short vs long term
+  </Card>
+  <Card title="4. Task formulation" href="/courses/ml-system-design/problem-framing/task-formulation">
+    Task type · Label definition · Prediction unit and horizon · Prediction to action policy
+  </Card>
+  <Card title="5. Framing constraints" href="/courses/ml-system-design/problem-framing/framing-constraints">
+    Latency and serving mode · Scale and cost · Explainability, regulation · Fairness and privacy
+  </Card>
+  <Card title="6. Feedback and dynamics" href="/courses/ml-system-design/problem-framing/feedback-and-dynamics">
+    Delayed labels · Selection bias · Feedback loops · Adversaries and drift
+  </Card>
+</Cards>
+
+## Main traps
+
+- **Proxy mismatch.** The metric the model optimizes (clicks) can diverge from the business goal (satisfaction). Always name the gap out loud.
+- **Skipping the "Is ML needed?" gate.** Rules win when data is thin, logic is simple, or mistakes must be explainable. Rules also make a good baseline later.
+- **Fuzzy label.** "Engaged" is not a label. "Watched more than 30s" is. If you can't say exactly how the label is computed, the framing isn't finished.
+- **Wrong task type.** Recommendations are usually a ranking problem, not a classification one. Fraud detection is classification with heavy class imbalance. The task type drives your loss, metrics and serving setup.
+
+<Callout title="Interview tip">
+  Spend the first 5 minutes asking clarifying questions: who the users are, the scale, what success looks like, and the constraints.
+</Callout>

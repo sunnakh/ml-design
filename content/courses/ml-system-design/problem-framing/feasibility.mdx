@@ -1,0 +1,343 @@
+---
+title: 2. Feasibility
+description: Should this be ML at all, and can it work?
+---
+
+Branch 1 answered *what decision, and what counts as success*. Branch 2 asks: **should this be ML at all, and can it work?** The first question is always what you can get *without* ML.
+
+## 2.1 Non-ML baseline
+
+### What problem it solves
+
+ML value is always **relative**: the improvement over the best simple alternative, not over nothing. Without a measured baseline:
+- You can't prove the model is worth anything.
+- You can't tell whether a mediocre model is a bug or a hard problem.
+- You might build a $2M ML system when a $50k rules cleanup would have captured 80% of the gain.
+
+### How it works: the baseline ladder
+
+Climb one rung at a time. Measure each rung on **the same data, the same time window and the same metric (TCF)**. Climb higher only if the remaining gap pays for the extra complexity.
+
+ShopFast, illustrative TCF per year:
+
+| Rung | Approach | TCF | Gain vs previous rung |
+|---|---|---|---|
+| 0 | No screening (card-network checks only) | ~$45M | — |
+| 1 | Current 40 rules, as-is | ~$27M | $18M |
+| 2 | Cleaned rules + velocity heuristics + **cost-based actions from 1.4** | ~$22M | $5M |
+| 3 | Logistic regression on about 15 features | ~$19M | $3M |
+| 4 | Gradient-boosted trees, rich features | ~$16M | $3M |
+
+- **Rung 2 has no ML in it**, yet captures a big chunk of the gain. Adding step-up and amount-aware thresholds (1.4) helps a lot. Always try it first.
+- **Rung 3 is "cheap ML"**: simple, explainable, a quick pipeline sanity check.
+- **Rung 4** is justified only if its $3M/yr exceeds its cost: infrastructure, team, monitoring and risk (2.4).
+
+"Velocity heuristics" means rules like "more than 3 different cards from the same device in 24h" or "5+ orders from a new account in its first hour". Simple, strong and fast to write.
+
+### Six reasons the baseline stays useful after ML ships
+
+1. **Honest attribution**: the A/B control arm is the baseline.
+2. **Pipeline sanity check**: if a GBDT loses to rules offline, suspect a bug, leakage or broken labels before the problem.
+3. **Fallback**: when the model times out, the rules still decide. Checkout can't just stop.
+4. **Cold start**: a new country with no labels runs on rules first.
+5. **Fast response**: an analyst can write a rule for a new attack in **1 hour**. A model needs new labels, which take **30–120 days** (6.1).
+6. **Hard constraints**: sanctions lists and known stolen cards stay rules forever. Legal requires determinism there.
+
+This leads to the architecture most mature systems use, a **hybrid**:
+
+<Diagram src="problem-framing/hybrid-rules-model-pipeline.svg" />
+
+### Assumptions
+
+- The baseline is **measured the same way** as the model: same metric, time window, population.
+- The baseline is **reasonably tuned**, not a strawman.
+- Historical outcomes allow **fair offline comparison**. Often false, because today's rules decided which orders got labels.
+
+### Design choices
+
+1. **Which rungs to build.** At minimum: current state, a tuned heuristic, and a simple model. Skipping straight to rung 4 is the most common mistake.
+2. **Hybrid layout.** Decide which rules stay *before* the model (hard constraints), which become **features** (a rule firing is often a strong input), and which sit *after* it (fast overrides).
+3. **Rule ownership and expiry.** Every override rule gets an owner and an expiry date (e.g. 30 days), then becomes a feature or is deleted.
+4. **Fail-open vs fail-closed** when the model is down: approve everything (fraud risk) or decline everything (revenue loss)? For ShopFast, neither: fall back to rules.
+
+### Trade-offs
+
+| | Rules | ML |
+|---|---|---|
+| Needs labels | No | Yes, lots |
+| Time to respond to a new attack | Hours | Weeks to months (label lag) |
+| Handles feature interactions | Poorly (rules multiply) | Well |
+| Explainability | Direct | Needs tooling |
+| Maintenance | Rots: 40 rules become 400, overlapping and conflicting | Needs retraining pipeline and monitoring |
+| Output | Binary fire / no-fire | Calibrated probability, which plugs into the 1.4 cost policy |
+
+Neither wins everywhere, which is why the hybrid exists.
+
+### Failure modes
+
+- **Strawman baseline**: comparing against untuned rules or "random" inflates the ML gain.
+- **No baseline measured**: costs go down and nobody knows if it was the model, seasonality or a card-network change.
+- **Labels inherited from rules**: orders the rules declined **never got a label**. The model trains only on orders the rules approved, so the offline comparison is biased and the model partly learns the rules' blind spots (the core of 6.2).
+- **Deleting all rules at ML launch**: you lose the fast-response lever and the fallback.
+- **Rule rot**: override rules never expire and silently fight the model.
+
+### Connections
+
+- **← 1.2**: the baseline field in the success spec comes from this ladder.
+- **← 1.4**: rung 2 reuses the cost matrix with no ML.
+- **→ 2.4 ROI**: the rung 3→4 gap versus its cost is the business case.
+- **→ Evaluation**: the baseline becomes the A/B control arm.
+- **→ Deployment**: the rules fallback is the model's degraded mode.
+
+<Callout title="Exercise 2.1">
+  The ML team says: *"Our GBDT catches 75% of fraud dollars at a 1% decline rate. The current rules catch 60%. We should ship."* Train and test data are last year's orders, labeled from chargebacks. Give two reasons this may overstate the real gain (one involving how labels were produced). Why is "fraud dollars caught at 1% decline rate" still not enough to ship? At launch, which rules would you keep, and in which slot of the hybrid pipeline?
+</Callout>
+
+## 2.2 Learnable signal
+
+### What problem it solves
+
+Part 2.1 asked what you get *without* ML. This part asks whether ML **can** learn anything useful here. If the pattern connecting inputs (x) to target (y) doesn't exist, doesn't last, or is buried in noise, no model will save the project. Find out in **days**, before investing months.
+
+### First principles
+
+A model estimates **P(y | x)**. It is useful only when four conditions hold:
+
+1. **Information**: x tells you something about y, *using only data available at the decision point* (1.1).
+2. **Stability**: the x→y relationship still holds next month.
+3. **Sufficiency**: there are enough examples, especially positives.
+4. **Ceiling**: labels are clean enough that "right" means right.
+
+Each check has a cheap test and a specific fallback if it fails:
+
+<Diagram src="problem-framing/learnable-signal-four-checks.svg" />
+
+### How it works: cheap probes (ShopFast, illustrative)
+
+**1. Information: does x predict y at the decision point?**
+- **Human expert test**: give fraud analysts 500 past orders showing *only checkout-time information*. If they clearly beat chance, there's signal. If they keep saying "I'd need the shipping tracking", the signal lives *after* your decision point: a 1.1 problem, not a modeling one.
+- **Univariate lift**: fraud rate per feature bucket versus the 0.2% base rate:
+
+| Feature (known at checkout) | Fraud rate | Lift |
+|---|---|---|
+| Device used with more than 3 cards in 24h | 6.0% | 30× |
+| Card country ≠ shipping country | 2.8% | 14× |
+| Account younger than 24h | 1.8% | 9× |
+| Returning customer, 10+ orders | 0.02% | 0.1× |
+
+**2. Stability: does the relationship hold?**
+- **Out-of-time test**: train on Jan–Mar; April gives PR-AUC 0.35, July gives 0.27.
+- The signal is real but **decays in months**. Fraudsters adapt. That implies monthly retraining, plus rules for fast-moving attacks (2.1).
+
+**3. Sufficiency: enough data?**
+- About 10M orders/yr × 0.2% = **roughly 20k fraud cases/yr**. The *positives* bind, not total volume.
+- **Learning curve**: train on 10%, 25%, 50% and 100% of data. Still rising at 100% → more data helps. Flat → you need **better features**, not more rows.
+
+**4. Ceiling: are labels trustworthy?**
+- **Label audit**: have experts re-examine 200 chargebacks coded "fraud".
+- ShopFast finds about **25% are "friendly fraud"**: the real cardholder bought, then disputed. Its checkout signal is different (the buyer looks legitimate), it caps accuracy, and it **mixes two targets** into one label.
+- Fix: use chargeback reason codes to separate true fraud from friendly fraud (4.2).
+
+### Assumptions
+
+- **Probe features are point-in-time correct.** Otherwise the probe shows fake signal: leakage.
+- **The past resembles the near future**, apart from measured drift.
+- **Labels mean what you think.** The friendly-fraud audit tests exactly this.
+
+### Design choices
+
+1. **Probe depth.** An afternoon of lift tables, or a two-week prototype. For a $16–27M/yr problem, two weeks is cheap.
+2. **Judge signal where you'll operate.** Only the top ~1–3% of scores trigger action. A model can be weak overall and strong in that slice (1.3).
+3. **Split mixed targets.** Stolen-card fraud and friendly fraud become separate problems. Friendly fraud is often better handled *after* the order (dispute evidence, refund policy).
+
+### Trade-offs
+
+- **Quick vs reliable probe**: lift tables mislead both ways. Leakage looks too good; too few features look too bad.
+- **Weak signal can still pay**: small lift at high volume, or with very uneven error costs (1.4), can be worth millions.
+- **More data vs better features**: the learning curve tells you which. Guessing wastes a quarter.
+
+### Failure modes
+
+- **Leakage mistaken for signal**: "refund issued" or "order cancelled" show 200× lift, but they're consequences of fraud, known only after the decision.
+- **Label-artifact signal**: the model learns "sellers who dispute aggressively", not fraud.
+- **Expert test cheats**: analysts peek at information unavailable at decision time.
+- **Aggregate signal, no actionable signal**: good PR-AUC overall, useless in the top 1%.
+- **Assuming stability**: one quarter's probe extrapolated to a year while attackers adapt (6.4).
+
+### Connections
+
+- **← 1.1**: the decision point defines which x is legal.
+- **← 1.3**: judge signal at the operating point.
+- **→ 2.3**: the probe shows *what* data you need; 2.3 asks if you can get it.
+- **→ 2.4**: estimated lift over rung 2 feeds the ROI.
+- **→ 4.2**: friendly fraud forces a label redefinition.
+- **→ 6.4 / Monitoring**: out-of-time decay sets retraining cadence and what you monitor.
+
+<Callout title="Exercise 2.2">
+  The lift probe shows **(a)** "failed payment attempts in this checkout session": 40× lift, and **(b)** "order later refunded": 200× lift. Which is usable, which is leakage, and why? Out-of-time PR-AUC drops from 0.35 to 0.27 over 3 months: name one design consequence. Friendly fraud is 25% of chargebacks: should the checkout model catch it? If not, which decision and decision point fit better?
+</Callout>
+
+## 2.3 Data and label access
+
+### What problem it solves
+
+Part 2.2 showed the signal exists *somewhere*. Part 2.3 asks: **can you get that data where and when the model needs it, legally and reliably, and get labels fast enough to learn from?**
+
+Many projects die here: data in the warehouse can't be served within 100 ms, history was overwritten, the vendor contract forbids the use, or labels arrive four months late. There are two halves: **feature access** (x) and **label access** (y).
+
+### Part A: feature access
+
+For every candidate source, answer six questions:
+
+1. **Exists before the decision?** The 1.1 point-in-time check.
+2. **Serving path**: an online low-latency store, or only a nightly batch table?
+3. **Freshness**: is yesterday's data good enough, or do you need the last 60 seconds?
+4. **Historical reconstruction**: can you rebuild the value *as it was at each past order*?
+5. **Legal / contract**: are you allowed to use it for this purpose?
+6. **Owner and SLA**: who fixes it at 3 AM? What happens when the schema changes?
+
+ShopFast data inventory:
+
+| Source | At checkout? | Serving | History | Legal | Verdict |
+|---|---|---|---|---|---|
+| Order and cart | Yes | Online, in-request | Full event log | OK | Use |
+| Account profile | Yes | Online DB | **Overwritten**: only current email/address | OK | Use, but add a change log now |
+| Device fingerprint (vendor) | Yes | API, **+40 ms** | Only since the contract, 6 months ago | Contract allows fraud use | Use, watch latency and cost |
+| Velocity counters (cards per device, 24h) | Yes | **Doesn't exist yet**: needs streaming | Rebuildable from event logs | OK | Build |
+| Support tickets | Batch, nightly | Warehouse only | Yes | Consent for this purpose unclear | Skip for v1 |
+| Card authorization result | **No**: comes after the decision | — | — | — | Leakage, exclude |
+
+### Part B: label access
+
+Labels come from several sources with different **speed, coverage and quality**:
+
+<Diagram src="problem-framing/label-arrival-timeline.svg" />
+
+Four label problems to plan for:
+- **Latency**: a chargeback can arrive up to 120 days later. An order from last week with no chargeback is **not yet known to be clean**; it's *unlabeled so far*.
+- **Coverage**: only *approved* orders can produce a chargeback. Declined orders never get labeled (6.2).
+- **Quality**: friendly fraud is mixed in (2.2), and reviewers disagree.
+- **Volume**: about 20k positives/year: enough for trees, thin for rare fraud subtypes.
+
+### Assumptions
+
+- **Training data is computed the same way as serving data**: same logic, same point in time.
+- **Labels mean the same thing over time**: reason codes and processor rules don't silently change.
+- **Access persists**: vendor contract, consent basis and upstream schemas stay stable.
+
+### Design choices
+
+1. **Log features at serving time.** Store the exact feature values the model saw, for every order, from **day 1, even before a model exists**. Removes training/serving differences and builds history for free; new features have no history until logged for months. The alternative, **backfilling** from raw logs, is faster to start but easy to get wrong.
+2. **Label maturity window.** Train only on orders older than ~90–120 days (accurate but stale); use newer orders with a correction for chargebacks not yet arrived (fresher but biased); or use issuer fraud alerts as fast **proxy labels** and chargebacks as final truth. Most systems combine these.
+3. **Exploration traffic.** Approve a tiny random slice of orders the model would decline, purely to get labels there. Costs fraud losses, buys visibility (6.2).
+4. **Build vs buy data.** A vendor fingerprint is fast but adds dependency, latency and per-call cost. Building your own is slow but under your control.
+
+### Trade-offs
+
+- **Freshness vs label completeness**: recent data catches new attacks with incomplete labels; mature data has right labels but old patterns. Fraud is adversarial (6.4), so staleness hurts.
+- **Online vs batch features**: streaming velocity counters cost real infrastructure; nightly counts are cheap but miss an attack happening *now*. Fraud rings strike in minutes, so streaming usually wins.
+- **More sources vs reliability**: every source is one more thing that can fail during checkout.
+
+### Failure modes
+
+- **Training/serving skew.** "Account age" computed in training as *today − created_at* instead of *order_time − created_at*. Offline every account looks old; in production new accounts get values the model never saw. Silent failure.
+- **Immature labels treated as negatives.** Recent orders without a chargeback yet get labeled "legit", teaching the model recent patterns are safe.
+- **Overwritten history.** Only the current email is kept, so "email changed within 24h before the order" (a strong takeover signal) can't be built for the past.
+- **Late legal surprise.** Consent or contract problems found after launch force a rip-out.
+- **Upstream outage.** The vendor API times out, the feature goes null, and the model sees an input it never trained on. Every feature needs an explicit **missing-value plan**.
+
+### Connections
+
+- **← 1.1**: the decision point defines legal features.
+- **← 2.2**: the probe showed which sources matter.
+- **→ 2.4**: data costs (vendor fees, streaming infrastructure) go into ROI.
+- **→ 5.1**: vendor latency eats into the latency budget.
+- **→ 5.4**: consent, purpose limitation, PII.
+- **→ 6.1 / 6.2**: label delay and missing labels on declined orders.
+- **→ Data and Features stages**: feature logging, point-in-time joins, feature stores.
+
+<Callout title="Exercise 2.3">
+  A data scientist computes "account age in days" for training as *today − account_created*. What goes wrong in production, and what's the fix? The training set includes orders up to last week, labeled 1 if a chargeback was received, else 0: what bias does this create, and one fix? The device-fingerprint vendor costs $0.01 per call and adds 40 ms: should you call it on every order? Propose a policy using expected cost (when does extra information change the action?).
+</Callout>
+
+## 2.4 ROI and risk
+
+### What problem it solves
+
+You know there's signal (2.2) and that you can get the data (2.3). The last feasibility question: **is building this worth it, compared with every alternative, including doing something else?** And what could go wrong? This is the go / no-go and scoping decision. Without it, teams build systems that never pay back, or never get killed.
+
+### How it works
+
+**Step 1: Measure benefit against the best non-ML option, not the current state.** The rules cleanup (rung 2) gets $27M → $22M with no ML. **ML gets credit only for going beyond $22M.**
+
+| Option | TCF | Gross ML benefit vs rung 2 |
+|---|---|---|
+| Rung 3: logistic regression | $19M | $3M/yr |
+| Rung 4: gradient-boosted trees | $16M | $6M/yr |
+
+**Step 2: Apply haircuts for optimism.** Offline estimates run high because of label selection bias (2.1), offline–online gaps (1.3) and drift (2.2).
+
+**Step 3: Count all costs**, including ones that recur forever. ShopFast trees case, risk-adjusted:
+
+| Line | Value | Note |
+|---|---|---|
+| Gross offline benefit | $6.0M/yr | vs rung 2 |
+| × offline→online haircut (0.6) | $3.6M | Typical when labels are biased |
+| × probability of success (0.7) | $2.5M | It might not work at all |
+| − run cost | −$0.9M/yr | Infrastructure $0.3M + vendor $0.1M + 2 people $0.5M |
+| **Expected net** | **≈ $1.6M/yr** | |
+| One-time build cost | ≈ $0.5M | 4 engineers × 6 months |
+
+**Step 4: Time to value.** Six months of building plus about **four months for the A/B test to mature** (chargebacks lag up to 120 days). Real value is proven **about 10 months out**. Tell stakeholders up front.
+
+**Step 5: Compare scopes and alternatives.**
+- **Staged**: ship logistic regression first. It validates the whole pipeline (feature logging, serving, fallback, A/B) and captures about half the value; then upgrade to trees on the same infrastructure. Most build cost is the pipeline, not the model.
+- **Buy**: third-party fraud-scoring vendors offer a per-transaction fee and fast launch.
+- **Opportunity cost**: what else could the same 4 engineers build?
+
+**Step 6: Build a risk register**: what could go wrong, how likely, how bad, and the mitigation.
+
+<Diagram src="problem-framing/risk-matrix.svg" />
+
+Every risk needs a **named owner**. A risk without an owner hasn't really been mitigated.
+
+### Assumptions
+
+- Haircuts are **roughly right**. Calibrate them on past launches if you have any.
+- Costs are **complete**: maintenance, on-call and retraining go on forever.
+- Stakeholders accept **risk-adjusted** numbers rather than the headline offline number.
+
+### Design choices
+
+1. **Scope**: staged vs big-bang. Staged is usually right when label lag is long, since each stage is a full A/B cycle you'd wait for anyway.
+2. **Build vs buy vs hybrid**: a vendor score can also become **one feature** inside your own model.
+3. **Kill criteria**: written *before* the build, taken from 1.2.
+4. **How conservative the haircuts are**: set by the cost of a wrong "go" versus a wrong "no-go".
+
+### Trade-offs
+
+- **Ambitious vs staged scope**: more value and risk with later payoff, versus less value proven sooner.
+- **Buy vs build**: vendors are fast and have cross-merchant data, but are generic (they don't know your cost matrix), opaque, and a dependency. Building gives control, at the cost of time and people.
+- **Conservative vs optimistic estimates**: too conservative kills good projects, too optimistic funds failures. Publish ranges, not single numbers.
+
+### Failure modes
+
+- **Crediting ML with the rules cleanup**: measuring against rung 1 instead of rung 2 inflates ROI by $5M/yr.
+- **Ignoring run costs**: ML systems are a loan you keep paying.
+- **Ignoring time to value**: promising results "next quarter" when labels need 120 days.
+- **Offline estimate taken at face value**: $6M becomes $2M online, and the project looks like a failure against an inflated promise.
+- **Zombie project**: no kill criteria, so it drifts on at 60% of the promise forever.
+- **Unowned risks**: "we'll handle fairness later", and later arrives as a regulator's letter.
+
+### Connections
+
+- **← 1.2**: kill criteria and decision rights come from the success spec.
+- **← 2.1**: benefit is measured against rung 2.
+- **← 2.2 / 2.3**: signal estimate and data costs feed the numbers.
+- **→ Branch 5**: constraints (latency, fairness, regulation) are risks with vetoes.
+- **→ 6.4**: adversarial risk means recurring cost.
+- **→ Evaluation**: the staged A/B plan *is* the risk mitigation.
+
+<Callout title="Exercise 2.4: branch 2 checkpoint">
+  A vendor pitches a fraud score: **$0.03 per order** ($300k/yr), live in **6 weeks**, claims TCF drops to **$18M**, black-box scores with unknown calibration. Your own trees option: expected TCF $16M, ~$0.9M/yr to run, 10 months to proven value. Build, buy, or combine? Justify with risk-adjusted thinking (does the vendor's claim need a haircut too?). Name two non-financial risks of buying. What single measurement would you insist on before signing?
+</Callout>

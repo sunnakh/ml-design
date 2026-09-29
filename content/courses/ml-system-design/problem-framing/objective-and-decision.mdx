@@ -1,0 +1,329 @@
+---
+title: 1. Objective and decision
+description: Find the decision a prediction will change, agree on what success means, and price the errors.
+---
+
+## 1.1 Find the decision
+
+### What problem it solves
+
+A prediction is only worth something if it changes a decision. The model's value is the outcome gain from changing that decision compared with today's default. Before modeling, pin down who decides, what the choices are, when the decision happens, and what is known at that moment.
+
+### How it works
+
+Look at every point in the process where a decision could use a prediction. For ShopFast's fraud problem:
+
+<Diagram src="problem-framing/decision-points-timeline.svg" />
+
+This is the central tension: **acting later means knowing more but being able to prevent less.** After delivery you know the truth, but the goods are already gone.
+
+ShopFast picks the **checkout decision**. Most of the loss can still be prevented there, and it runs on every order.
+
+| Question | ShopFast answer |
+|---|---|
+| Who decides | The payment service, automatically |
+| Choices | Approve / step-up (3DS or OTP) / decline / send to manual review |
+| When | Inside the checkout request, before card authorization |
+| Known then | Account, device, cart, card BIN, address, past behavior. *Not* the auth result or shipping events |
+| Default today | About 40 hand-written rules plus the card network's own checks |
+
+### Assumptions
+
+- **The decision repeats at high volume.** ML pays off by amortizing over millions of decisions. A decision made 50 times a year belongs to a human analyst.
+- **The action actually changes the outcome.** Declining a fraudulent order prevents the loss. Predicting weather doesn't change the weather.
+- **Someone owns the action and will execute it.** Risk ops has to trust the system and wire it into checkout.
+- **A baseline policy exists that you can measure against.** Here it's the rules.
+
+### Design choices
+
+1. **Decision point.** It sets your information, latency and preventable loss all at once. You can use **several points**: a cheap checkout model plus a richer pre-shipment review for the grey zone. Most mature fraud systems work this way.
+2. **Action space.** A binary approve/decline makes every false positive a lost customer. Adding **step-up** (3DS) gives a cheap middle action: fraudsters usually fail it and good users mostly pass. A richer action space lowers the cost of uncertainty.
+3. **Automation level.** Full automation, human review of flagged orders, or a mix.
+
+### Trade-offs
+
+- **Early vs late**: less information and more preventable loss, versus more information and less preventable loss.
+- **Richer actions vs simplicity**: more actions give better outcomes but bring more thresholds to tune and harder evaluation.
+- **Human review vs automation**: reviewers are accurate but **capacity-bound**. If the team can review 2,000 orders/day, the problem changes from "classify fraud" to "rank orders and send the top 2,000." The decision shapes the task (see 4.1 and 4.4).
+
+### Failure modes
+
+- **Dashboard model**: the score goes on a dashboard and no workflow consumes it. Accuracy with zero value.
+- **Time-travel features**: a checkout model trained on data that only exists later, such as the auth result. It looks brilliant offline and fails in production. This is leakage caused by a decision point you never pinned down.
+- **Ignoring the default policy**: "the model catches 80% of fraud," but the rules already caught 60%. The real gain is the difference.
+- **Blind spot from your own actions**: once you decline an order, you never learn whether it was fraud. The label disappears (see 6.2).
+
+### Connections
+
+- **Decision point → latency and serving**: checkout means a synchronous call with roughly a 100 ms budget.
+- **What's known then → data and features**: features must be point-in-time correct.
+- **Action space → policy layer** (4.4): the model gives a score, and thresholds map scores to actions.
+- **Actions → labels** (6.1, 6.2): what you do decides which labels you'll ever see.
+- **Default policy → evaluation**: the baseline you A/B test against.
+
+<Callout title="Exercise 1.1">
+  ShopFast's ops lead asks: *"Build a model that predicts which orders will be delivered late."* List at least 2 decisions this prediction could drive and who owns each. Pick one and give its decision point, action space, what's known then, and today's default. Name one way the model could be accurate and still create zero or negative value.
+</Callout>
+
+## 1.2 Stakeholders and success
+
+### What problem it solves
+
+Several people care about the decision, and they want different things. If you don't settle that up front, the project can never be declared done or killed, the model gets tuned to whoever complains loudest, or a stakeholder you never asked blocks the launch. Success needs to be a **written, measurable contract** before modeling starts.
+
+### How it works
+
+**Step 1: Map the stakeholders.** For each one, ask what they want, what they fear, what they can veto, and who bears the cost.
+
+| Stakeholder | Wants | Fears / can veto |
+|---|---|---|
+| Head of Risk | Fewer chargebacks | Chargeback rate crossing card-network penalty thresholds |
+| Growth / Product | High conversion | False declines of good buyers |
+| Finance | Net $ impact | Unmeasurable claims |
+| Good buyers | Frictionless checkout | Wrongful decline, extra 3DS step |
+| Sellers | Get paid | Depends on who bears the fraud loss |
+| Review ops | A manageable queue | More than about 2,000 cases/day |
+| Legal / compliance | Regulatory fit (e.g., EU strong customer authentication) | Unexplainable declines |
+| Payments engineering | Reliable checkout | Latency; the model going down |
+
+**Step 2: Find the conflicts.** The main one is Risk (fewer fraud losses) against Growth (fewer false declines).
+
+<Diagram src="problem-framing/stakeholder-tension.svg" />
+
+**Step 3: Convert the conflict into a common currency.**
+
+> **Total cost of fraud (TCF)** = fraud losses + chargeback fees + margin lost on falsely declined good orders + manual review cost + sales lost when step-up makes buyers abandon
+
+Risk and Growth now argue about one number. The disagreement moves to something you can discuss: *what is a falsely declined customer worth?* That becomes a documented assumption.
+
+**Step 4: Write the success spec.**
+
+| Field | ShopFast v1 |
+|---|---|
+| Objective | Reduce TCF |
+| Baseline | TCF under the current rules, over the last full quarter |
+| Target | −20% TCF within 2 quarters of launch |
+| Guardrails | Approval rate ≥ baseline − 0.2pp; chargeback rate below the network threshold; p99 latency < 100 ms; review queue ≤ 2,000/day |
+| Measured how | A/B test against the rules, with a random holdout |
+| Measured when | Chargebacks arrive 30–120 days later: early readouts on leading indicators, final readout at 120 days |
+| Kill criteria | No significant TCF reduction by the final readout, or any guardrail breached for more than 1 week |
+| Decision rights | Risk owns thresholds within the guardrails; changing a guardrail needs Growth and Risk to sign off together |
+
+### Assumptions
+
+- Costs can be **estimated in dollars** with acceptable uncertainty.
+- The stakeholder list is **complete**. The missing stakeholder is the classic surprise.
+- Stakeholders will **accept a trade-off rate**: a stated $ value for a false decline.
+- Success can be **observed within a time window** the business will tolerate.
+
+### Design choices
+
+1. **One combined objective vs a main metric plus guardrails.** Most real systems use both: one dollar objective plus hard guardrails for things that shouldn't be traded at any price (regulation, latency).
+2. **Valuing a false decline: margin vs lifetime value.** Lifetime value is more correct, since declined good customers often never return, but harder to estimate and easier to dispute.
+3. **Who holds decision rights.** Decide before launch, not during the first incident.
+
+### Trade-offs
+
+- **Putting dollars on everything** makes value judgments explicit and comparable, and also contestable. That's still better than hidden disagreement.
+- **Tight guardrails** protect stakeholders but can block net-positive trades. Loose guardrails provide little protection.
+- **Short vs long measurement window**: fast decisions vs trustworthy decisions. Fraud labels are slow (see 6.1).
+
+### Failure modes
+
+- **Asymmetric visibility.** Fraud losses show up on finance reports every month. False declines show up **nowhere**: a declined good customer just leaves. Organizations over-block for years and believe it's working. Fix: measure false declines deliberately, for example by approving a small random sample of orders the model would decline.
+- **Success defined as a model metric.** "Ship when AUC > 0.95" says nothing about dollars, thresholds or the baseline.
+- **Missing stakeholder.** Legal finds a regulatory issue after launch, or sellers who bear the losses rebel.
+- **Moving goalposts.** The target shifts after results come in.
+- **Unmeasurable-in-time success.** A 120-day label lag with no leading indicators means flying blind for a quarter.
+
+### Connections
+
+- **→ 1.3 Metric hierarchy**: TCF becomes the top metric; guardrails become formal constraints.
+- **→ 1.4 Cost of errors**: the TCF terms *are* the costs of false positives and false negatives.
+- **→ 4.4 Action policy**: thresholds get set by minimizing TCF under the guardrails.
+- **→ Evaluation**: the success spec *is* the A/B test plan.
+
+<Callout title="Exercise 1.2">
+  Risk added a rule: *"decline if shipping country ≠ card country and order > $300."* Fraud losses fell from $4.5M to $3.9M for the quarter. Growth says conversion "feels lower." What data would you need to decide if the rule was net positive? Write the TCF inequality that must hold. Which failure mode is most likely at play, and how would you fix it?
+</Callout>
+
+## 1.3 Metric hierarchy
+
+### What problem it solves
+
+Part 1.2 produced one success metric (TCF). But TCF takes **120 days** to measure, because chargebacks arrive slowly. You can't wait a quarter to know whether yesterday's model was better. You need faster metrics that *stand in* for TCF, and you need to know how far to trust each one.
+
+A metric hierarchy orders your metrics from **closest to real value (slow, expensive)** down to **fastest feedback (cheap, less faithful)**. Each layer is a proxy for the layer above it.
+
+<Diagram src="problem-framing/metric-hierarchy-pyramid.svg" />
+
+### How it works: each layer for ShopFast
+
+**L1 Business outcome (north star).** TCF, defined in 1.2. There is exactly one north star, and it's the final judge of every model version. It is lagging: the final readout comes about 120 days after launch.
+
+**L2 Online product metrics.** Measured in the A/B test, per arm, within days to weeks:
+- Approval rate, decline rate, step-up rate and step-up pass rate
+- Chargeback rate in basis points (lagging too, but partial counts come in weekly)
+- **Leading fraud indicators**: fraud alerts from card issuers and cardholder "I didn't make this purchase" reports arrive in days, not months. These are your early read on L1.
+- Manual review queue size and review hit rate (the % of reviewed orders that turn out to be fraud)
+
+**L3 Offline model metrics.** Computed on historical data before anything ships:
+- **PR-AUC, not ROC-AUC.** Fraud is about 0.2% of orders. ROC-AUC looks great under heavy class imbalance even when the model is useless in practice.
+- **Recall at the operating point**: "At a 1% decline rate, what % of fraud do we catch?" This is the only region of the curve you'll actually use.
+- **Dollar-weighted recall**: catching one $2,000 fraud matters more than catching ten $20 ones. Plain recall counts orders; TCF counts dollars.
+- **Calibration**: does a score of 0.3 mean a 30% chance of fraud? Required because the threshold logic in 4.4 uses *expected cost = p(fraud) × amount*.
+- Always evaluated on an **out-of-time** holdout (train on Jan–Jun, test on Jul), never a random split. Fraud patterns shift over time.
+
+**L0 (below the pyramid): training loss.** Log loss is what the model actually minimizes. It is yet another proxy, one level below L3. Loss ≠ metric ≠ business value (see 3.1).
+
+**L4 System health.** Real-time checks for whether the system works at all: p99 latency, timeout rate, feature null and staleness rates, score distribution drift, and decline rate by segment.
+
+**Guardrails.** These cut across layers. They are metrics with **veto power**: not optimized, never breached. ShopFast has approval rate ≥ baseline − 0.2pp, chargeback rate below the network threshold, p99 < 100 ms, review queue ≤ 2,000/day, and no segment (country, new users) with a decline rate more than 2× its baseline.
+
+### The rule that holds it together
+
+> Each layer is only trustworthy if **moving it has been shown to move the layer above.**
+
+Validate this with history. Across past launches, did gains in offline dollar-recall predict online TCF gains? If they did, you can trust L3 for fast iteration. If they didn't, your offline metric is lying, and you must fix it before iterating.
+
+### Assumptions
+
+- The layers are **correlated**: improving a lower layer tends to improve the one above.
+- The offline data **represents** production traffic. Selection bias (6.2) and drift (6.4) break this.
+- Leading indicators (issuer fraud alerts) **track** final chargebacks closely enough.
+
+### Design choices
+
+1. **Threshold-free vs operating-point offline metrics.** PR-AUC summarizes the whole curve, good for comparing models early. Recall-at-FPR looks only where you'll operate, good for ship decisions. Use both, and let the operating-point metric decide.
+2. **Count-weighted vs dollar-weighted.** Match whatever the north star counts.
+3. **How many guardrails.** Use 3–5. Each extra guardrail is one more way for a net-positive change to be blocked.
+4. **Segment-level reporting.** Report metrics per country, per new vs returning user and per payment method, not just overall.
+
+### Trade-offs
+
+- **Speed vs fidelity**: every step down the pyramid gives faster iteration and less truth. Fast iteration on a misaligned metric is fast progress in the wrong direction.
+- **Many metrics vs decisiveness**: 20 dashboards mean some metric always looks bad, so nothing ships, or someone cherry-picks.
+- **Composite vs separate metrics**: TCF combines costs into one number, which is decisive but hides which part moved. Always report its components alongside it.
+
+### Failure modes
+
+- **The ROC-AUC trap**: model A has 0.98 AUC and still catches less fraud at a 1% decline rate than model B at 0.96. The high AUC came from easy separation of obviously good orders, a region you never operate in.
+- **Offline–online gap**: offline recall improves but online TCF doesn't. Common causes: leakage, selection bias in labels, or a shifted operating point.
+- **Vanity metric**: "Fraud caught is up 30%!" only because the model declines more of *everything*. Pair any fraud-caught metric with its false-decline cost.
+- **Simpson's paradox / hidden segments**: overall metrics improve while new users in Brazil get declined 5× more often. Segment guardrails catch this.
+- **Guardrail creep**: 15 guardrails, each with a veto, and nothing ever ships.
+
+### Connections
+
+- **→ 1.4 Cost of errors**: supplies the dollar weights for L3 and the TCF terms.
+- **→ 3.1 Proxy metrics**: L0 and L3 are ML-side proxies.
+- **→ 4.4 Action policy**: calibration at L3 makes cost-based thresholds possible.
+- **→ Evaluation**: L3 is offline evaluation; L2 plus guardrails are the A/B plan.
+- **→ Monitoring**: L4 is on-call alerting; L2 over time is drift detection.
+
+<Callout title="Exercise 1.3">
+  Two models on an out-of-time holdout. **Model A:** ROC-AUC 0.981, PR-AUC 0.44, fraud $ caught at 1% decline rate 61%, calibration error low. **Model B:** ROC-AUC 0.964, PR-AUC 0.51, fraud $ caught 68%, calibration error high. Which goes to the A/B test, and why? Name one specific reason it could still lose online.
+</Callout>
+
+## 1.4 Cost of errors
+
+### What problem it solves
+
+Every model is wrong sometimes. The question is **which mistakes, and at what price.** In fraud they are wildly unequal:
+- Missing a $2,000 fraud costs about $2,000.
+- Wrongly declining a $20 order from a good customer costs a few dollars of margin, plus maybe that customer.
+
+"Maximize accuracy" treats every error the same. A model that approves everything has 99.8% accuracy and loses all $18M.
+
+This part turns the TCF terms from 1.2 into a **cost matrix**. The system then picks the action with the lowest *expected* cost for each order.
+
+### How it works
+
+**Step 1: Build a cost matrix**, one row per action and one column per true state. ShopFast, with order amount = A:
+
+| Action ↓ / Truth → | Fraud | Legit |
+|---|---|---|
+| Approve | A + $15 chargeback fee | $0 |
+| Decline | $0 | 0.1·A margin + $20 expected lost future value |
+| Step-up (3DS) | ~15% of fraudsters pass, so 0.15·(A + 15) | ~10% of good buyers abandon, so 0.1·(0.1·A + 20) |
+| Manual review | $3 reviewer + 10% missed, so 3 + 0.1·(A + 15) | $3 reviewer |
+
+(Fraud that passes 3DS often shifts liability to the card issuer, lowering ShopFast's cost further. Costs depend on *who bears the loss*: 1.2's stakeholder question coming back.)
+
+**Step 2: Compute expected cost** for each action:
+
+> E[cost(action)] = p · C(action, fraud) + (1 − p) · C(action, legit)
+
+**Step 3: Pick the cheapest feasible action.** The model only supplies **p**. The costs and the choice live in a separate policy layer:
+
+<Diagram src="problem-framing/score-to-action-cost-matrix.svg" />
+
+**Worked example: a $200 order with p = 0.05**
+
+| Action | Expected cost |
+|---|---|
+| Approve | 0.05 × 215 = **$10.75** |
+| Decline | 0.95 × 40 = **$38.00** |
+| Step-up | 0.05 × 32.25 + 0.95 × 4 = **$5.41** |
+| Review | 0.05 × 24.5 + 0.95 × 3 = **$4.08** (if capacity is left) |
+
+A 5% fraud risk looks "safe" if you think in accuracy, and declining looks "safe" if you think in fraud. Both are wrong. The cheap middle actions win.
+
+**The key insight: the threshold depends on the amount.** Break-even points using approve / step-up / decline (review is capacity-limited):
+
+| Order amount | Approve below p = | Step-up between | Decline above p = |
+|---|---|---|---|
+| $20 | 6.9% | 6.9% – 79% | 79% |
+| $200 | 2.1% | 2.1% – 53% | 53% |
+| $2,000 | 1.3% | 1.3% – 40% | 40% |
+
+Big orders get stricter treatment automatically. A single global "decline if score > 0.5" is wrong for almost every order.
+
+**Handling capacity.** Review costs $3 but is limited to about 2,000 orders/day. Rank orders by **savings from review versus their next-best action** and send the top 2,000. This is 1.1's capacity-bound ranking, now with a formula.
+
+### Assumptions
+
+- **p is calibrated.** A score of 0.05 really means a 5% fraud rate. The math breaks without it (hence calibration in 1.3).
+- **Costs can be estimated** and stay stable for weeks.
+- **Decisions are independent**, except where capacity couples them.
+- **Costs are known at decision time.** The amount is; a good customer's lifetime value has to be estimated.
+
+### Design choices
+
+1. **Costs in the policy layer vs in training.** *Post-hoc*: train a calibrated probability model, then apply costs in the policy layer. *Cost-sensitive training*: weight the loss by cost. Recommended default: post-hoc, so the business can change costs (a new fee, a new liability rule) **without retraining**. Cost-sensitive training can help when model capacity is limited and you want focus on high-cost regions.
+2. **Fixed vs per-instance costs.** Per-instance (depending on amount) is optimal but harder to explain and audit.
+3. **Margin vs lifetime value** for false declines, set in 1.2 and now a coefficient.
+4. **Who bears the cost.** Liability rules (3DS shift, seller-borne losses) change the matrix directly.
+
+### Trade-offs
+
+- **Precise costs vs effort**: estimating lifetime value, abandonment and 3DS pass rates takes experiments. Rough, directionally right costs beat a perfect "accuracy" objective.
+- **Optimal vs explainable**: "Why was my $2,100 order declined when my $1,900 one wasn't?" is a harder conversation with Legal (5.3).
+- **Richer actions vs harder estimation**: every new action adds a row whose costs you must measure.
+
+### Failure modes
+
+- **Accuracy as the objective**: approve everything, 99.8% accuracy, $18M lost.
+- **Uncalibrated scores in the cost formula**: expected costs and actions come out wrong, silently.
+- **Stale costs**: fees and liability rules change; the matrix is still last year's.
+- **Seams attackers exploit**: amount-dependent thresholds create boundaries. Fraudsters learn orders under $X get approved and split big orders into small ones (6.4).
+- **Unpriced costs**: reputational or regulatory harm can't be put in dollars. Those become **guardrails** (1.3), not matrix entries.
+
+### Connections
+
+- **→ 1.3**: dollar-weighted metrics use these costs; calibration becomes required.
+- **→ 2.4 ROI**: expected savings under the matrix, versus today's rules, is the business case.
+- **→ 3.3 Multiple objectives**: the matrix is one way to combine objectives into one number.
+- **→ 4.4 Action policy**: this *is* the policy layer; 4.4 adds exploration and threshold operations.
+- **→ 6.4 Adversaries**: attackers optimize against your cost boundaries.
+
+## Branch 1 checkpoint
+
+This tests all of branch 1 on a **new problem**: transfer, not recall.
+
+> **FoodDash**, a food-delivery app, sees customers claim "items missing" to get refunds they don't deserve. The ask: *"Use ML to reduce refund abuse."*
+
+1. **(1.1)** Name the decision, its decision point and its action space (at least 3 actions).
+2. **(1.2)** Name two stakeholders who conflict, and the common currency that resolves it.
+3. **(1.3)** Give one north-star metric, one fast leading indicator and one guardrail.
+4. **(1.4)** Fill in the cost matrix for **approve refund vs deny refund** against **abuse vs genuine**. What makes the false-positive cost larger than it first looks?

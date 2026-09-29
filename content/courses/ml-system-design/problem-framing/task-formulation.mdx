@@ -1,0 +1,418 @@
+---
+title: 4. Task formulation
+description: Turn the objective into a concrete ML task with a label, a unit and an action policy.
+---
+
+## 4.1 Task type
+
+### What problem it solves
+
+"Stop fraud" can be turned into at least seven different ML tasks. Each implies different labels, losses, evaluation, serving and failure modes. Picking the task type by habit ("fraud → binary classifier") is how teams end up adjusting a threshold every morning to hit a queue size, or feeding uncalibrated ranking scores into a cost formula.
+
+The key idea is that the **task type follows from three things you already decided**:
+1. **The decision and action space** (1.1): what the output must drive.
+2. **What the policy consumes** (1.4): calibrated probabilities, an ordering, or categories.
+3. **Label availability** (2.3): whether you have enough labels, and at what granularity.
+
+### How it works: the task-type menu
+
+| Task type | Output | Fits when |
+|---|---|---|
+| **Binary classification** | Calibrated p(fraud) | One kind of target; a cost policy consumes p |
+| **Multi-class / multi-task** | p per fraud type | Different types need different actions |
+| **Regression** | Expected $ loss | Rarely the best choice; outliers dominate (3.1) |
+| **Ranking / top-K** | An ordering | A capacity-limited action (review queue) |
+| **Anomaly detection** | An "unusualness" score | No labels, or novel attacks |
+| **Graph-based** | Risk per entity or cluster | Coordinated fraud rings |
+| **Contextual bandit** | Chooses the action directly | Actions change what you learn (6.2) |
+
+Two of these describe **input structure**, not output:
+- **Graph**: relationships between accounts, cards and devices.
+- **Sequence**: session clickstreams.
+
+They combine with any output type. **Task type is also not the same as architecture**: gradient-boosted trees can do classification, ranking or regression.
+
+A simple decision path for choosing the output type:
+
+<Diagram src="problem-framing/choosing-ml-task-type-decision-path.svg" />
+
+### ShopFast's answer is a portfolio, not one task
+
+Different decisions get different task types:
+
+| Decision | Task type | Why |
+|---|---|---|
+| Checkout: approve / step-up / decline | **Multi-task classification**: calibrated heads for stolen card and account takeover | The cost policy needs calibrated p (1.4); account takeover warrants a different action (lock the account, reset credentials) |
+| Which 2,000 orders reviewers see | **Ranking by expected review savings** | Capacity is fixed, so ordering is what matters |
+| Fraud rings (many accounts sharing devices and cards) | **Graph-based**, nightly batch, output fed in as a checkout *feature* | Rings are invisible when you look at one order at a time |
+| New attacks with no labels yet | **Anomaly detection**, feeding analyst alerts and a feature | Chargebacks for a new pattern arrive 30–120 days late (2.3) |
+| Friendly fraud | **Separate post-order model** (4.2) | Different signal, different decision point (2.2) |
+
+Note the pattern: expensive or batch tasks (graph, anomaly) often produce **features for the real-time model** instead of making decisions themselves.
+
+### Assumptions
+
+- The task output **matches what the consumer needs**: probability, ordering or category.
+- Labels exist at the **granularity** the task needs. Multi-class needs reliable subtype labels, e.g., usable chargeback reason codes.
+- The task setup is **stable**. If capacity changes daily, the ranking cutoff has to adapt with it.
+
+### Design choices
+
+1. **One model vs a portfolio.** One model is simple but misfits some decisions; a portfolio fits each decision and multiplies maintenance.
+2. **Supervised + unsupervised hybrid.** Supervised models for known fraud, anomaly detection for novel fraud. Anomaly output feeds analysts and features, never directly decides.
+3. **Classification vs ranking for the review queue.** A calibrated classifier can also rank, and rank by expected savings (p × amount-dependent cost). One model serving both uses is often the simplest path.
+4. **Model the outcome vs model the decision.** Classification predicts fraud, and the policy decides. A bandit learns which action is best directly. That's powerful when your actions hide labels (6.2), but much harder to build and evaluate.
+
+### Trade-offs
+
+- **Binary vs multi-class**: simple and robust vs richer but hungry for labels. Rare subtypes may have only hundreds of positives.
+- **Ranking vs calibrated classification**: a pure ranking loss can order orders well, but **can't feed a cost policy** because its scores mean nothing in dollars.
+- **Anomaly detection**: finds novel patterns, but **"unusual" isn't "fraud."** Travelers, big gift purchases and new devices are all unusual and legitimate. It's also hard to evaluate, because there are no labels by definition.
+- **Graph**: catches rings, but it's computationally heavy, usually batch, and needs entity resolution (deciding which accounts are "the same person").
+
+### Failure modes
+
+- **Classification pretending to be ranking**: the real constraint is 2,000 reviews/day, but the team builds a classifier with a fixed threshold. The flagged volume swings daily between 800 and 5,000, and ops adjusts the threshold by hand every morning.
+- **Anomaly detection as the decider**: it declines "unusual" orders, which hits travelers and holiday shoppers. False declines spike exactly on the highest-value days.
+- **Ranking scores in the cost formula**: expected costs come out as nonsense, and actions are wrong across the board (3.1).
+- **Multi-class on noisy subtypes**: heads learn the quirks of reason-code labeling, not fraud types.
+- **Regression on dollars**: one $15k fraud dominates training, and the model chases outliers.
+
+### Connections
+
+- **← 1.1**: the action space defines what the output must drive.
+- **← 1.4**: the cost policy needs calibrated probabilities, which constrains task and loss.
+- **← 2.3**: label availability gates supervised vs unsupervised.
+- **← 3.1 / 3.3**: loss choice and multi-task vs policy-level combination.
+- **→ 4.2**: the label definition for each task.
+- **→ 4.3**: the prediction unit (order vs account vs ring).
+- **→ 4.4**: the policy layer consuming each output.
+- **→ 6.2**: bandits and exploration.
+- **→ Stages 4–5**: graph and anomaly outputs become features.
+
+<Callout title="Exercise 4.1 (task type + one-line why)">
+
+1. Pick which 2,000 orders/day reviewers see.
+2. Spot a brand-new attack pattern the week it starts, with no chargebacks yet.
+3. Catch a ring of 50 accounts sharing 3 devices and 10 cards.
+4. Decide approve / step-up / decline at checkout.
+5. **(1.4 / 3.1 check)** A teammate proposes feeding scores from the **pairwise ranking model** (item 1) directly into the checkout cost policy. What breaks? One-line fix.
+
+</Callout>
+
+## 4.2 Label definition
+
+### What problem it solves
+
+"Fraud" is a concept. A model needs a **function**: for every order, it takes the raw events and returns 1, 0 or *unknown*, with no human in the loop. That function **is** the specification of what the model learns. Two teams with the same data and different label functions build different models.
+
+Most label bugs aren't visible in model metrics. The model faithfully learns the wrong thing.
+
+### How it works: a label spec has 7 parts
+
+1. **Positive events**: which events count as fraud.
+2. **Negatives**: what makes an order legitimately clean. This is *not* "no chargeback yet."
+3. **Unknowns**: which orders get no label, and why.
+4. **Maturity window**: how long before absence of a positive counts as a negative.
+5. **Precedence**: which source wins when sources conflict.
+6. **Unit and attribution**: which entity gets the label (4.3).
+7. **Version**: every label definition is versioned, and every training set records which version it used.
+
+For ShopFast's **true-fraud head**, the label function looks like this:
+
+<Diagram src="problem-framing/true-fraud-labeling-function.svg" />
+
+Details behind each box:
+
+- **Maturity window: why 120 days?** Plot the **chargeback arrival curve**: the % of eventual chargebacks that have arrived by day X after the order. Illustrative ShopFast numbers: 60% by day 30, 90% by day 60, 97% by day 90, 99% by day 120. Choose the window from the curve, don't guess. A 90-day window loses about 3% of positives, which may be worth it for fresher data.
+- **Precedence rules**, for when sources conflict:
+  1. Fraud-coded chargeback **beats** a reviewer's "legit." Reviewers make judgments; chargebacks come from the cardholder.
+  2. A dispute ShopFast **won with evidence** turns a chargeback into *friendly fraud*, not a positive.
+  3. Confirmed account takeover (support investigated) marks **all orders on the account since the takeover time** as positive. That attribution window is a 4.3 topic.
+  4. A failed step-up is *unknown*, not positive. It could be a fraudster failing, or a good customer who gave up.
+- **Two known types of label noise:**
+  - **Silent fraud (missing positives)**: the cardholder never notices small charges, or prepaid and gift cards produce no disputes. Positives are undercounted.
+  - **Noise that varies by segment**: some card issuers send fraud alerts much more readily than others. The model then learns "cards from issuer X look risky." That's a labeling artifact, not fraud (2.2).
+
+### Manual review labels: useful but dangerous
+
+Review outcomes arrive **within hours**, far faster than chargebacks. But they are:
+- **Opinions, not ground truth.** Train on them and the model learns the reviewers' habits.
+- **Selected**: only orders that got flagged are ever reviewed.
+- **Potentially circular**: if reviewers **see the model's score** while deciding, their labels partly copy the model. The next model trains on its own echo (6.3).
+
+Use them as fast **weak labels**, confirm them against matured chargebacks, and ideally **hide the model score** from reviewers on a random subset so you can measure the echo.
+
+### Assumptions
+
+- Events are **recorded reliably**, and reason codes mean what they say.
+- The maturity window captures **nearly all** positives. The arrival curve verifies this.
+- The label function is **stable**: nobody changes reason-code mappings without a version bump.
+
+### Design choices
+
+1. **Strict vs broad positives**: fraud-coded chargebacks only, or also issuer alerts and review confirmations.
+2. **Window length**: taken from the arrival curve, trading completeness against freshness.
+3. **Unknowns**: exclude (clean, but biased toward approved orders), impute (noisy), or recover with exploration (6.2).
+4. **Weak-label strategy**: use fast, noisy labels early, then re-weight or replace them when strong labels mature.
+5. **Versioning**: a label version ID on every training row, and a changelog.
+
+### Trade-offs
+
+- **Strict vs broad**: cleaner vs more positives. Strict can miss silent fraud; broad imports noise.
+- **Long vs short window**: complete vs fresh. Fraud patterns change, so stale-but-complete labels teach last season's attacks.
+- **Exclude vs impute unknowns**: exclusion guarantees a blind spot on declined orders. Imputing ("assume declined orders were fraud") guarantees self-confirmation. Neither is free, which is why 6.2 exists.
+
+### Failure modes
+
+- **Immature labels treated as negatives**: last month's orders count as "legit," and the model learns that fresh patterns are safe (2.3).
+- **Silent label drift**: the payment processor re-maps a reason code, the positive rate jumps 20% overnight, and calibration breaks with no code change on your side. Monitor the label base rate like any other metric.
+- **Circular labels**: reviewers influenced by the score, and the model reinforcing itself.
+- **Mixed targets**: friendly fraud counted as positive, so good customers get flagged (3.1).
+- **Timestamp misalignment**: the label is attached to the wrong order when one account has several orders near the takeover time.
+
+### Connections
+
+- **← 2.2**: the label audit found the friendly fraud.
+- **← 2.3**: label sources and their latency.
+- **← 3.1**: the target choice (true fraud) is implemented here.
+- **← 4.1**: each task head gets its own label function.
+- **→ 4.3**: which entity the label belongs to (order vs account), and the attribution window.
+- **→ 6.1**: maturity and delay in depth.
+- **→ 6.2**: declined orders as unknowns.
+- **→ 6.3**: reviewer echo as a feedback loop.
+- **→ Stage 8**: monitor the label base rate for drift.
+
+<Callout title="Exercise 4.2">
+
+Apply the label function. Give **Positive / Negative / Friendly / Unknown (why)** for each:
+
+- **(a)** Approved 150 days ago, no chargeback, no alerts.
+- **(b)** Approved 20 days ago, no chargeback.
+- **(c)** Declined at checkout 200 days ago.
+- **(d)** Approved 130 days ago. Fraud-coded chargeback. Delivered with signature to an address the customer has used for 3 years; 40 prior orders; ShopFast won the dispute.
+- **(e)** Approved 140 days ago. A reviewer marked it **"legit"** on day 1. Fraud-coded chargeback on day 60. No friendly-fraud evidence.
+
+Then one line: **(6.3 preview / 3.2 check)** reviewers see the model score while reviewing. What happens to the next model trained on their labels?
+
+</Callout>
+
+## 4.3 Prediction unit and horizon
+
+### What problem it solves
+
+"Predict fraud" leaves three things undefined:
+1. **For what entity?** A payment attempt, order, session, account, card, device or ring.
+2. **At what moment?** The prediction time, when the features are frozen.
+3. **About what future window?** The horizon: fraud on *this order*, or by *this account in the next 30 days*?
+
+Each combination is a different model, with different labels, features, leakage risks and evaluation. Get them wrong and you get models that score the wrong thing, evaluations inflated by memorization, and labels attached to the wrong events.
+
+### How it works
+
+**Rule 1: the unit matches the action's target** (1.1).
+- Decline an order → the unit is the **order**.
+- Lock an account → the unit is the **account** or **login session**.
+- Block a device → the unit is the **device**.
+
+**Rule 2: prediction time = decision point.** Features must be frozen at that moment (2.3). One entity can be scored at **many** prediction times: an account at signup, at every login and at every order.
+
+**Rule 3: the horizon is set by the label and the action.** It has to be long enough for the outcome to show up and short enough that the prediction is still actionable.
+
+Here is one account's life, with its prediction points, horizons and the takeover attribution window from 4.2:
+
+<Diagram src="problem-framing/account-timeline-units-horizons-attribution.svg" />
+
+Reading the timeline:
+- **Order 1** happened *before* the takeover began, so it's labeled **legit**, even though the account is "an ATO account."
+- **Orders 2 and 3** fall inside the takeover period, so they're labeled **fraud**.
+- The takeover start is **estimated** as the first login from a new device. That estimate is a design choice, and it can be wrong.
+- The account score from signup, with its 30-day horizon, is a **different model** with a different label ("did this account commit fraud within 30 days?").
+
+### ShopFast unit map
+
+| Model | Unit | Prediction time | Horizon / label | Action |
+|---|---|---|---|---|
+| Checkout risk | Order | Checkout submit | Fraud on this order, 120-day maturity | Approve / step-up / decline |
+| Takeover risk | Login session | Each login | Takeover-labeled orders within 7 days of login | Step-up at login, lock account |
+| Account risk (batch) | Account | Daily | Fraud within 30 days | Feature for the checkout model; watchlist |
+| Ring detection | Cluster | Nightly | Cluster contains confirmed fraud | Feature; analyst investigation |
+| Card testing | Payment attempt | Each attempt | Attempt part of a testing burst | Velocity rules (2.1) |
+
+Card testing means fraudsters making many tiny charges to check which stolen cards work. It happens at the **attempt** level, and 50 attempts may produce 0 orders.
+
+### Hidden consequence: how you split evaluation data
+
+Orders from the same account, device or ring are **correlated**. If a ring's orders land in both train and test, the model memorizes the ring and offline metrics look fantastic.
+
+The fix:
+- **Split by time**: train on the past, test on the future (2.2).
+- **Group by entity**: all orders from one account, and ideally one cluster, go entirely to one side.
+
+Illustrative: random split PR-AUC 0.62 → time + account split 0.41. **The second number is the real one.**
+
+### Assumptions
+
+- **Entity IDs are stable**. They often aren't: cookies get cleared, devices reset, fraudsters create new emails (6.4).
+- **The prediction time is logged exactly**, so features can be rebuilt as of that moment.
+- **Units are roughly independent** within a split. Correlated units need group splits.
+
+### Design choices
+
+1. **Unit per action**, not one unit for everything.
+2. **Scoring cadence**: event-triggered (every order, every login) vs scheduled batch (daily account score). This drives the infrastructure (5.1).
+3. **Horizon length**: from the arrival curve (4.2) and how long the prediction stays actionable.
+4. **Attribution rules**: how takeover start is estimated, and what happens to orders in the grey zone.
+5. **Entity-resolution strictness**: how aggressively accounts, devices and cards get merged into "one actor."
+6. **Split strategy**: time + group, decided *before* the first model, not after an embarrassing launch.
+
+### Trade-offs
+
+- **Fine unit (attempt) vs coarse unit (account)**: earlier action and more data points but noisier, vs more context but later detection and heavier actions (locking an account hurts a good user a lot).
+- **Short vs long horizon**: quick labels and actionable, vs more positives and more signal but slower feedback. A 365-day account horizon predicts *something*, just nothing you can act on at checkout.
+- **Aggressive vs cautious entity resolution**: catches more rings vs fewer innocent people swept in. A university campus behind one shared IP address, or a family sharing a laptop, can look like a "ring."
+
+### Failure modes
+
+- **Unit mismatch**: account-level labels get copied to every order. Order 1 (legit, pre-takeover) becomes a positive, and the model learns the account owner's *normal* behavior as fraud.
+- **Leaky random split**: the same ring or account on both sides, so offline metrics are inflated and the launch disappoints.
+- **Horizon mismatch**: the label is "fraud within 7 days," but chargebacks take 30–120 days, so nearly every positive gets missed.
+- **Re-scoring leakage**: a daily account score used as a checkout feature was computed *after* the order (e.g., from that night's batch). This is time travel again.
+- **Over-merged entities**: shared IP addresses get entire offices or campuses declined.
+- **Count dominance**: card-testing bursts of 50 attempts outweigh real orders in the training data. Weight by the unit you care about.
+
+### Connections
+
+- **← 1.1**: the action's target sets the unit; the decision point sets the prediction time.
+- **← 2.3 / 4.2**: label maturity sets horizons; takeover attribution sets windows.
+- **← 4.1**: each portfolio model gets its own unit.
+- **→ 4.4**: the policy combines scores from several units at one decision.
+- **→ 5.1**: event-triggered vs batch determines latency and infrastructure.
+- **→ 6.4**: fraudsters reset entity IDs to escape unit-level history.
+- **→ Stage 3 / 6**: split strategy and evaluation validity.
+
+<Callout title="Exercise 4.3 (includes checks)">
+
+1. A random 80/20 split gives PR-AUC **0.62**; a time + account split gives **0.41**. Which do you report, and why is the gap so big?
+2. **(4.2 attribution)** First new-device login on **day 10**; takeover confirmed on **day 40**. Orders on **days 5, 15 and 35**: label each one.
+3. Give the **unit** and **prediction time** for the action "lock the account when takeover is likely." One line.
+4. **(1.1 check)** Why is *"will this account commit fraud in the next 365 days"* a poor target for the checkout decision?
+
+</Callout>
+
+## 4.4 Prediction to action policy
+
+### What problem it solves
+
+Models output **scores**. Businesses take **actions**. The policy layer in between is where value actually happens (1.1), yet it's often an afterthought: `if score > 0.5: decline`, hard-coded and never revisited.
+
+A real policy layer has to:
+- combine **several scores** (4.1, 4.3) with context,
+- apply the **cost matrix** (1.4),
+- respect **constraints** (1.3, 3.3),
+- decide when to **buy more information**,
+- **explore** to keep labels flowing,
+- and be **operated safely**, with versioning, rollout and logging.
+
+### How it works: the policy pipeline
+
+<Diagram src="problem-framing/policy-layer-cascade.svg" />
+
+**1. Combine scores.** ShopFast has several scores for one checkout: the order p(stolen card), the session p(takeover), the account risk, and a ring flag. There are two ways to combine them:
+- **As features** of the checkout model. The batch scores (account, ring) go *into* the model (4.3), and the model outputs one calibrated p. This is preferred: the model learns how much to trust each input.
+- **As policy rules**, e.g., "ring flag → always review." Use this for signals that are too rare or too new to learn from.
+
+With multiple fraud heads, expected cost sums over the types:
+
+> E[cost(a)] = p_stolen · C(a, stolen) + p_ATO · C(a, ATO) + p_legit · C(a, legit)
+
+The heads can warrant different actions: a takeover may call for locking the account, not just declining the order.
+
+**2. Value of information: the cascade.** Extra information (the vendor call: $0.01 and +40 ms) is only worth buying **if it could change the action**.
+- Orders with p₁ = 0.05% are approved regardless. The vendor call is pure waste.
+- Orders **near a threshold** (e.g., around the 2.1% approve/step-up line for $200 orders) are exactly where more information flips the decision.
+
+> Value of information = expected cost without the info − expected cost with the info − cost of getting it
+
+Call the vendor only when that's positive. In practice it's about 10–20% of orders, which cuts vendor spend and average latency by 80%+. (This resolves the question in Exercise 2.3.3.)
+
+**3. Constraints.** After choosing the cheapest action per order:
+- **Capacity**: if more than 2,000 orders/day want review, keep the top 2,000 by *savings versus their next-best action*; the rest fall back to that action.
+- **Guardrails**: approval rate, segment decline ratios (1.3).
+- **Friction budget**: at most 1 step-up per 30 days for trusted customers (3.4).
+- **Feasibility check**: before launch, *replay the policy on historical traffic* and confirm every constraint can be met at the same time (3.3). If they conflict, escalate to the decision owners (1.2), not to whoever is on call.
+
+**4. Exploration.** For about 1% of orders, deliberately take a different action than the policy wants (e.g., step-up instead of decline for some low-amount would-be declines) to **get labels where the policy is otherwise blind**. **Log the probability** of the action taken (the *propensity*). It's what lets you evaluate *other* policies offline later. Full treatment in 6.2.
+
+**5. Log everything.** For every decision, log: feature snapshot, all scores, model versions, policy version, action, reason codes, and propensity. Without this you can't debug, attribute, explain (5.3) or evaluate counterfactual policies.
+
+### Operating the policy
+
+- **Thresholds and costs live in versioned config, not code.** Changes follow the decision rights from 1.2: Risk adjusts within guardrails, and guardrail changes need joint sign-off.
+- **Shadow mode**: a new model or policy scores live traffic and logs "what I would have done" without acting. Compare before switching.
+- **Staged rollout**: 1% → 10% → 50% → 100%, with automatic rollback if a guardrail breaks.
+- **Kill switch**: one flag reverts to the rules fallback (2.1).
+- **Recalibrate, don't re-threshold.** When base rates shift, fix the *probabilities* so the cost-derived thresholds stay meaningful. Don't nudge thresholds by hand.
+
+### Assumptions
+
+- Scores are **calibrated**. Every expected-cost calculation depends on this.
+- The cost matrix is **current** (3.4: long-term values re-measured).
+- Logging is **complete and consistent** across versions.
+- The constraints are **jointly feasible**.
+
+### Design choices
+
+1. **Global threshold vs per-instance cost-based policy.** Cost-based is optimal (1.4), and a global threshold is easier to explain.
+2. **Scores in as features vs as policy overrides** (above).
+3. **Cascade depth and band width**: more stages save more but add complexity and blind spots.
+4. **Exploration budget**: what % of traffic, in which regions, and at what maximum dollar exposure.
+5. **Policy in config vs code**: config is safer to change, but needs validation so a typo can't decline everything.
+
+### Trade-offs
+
+- **Optimal vs explainable**: per-order dynamic thresholds vs "declined because risk > X."
+- **Cascade savings vs blind spots**: an order scored confidently wrong by the cheap model is never enriched. The band must account for the cheap model's calibration error.
+- **Exploration cost vs label value**: exploration costs real fraud dollars now and buys the model's future accuracy (6.2).
+- **Automation vs change control**: auto-adjusting policies react fast but can spiral; manual approval is safe but slow.
+
+### Failure modes
+
+- **New model, old thresholds.** This is the most common launch incident. Model v2 is calibrated differently, and on day 1 the decline rate jumps from 1% to 2.3% with thresholds unchanged. Fix: re-derive thresholds from the cost matrix using v2's calibrated scores, and verify in shadow mode first.
+- **Stale hard-coded threshold**: set at launch and never revisited while base rates and costs drift.
+- **Manual threshold juggling**: ops adjusts the review threshold daily to fit the queue. It should be a top-K cutoff (4.1).
+- **Unlogged policy change**: TCF moves, and nobody can say whether the model, the policy or the traffic changed it.
+- **Override pile-up**: analyst hotfixes never expire and silently override the model (2.1 rule rot).
+- **No propensity logging**: a year later you want to test a new policy offline, and you can't. Historical actions were never randomized or recorded with their probabilities.
+
+### Connections
+
+- **← 1.1, 1.4**: actions and cost matrix.
+- **← 1.2**: decision rights over thresholds.
+- **← 1.3, 3.3, 3.4**: guardrails, constraints, friction budgets.
+- **← 2.1**: rules fallback and override slot.
+- **← 3.1**: calibration requirement.
+- **← 4.1, 4.3**: multiple heads and units.
+- **→ 5.1**: the cascade is a latency tool.
+- **→ 5.3**: reason codes support explainability.
+- **→ 6.2**: exploration and propensities.
+- **→ Stages 6–8**: shadow mode, staged rollout, monitoring of the policy, not just the model.
+
+<Callout title="Exercise 4.4: branch 4 checkpoint (numbers + quick lines)">
+
+**Value of information.** A $200 order has cheap-model p₁ = **2%**. Its costs, from 1.4: approve = 215·p, step-up = 32.25·p + 4·(1 − p).
+
+The vendor call costs **$0.01**. From past data, for orders like this one, the vendor data splits them into:
+- **70%** that turn out to have p = 0.5%
+- **30%** that turn out to have p = 5.5%
+
+1. Without the vendor call: which action, and what expected cost?
+2. With the call: which action in each case, and what's the expected cost overall?
+3. Is the call worth $0.01? What about for an order with p₁ = 0.05%, and why?
+
+**Operations**
+
+4. Model v2 deploys, and the decline rate jumps from **1% to 2.3%** on day 1. The thresholds haven't changed. What's the most likely cause, and what's the fix?
+5. **(1.2 check)** Ops wants to raise the decline threshold to shrink the review queue. Who approves that, and under which condition?
+
+</Callout>

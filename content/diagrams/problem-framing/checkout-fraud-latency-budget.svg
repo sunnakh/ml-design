@@ -1,0 +1,24 @@
+<svg width="100%" viewBox="0 0 680 310" role="img"><title>Checkout fraud latency budget</title><desc>Timeline in milliseconds against a 100 ms p99 budget. Network in 0 to 5, feature fetch 5 to 30, cheap model 30 to 35, vendor call 35 to 75 only for orders in the uncertain band, rescore 75 to 80, policy and log 80 to 82, network out 82 to 87. Worst path 87 ms leaves 13 ms headroom; common path without vendor is about 47 ms.</desc>
+<text class="ts" x="170" y="68" text-anchor="end" dominant-baseline="central">Network in</text>
+<rect x="180" y="60" width="22.5" height="16" rx="2" fill="#888780"/>
+<text class="ts" x="170" y="98" text-anchor="end" dominant-baseline="central">Feature fetch</text>
+<rect x="202.5" y="90" width="112.5" height="16" rx="2" fill="#888780"/>
+<text class="ts" x="170" y="128" text-anchor="end" dominant-baseline="central">Cheap model</text>
+<rect x="315" y="120" width="22.5" height="16" rx="2" fill="#7F77DD"/>
+<text class="ts" x="170" y="158" text-anchor="end" dominant-baseline="central">Vendor (band only)</text>
+<rect x="337.5" y="150" width="180" height="16" rx="2" fill="none" stroke="#D85A30" stroke-width="1.5" stroke-dasharray="5 3"/>
+<text class="ts" x="170" y="188" text-anchor="end" dominant-baseline="central">Rescore</text>
+<rect x="517.5" y="180" width="22.5" height="16" rx="2" fill="#7F77DD"/>
+<text class="ts" x="170" y="218" text-anchor="end" dominant-baseline="central">Policy and log</text>
+<rect x="540" y="210" width="9" height="16" rx="2" fill="#1D9E75"/>
+<text class="ts" x="170" y="248" text-anchor="end" dominant-baseline="central">Network out</text>
+<rect x="549" y="240" width="22.5" height="16" rx="2" fill="#888780"/>
+<line x1="630" y1="50" x2="630" y2="266" stroke="#D85A30" stroke-width="1" stroke-dasharray="4 3"/>
+<text class="ts" x="630" y="40" text-anchor="end" dominant-baseline="central">p99 budget: 100 ms</text>
+<line x1="180" y1="272" x2="630" y2="272" stroke="var(--text-secondary)" stroke-width="0.5"/>
+<text class="ts" x="180" y="290" text-anchor="middle" dominant-baseline="central">0</text>
+<text class="ts" x="292.5" y="290" text-anchor="middle" dominant-baseline="central">25</text>
+<text class="ts" x="405" y="290" text-anchor="middle" dominant-baseline="central">50</text>
+<text class="ts" x="517.5" y="290" text-anchor="middle" dominant-baseline="central">75</text>
+<text class="ts" x="620" y="290" text-anchor="end" dominant-baseline="central">100 ms</text>
+</svg>

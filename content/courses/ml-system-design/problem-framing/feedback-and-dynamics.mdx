@@ -1,0 +1,20 @@
+---
+title: 6. Feedback and dynamics
+description: How labels, the model's own actions and the world change over time.
+---
+
+## 6.1 Delayed labels
+
+Some labels arrive long after the prediction. Fraud chargebacks come 30–120 days later. You need leading indicators for early readouts and a training setup that handles incomplete recent data.
+
+## 6.2 Selection bias
+
+You only observe outcomes for the actions you took. Once an order is declined, you never learn whether it was fraud. Fix: keep a small random exploration sample where the model's decision is not applied.
+
+## 6.3 Feedback loops
+
+The model's predictions shape the data it is later trained on. A recommender that only shows popular items keeps making them more popular. Break loops with exploration and careful logging.
+
+## 6.4 Adversaries and drift
+
+The world changes, and in fraud the other side actively adapts to your model. Expect patterns to shift, monitor for drift, and plan regular retraining.

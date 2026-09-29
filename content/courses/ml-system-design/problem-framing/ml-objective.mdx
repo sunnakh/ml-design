@@ -1,0 +1,349 @@
+---
+title: 3. ML objective
+description: What exactly the model is trained to optimize, and how far that is from what we want.
+---
+
+Branch 1 defined business success (TCF). Branch 2 confirmed ML is worth building. Branch 3 asks: **what exactly will the model be trained to optimize, and how far is that from what we actually want?**
+
+## 3.1 Proxy metrics
+
+### What problem it solves
+
+You can't train a model directly on TCF:
+- It's **not differentiable**: a sum of dollars over decisions, not a smooth function of model weights.
+- It's **delayed**: 120 days.
+- It **depends on actions**: TCF changes with the policy, and the counterfactual is unobserved.
+
+So you train on a **surrogate**: a target (what to predict), a loss (how to score errors) and weights (which examples matter more). Every surrogate is a **proxy**, and every proxy has gaps. Choose one whose gaps you understand and can close.
+
+### How it works: the proxy chain
+
+What you train is several steps removed from what you want. Each link has a specific gap:
+
+<Diagram src="problem-framing/proxy-chain-with-gaps.svg" />
+
+Three choices make up the ML objective.
+
+**1. Target: what exactly to predict.**
+
+| Option | Pros | Cons |
+|---|---|---|
+| P(any chargeback within 120 days) | Easy, lots of positives | Includes friendly fraud (2.2): a label gap |
+| **P(true fraud)**: fraud-coded chargebacks + issuer alerts + confirmed review outcomes | Matches the checkout decision | Fewer positives, needs label engineering |
+| Expected loss in dollars (regression) | Directly in dollars | High variance; a few huge orders dominate |
+
+**ShopFast choice: P(true fraud).** The amount is applied later, in the policy layer (1.4). Keep the model's job narrow.
+
+**2. Loss: how errors are scored.**
+
+| Loss | What it gives | When to use it |
+|---|---|---|
+| **Log loss** | Calibrated probabilities | When a cost policy consumes p (ShopFast's case) |
+| Class-weighted or focal loss | Focus on the rare class / hard examples | Can help ranking, but **breaks calibration**. Recalibrate afterwards. |
+| Pairwise / ranking loss | Good ordering | Top-K problems, e.g. a fixed-capacity review queue |
+| Amount-weighted log loss | Aligns training with dollars | Higher variance; output is no longer a plain probability |
+
+**3. Sampling and weighting.** Fraud is 0.2% of orders, so teams often keep all fraud and a sample of legit orders (e.g. 5%) to train faster. That **inflates the model's probabilities**, so you must correct them:
+
+> If legit orders were kept at rate r, then **p_true = r · p_s / (r · p_s + 1 − p_s)**, where p_s is the score from the sampled model.
+
+### Choosing a proxy: four tests
+
+1. **Decision-aligned**: it outputs what the policy needs. ShopFast needs a *calibrated* p.
+2. **Observable in time**: labels arrive within a usable window (2.3).
+3. **Correlated with the goal in the operating region**: in the top 1–3% of scores, not just on average (1.3).
+4. **Hard to game**: optimizing it hard doesn't break the link to the goal (the whole of 3.2).
+
+### Assumptions
+
+- Proxy and goal **move together** where you operate.
+- That relationship **survives optimization pressure** (3.2).
+- Label noise is **random-ish**, not tied to some segment.
+
+### Design choices
+
+- **Narrow target + policy layer** vs **end-to-end dollar target**. Narrow is easier to debug and reuse; end-to-end is theoretically more aligned but fragile.
+- **One model for all fraud** vs **separate models per fraud type** (stolen card, account takeover, friendly fraud). Separate models give cleaner targets but multiply maintenance.
+- **Loss choice, driven by the consumer**: a cost policy needs log loss; a capacity-limited queue can use a ranking loss.
+
+### Trade-offs
+
+- **Clean vs broad label**: less noise but fewer positives, versus more data with more noise.
+- **Calibration vs ranking focus**: tricks that sharpen ranking usually damage calibration. Recalibrate (Platt scaling or isotonic regression on held-out data) or don't use them.
+- **Dollar-aligned training vs stability**: amount weighting matches TCF better, but one $10k fraud can swing the model.
+
+### Failure modes
+
+- **Downsampling without correction**: the model says p = 0.04 when the true rate is ~0.2%, and the policy over-acts on thousands of good orders. Silent, and common.
+- **Class weights silently breaking calibration**: same effect, harder to spot.
+- **Broad label, wrong behavior**: training on all chargebacks teaches the model that good-looking, established customers are risky (friendly fraud). False declines rise among your *best* customers.
+- **Train–evaluate mismatch**: trained on order-count loss, judged on dollar recall. It improves where orders are frequent, not where the dollars are.
+- **Fine on average, broken at the top**: overall log loss improves while top-1% ranking gets worse.
+
+### Connections
+
+- **← 1.3**: training loss is L0 at the bottom of the pyramid.
+- **← 1.4**: the cost policy requires calibrated p.
+- **← 2.2**: the label audit sets the label gap.
+- **→ 3.2**: what happens when proxies are pushed hard.
+- **→ 4.2 / 4.4**: label definition, and how the policy consumes p.
+- **→ Modeling**: loss, sampling and calibration during training.
+
+<Callout title="Exercise 3.1">
+  The team kept **5% of legit orders** (r = 0.05) and didn't correct scores. A **$2,000 order** gets **p_s = 0.04**. Compute the corrected p_true. Using the $2,000 row of the 1.4 threshold table (approve below 1.3%, step-up 1.3–40%, decline above 40%), which action does the uncorrected score trigger, and which the corrected one? What's the business cost across thousands of orders? Growth suggests weighting training examples by order amount: give one benefit and one risk.
+</Callout>
+
+## 3.2 Goodhart and misalignment
+
+### What problem it solves
+
+Part 3.1 chose a proxy that *correlates* with the goal. **Goodhart's law**: *when a measure becomes a target, it stops being a good measure.* A correlation that holds normally can break once you **push hard on the proxy**, and pushing hard is exactly what optimization does: gradient descent, hyperparameter search, threshold tuning, team incentives. This part teaches you to predict *how* a proxy will break before it does.
+
+### The core picture
+
+As optimization pressure increases, the proxy keeps improving while the real goal peaks and then gets *worse*:
+
+<Diagram src="problem-framing/goodhart-divergence.svg" />
+
+Left of the dashed line, the declined orders are mostly fraud, so both curves rise together. Right of it, the extra declines are mostly **good customers**: "fraud caught" keeps climbing while TCF gets worse.
+
+### How it works: four ways proxies break
+
+Each type has a **different fix**:
+
+| Mechanism | What happens | ShopFast example | Fix |
+|---|---|---|---|
+| **Regressional** | Proxy = goal + noise. Selecting the best by proxy also selects lucky noise. | 60 configs tried; the test-set winner gains half as much online. | An untouched final holdout; shrink estimates; confirm with A/B |
+| **Extremal** | The link holds in the normal range and breaks at extremes. | Raising the decline rate from 1% to 5% maximizes fraud caught, and TCF collapses. | Pair every proxy with a **counter-metric**; stay where your data covers |
+| **Causal** | The proxy correlates with the goal but doesn't *cause* it. | Risk is measured on *chargeback rate*, so they auto-refund disputed orders before they become chargebacks. Rate −30%; money lost unchanged. | Measure the goal itself (dollars lost) |
+| **Adversarial** | Another party optimizes against your proxy. | The model trusts "account older than 30 days"; fraudsters age accounts or buy aged ones. | Features **costly to fake**; monitor where fraud shows up; the fast rules layer (2.1) |
+
+A fifth, not about the model: **organizational misalignment.** If Risk's bonus is tied to fraud losses alone, they will over-block (asymmetric visibility again, 1.2). Incentives *are* an objective function, and people optimize them too.
+
+### Assumptions that Goodhart breaks
+
+- **The correlation survives intervention.** Causal breaks this.
+- **Nobody is gaming it.** Adversarial breaks this.
+- **You stay in familiar territory.** Extremal breaks this.
+- **Selection doesn't amplify noise.** Regressional breaks this.
+
+### Design choices
+
+1. **Metric pairs**: every optimized metric gets a counter-metric with veto power (1.3 guardrails).
+2. **Limit optimization pressure**: cap search budgets, keep a final holdout nobody tunes on, change thresholds in small steps with measurement in between.
+3. **Feature robustness**: prefer signals expensive to fake (months of device history, behavioral patterns) over cheap ones (account age, email domain).
+4. **Periodic re-validation**: re-check the proxy→goal link each quarter with matured labels and A/B results.
+
+### Trade-offs
+
+- **Robust vs strong features**: costly-to-fake signals are often weaker today; cheap signals are strong until attackers notice.
+- **Explainability vs gaming**: explaining declines (5.3) also teaches fraudsters what to change. Explain in detail to regulators and support; coarsely to customers.
+- **Guardrails vs speed**: every counter-metric slows shipping. That's the point, but too many and nothing ships (1.3).
+
+### Failure modes
+
+The four mechanisms in practice: a model that "wins" offline and underwhelms online; threshold creep; metrics that improve while the money doesn't; fraud migrating into trusted segments. Plus **incentive-driven over-blocking**.
+
+The meta-failure: **only watching the proxy**. If nobody looks at TCF, every one of these stays invisible.
+
+### Connections
+
+- **← 1.2**: incentives and asymmetric visibility are organizational Goodhart.
+- **← 1.3**: counter-metrics and guardrails are the main defense.
+- **← 3.1**: this stress-tests the proxy chosen there.
+- **→ 3.3**: multiple objectives, formalized.
+- **→ 5.3 / 6.3 / 6.4**: explainability vs gaming, feedback loops, adversaries.
+- **→ Evaluation**: winner's curse and holdout discipline.
+
+<Callout title="Exercise 3.2">
+  Name the mechanism (regressional / extremal / causal / adversarial) and one fix for each. **(a)** Three months after launch, fraud from accounts older than 30 days has tripled. **(b)** 60 configs tried, best on the test set picked, A/B gain is half the offline estimate. **(c)** Risk auto-refunds disputed orders; chargeback rate −30%, dollars lost unchanged. **(d)** Raising the decline rate from 1% to 3% lifted fraud $ caught from 68% to 80%; Risk wants 5%. Which metric should decide, and what's missing from Risk's argument?
+</Callout>
+
+## 3.3 Multiple objectives
+
+### What problem it solves
+
+ShopFast doesn't have one objective. It has at least six, and they conflict:
+
+| Objective | Direction | Conflicts with |
+|---|---|---|
+| Fraud loss | ↓ | False declines, friction |
+| False-decline cost | ↓ | Fraud loss |
+| Step-up friction | ↓ | Fraud loss |
+| Review queue | ≤ 2,000/day | Fraud loss (review is your cheapest good action, per 1.4) |
+| Segment fairness | Decline ratio ≤ 2× baseline | Pure TCF |
+| Latency | p99 < 100 ms | Richer features / bigger models |
+
+You need a **principled way to combine them**. Otherwise the combination happens implicitly, in whoever picks the threshold on a Friday afternoon.
+
+### How it works: four combination methods
+
+**1. Scalarize (weighted sum).** Convert everything into one number. **TCF is exactly this**: every term in dollars, weight 1.
+- ✅ Decisive, and one number to optimize.
+- ❌ The weights are value judgments ("a false decline costs $20 of future value"), and some things can't be priced honestly (fairness, legal).
+
+**2. Constrain.** Optimize one objective, subject to limits on the others:
+
+> minimize TCF, subject to: queue ≤ 2,000/day · approval ≥ baseline − 0.2pp · segment decline ratio ≤ 2× · p99 < 100 ms
+
+This is what 1.3's guardrails formalize. The hidden bonus is the **shadow price**: how much TCF would drop if you relaxed a constraint by one unit. It turns "should we hire reviewers?" into arithmetic (see the exercise).
+
+**3. Pareto frontier.** When stakeholders can't agree on weights, show them the **set of best achievable trade-offs** and let them pick:
+
+<Diagram src="problem-framing/pareto-frontier-fraud-vs-false-declines.svg" />
+
+How to read it:
+- **Points on the curve** are the best achievable trade-offs, meaning model thresholds that can't reduce one cost without increasing the other.
+- **Current rules sit inside the frontier** (dominated). A point exists that is **better on both axes**. Moving there is a free improvement; nobody has to lose. Always check for this first.
+- **The dashed line** marks every combination with the same TCF. Where it just touches the frontier is the TCF minimum. **Change the weights** (e.g., value false declines at lifetime value) and the line tilts, so the minimum slides along the curve.
+- **Below the curve** is impossible with this model. Getting there needs *better signal* (2.2), not better tuning.
+
+**4. Priority order.** Hard requirements first, then optimize: legal and compliance rules are absolute (the hard-rules slot in 2.1), and TCF is optimized within what's left.
+
+**Most real systems combine methods**: priority order for the law, constraints for guardrails, scalarized TCF inside those, and the Pareto view when stakeholders need to renegotiate weights.
+
+### Where to combine: model or policy?
+
+- **Model level (multi-task)**: separate heads for stolen card, account takeover and friendly fraud, trained with a combined loss. Better features are shared, but **changing the business weights means retraining**.
+- **Policy level** (the ShopFast default): the model outputs separate calibrated probabilities, and the policy layer combines them with costs and constraints. **Weights change without retraining.** This is the 1.4 principle again: keep business logic out of the weights.
+
+### Assumptions
+
+- Every objective can be **measured**. False declines are hard to measure (6.2).
+- The frontier estimated offline is **real**. Selection bias can make it optimistic.
+- Stakeholders will **commit** to weights or constraints and revisit them on a schedule, not constantly.
+
+### Design choices
+
+1. **Scalarize vs constrain vs Pareto**, per objective. Price what's priceable; constrain what isn't.
+2. **How tight the constraints are**: every constraint has a shadow price, and you should compute it.
+3. **Where the combination lives**: model or policy (above).
+4. **Review cadence**: weights and constraints get revisited quarterly with matured labels.
+
+### Trade-offs
+
+- **Scalar**: decisive, but hides the disagreement inside a coefficient.
+- **Constraints**: protect stakeholders, but can quietly cost millions. The shadow price makes that visible.
+- **Pareto**: transparent, but needs a decision-maker with authority (1.2 decision rights).
+- **Combining in the model vs in the policy**: shared representations vs flexibility.
+
+### Failure modes
+
+- **Hidden weights**: nobody wrote down the trade-off, but a threshold choice implies one. Nobody can defend or revisit it.
+- **Staying dominated**: the team debates *which* trade-off to take while sitting inside the frontier, where free gains are available.
+- **Infeasible constraint set**: no threshold satisfies every guardrail at once. You find out at launch, not in design. Check feasibility on historical data early.
+- **Stale weights**: set once, while costs changed (new fees, new liability rules).
+- **Fairness treated as a pure price**: some constraints are ethical or legal commitments, not dollar trade-offs. Showing the shadow price informs the decision; it doesn't make it for you.
+
+### Connections
+
+- **← 1.2**: TCF is the scalarization, and decision rights resolve Pareto choices.
+- **← 1.3**: the guardrails *are* the constraints.
+- **← 1.4**: the cost matrix supplies the weights.
+- **← 3.2**: counter-metrics are two-objective constraints against Goodhart.
+- **→ 3.4**: time adds another objective axis: now vs later.
+- **→ 4.4**: the policy layer implements the combination.
+- **→ 5.4**: fairness constraints in depth.
+
+<Callout title="Exercise 3.3 (includes a 1.2 check)">
+
+Annual figures:
+
+| Option | Fraud loss | False-decline cost |
+|---|---|---|
+| Current rules | $9M | $8M |
+| Threshold A | $7M | $8M |
+| Threshold B | $6M | $10M |
+| Threshold C | $10M | $5M |
+
+1. Which option(s) are **dominated**? Which minimize TCF with equal weights?
+2. Two options tie. What **single assumption change** from 1.2 would break the tie, and in which direction?
+3. **Shadow price**: raising the review cap from 2,000 to 2,500/day cuts TCF by $0.6M/yr. Eight more reviewers cost $0.4M/yr. Decision? Name one non-dollar concern.
+4. **(1.2 check)** Who should choose between the tied options, and why them?
+
+</Callout>
+
+## 3.4 Short vs long term
+
+### What problem it solves
+
+Every metric so far has been measured over **weeks to a quarter**. But many effects of a fraud policy play out over **months to years**, and standard A/B tests never see them:
+- A falsely declined customer doesn't just lose one order. They may never come back.
+- Strict blocking today pushes fraud rings toward softer targets. Loose blocking gets ShopFast a reputation among fraudsters as an easy mark.
+- Declining more today means fewer labels tomorrow, so the model slowly loses sight of what it declines (6.2).
+
+A policy can **win every quarterly A/B test and still lose money over two years.** This is Goodhart (3.2) applied to time.
+
+### How it works: map effects by time horizon
+
+For any policy change, sort its effects into a grid. Here it is for "tighten the fraud policy":
+
+<Diagram src="problem-framing/tightening-policy-short-vs-long-term-effects.svg" />
+
+Both long-term cells can dominate. Which one wins is **an empirical question**, and you need specific tools to answer it.
+
+**ShopFast's long-term effects, in full:**
+
+| Effect | Direction when tightening | Time scale |
+|---|---|---|
+| Customer churn after false decline | Cost | 3–12 months |
+| Step-up fatigue (3DS on every order, abandonment creeps up) | Cost | Months |
+| Deterrence (fraud rings share soft targets with each other) | Benefit | Months |
+| Label starvation (declined orders never get labels) | Cost | Model versions |
+| Card-network standing (months above the threshold means fines and higher fees) | Benefit | Quarters |
+| Seller trust (if sellers bear losses) | Benefit | Quarters |
+
+### Tools for measuring long-term effects
+
+1. **Long-term holdout.** Keep 1–2% of customers on the old policy for 6–12 months and compare cumulative spend, retention and fraud. This is the only direct measurement. It's slow and costs a little, and it's worth it.
+2. **Surrogate index.** Find short-term signals that *predict* the long-term outcome (e.g., "30-day return rate after a false decline" predicts 12-month spend). Fit that relationship once using the long-term holdout, then use the surrogate in routine A/B tests. It's fast, but it is itself a proxy, so re-validate it (3.2).
+3. **Put the long term into the cost matrix.** The "$20 expected lost future value" in 1.4 is exactly this. The holdout is how you *measure* it rather than guess it.
+4. **Friction budgets.** A per-customer cap on friction, e.g., "trusted customers see at most 1 step-up per 30 days." It's a guardrail against effects that accumulate over time.
+5. **An explicit horizon in the success spec (1.2).** Write down "evaluated at 120 days and re-confirmed at 12 months," so nobody declares victory on week-3 numbers.
+
+### Assumptions
+
+- Long-term effects are **measurable** within a horizon the business will wait for.
+- The environment is **stable enough** that a 12-month holdout still means something when it completes.
+- Holdout customers **don't mix** with treatment customers (shared devices, households).
+
+### Design choices
+
+1. **Horizon**: a quarter vs a year. Finance often wants quarters; customer value lives in years. Pick one explicitly.
+2. **Holdout size and duration**: bigger and longer means more precise and more expensive.
+3. **Surrogate choice**: which short-term signals stand in for long-term value, and how often they get re-validated.
+4. **Discount rate**: how much a dollar in 12 months counts versus a dollar today.
+
+### Trade-offs
+
+- **Speed vs truth**: weekly A/B iteration vs the months long-term effects need. Surrogates bridge the gap at some risk.
+- **Holdout cost vs knowledge**: holdout users get a worse (or just different) policy. **Fraudsters must not be able to tell who is in the holdout**, or they'll target it. Randomize by customer and keep the assignment secret.
+- **Deterrence vs churn**: both are long-term and both are uncertain. Tighten too much and you lose good customers; loosen too much and you become a target.
+
+### Failure modes
+
+- **Death by a thousand cuts**: ten A/B wins in a row, each adding a small step-up. Nobody sees the cumulative friction, and abandonment creeps up across the year.
+- **Holiday loosening**: the policy is loosened for Black Friday conversion. Fraud rings notice, and attack volume stays high for months afterwards.
+- **Stale LTV term**: the $20 estimate is from two years ago. Customer value has changed, and so have the correct thresholds.
+- **Contaminated holdout**: shared devices and family accounts cross arms, so the measured difference shrinks toward zero.
+- **Horizon mismatch between teams**: Risk optimizes the quarter, Growth optimizes the year, and each blames the other.
+
+### Connections
+
+- **← 1.2**: the horizon and the margin-vs-lifetime-value choice come from the success spec.
+- **← 1.4**: the long-term cost term lives in the cost matrix.
+- **← 3.2**: this is Goodhart along the time axis.
+- **← 3.3**: time is one more objective to trade off.
+- **→ 6.2 / 6.3**: label starvation and feedback loops are long-term effects of the policy.
+- **→ 6.4**: deterrence and adaptation are adversary dynamics.
+- **→ Stage 6**: long-term holdouts and surrogate indexes are evaluation tools.
+
+<Callout title="Exercise 3.4: branch 3 checkpoint">
+
+1. A 3-week A/B test shows: *"More step-ups for new customers cut TCF by $0.5M/yr annualized, and conversion didn't drop."* Name **one long-term effect it misses** and **how you'd measure it**.
+2. **(1.4 check)** A long-term holdout shows falsely declined customers spend **25% less over the next 12 months**. Average 12-month spend is **$400**, margin is **10%**.
+   - Recompute the "lost future value" term (one line of arithmetic).
+   - Compared with the $20 used in 1.4, does this make decline thresholds **stricter or looser**? Why?
+3. **(3.2 check)** Your surrogate, the 30-day return rate, starts improving right after the team launches a "we're sorry" discount email for declined customers. Which Goodhart mechanism might be at work?
+
+</Callout>

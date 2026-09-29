@@ -1,0 +1,15 @@
+<svg width="100%" viewBox="0 0 680 500" role="img"><title>Problem framing steps</title><desc>Flow: business objective, then a gate asking whether ML is needed (no leads to rules and heuristics), then ML objective, task type, and input and output definition.</desc><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<g class="node c-purple"><rect x="170" y="40" width="260" height="56" rx="4" stroke-width="0.5"/><text class="th" x="300" y="58" text-anchor="middle" dominant-baseline="central">Business objective</text><text class="ts" x="300" y="80" text-anchor="middle" dominant-baseline="central">What does business want?</text></g>
+<g class="node c-purple"><rect x="170" y="136" width="260" height="56" rx="4" stroke-width="0.5"/><text class="th" x="300" y="154" text-anchor="middle" dominant-baseline="central">Is ML needed?</text><text class="ts" x="300" y="176" text-anchor="middle" dominant-baseline="central">Data, patterns, scale</text></g>
+<g class="node c-gray"><rect x="480" y="136" width="160" height="56" rx="4" stroke-width="0.5"/><text class="th" x="560" y="154" text-anchor="middle" dominant-baseline="central">Use rules</text><text class="ts" x="560" y="176" text-anchor="middle" dominant-baseline="central">Heuristics first</text></g>
+<g class="node c-purple"><rect x="170" y="232" width="260" height="56" rx="4" stroke-width="0.5"/><text class="th" x="300" y="250" text-anchor="middle" dominant-baseline="central">ML objective</text><text class="ts" x="300" y="272" text-anchor="middle" dominant-baseline="central">Proxy metric to optimize</text></g>
+<g class="node c-purple"><rect x="170" y="328" width="260" height="56" rx="4" stroke-width="0.5"/><text class="th" x="300" y="346" text-anchor="middle" dominant-baseline="central">Task type</text><text class="ts" x="300" y="368" text-anchor="middle" dominant-baseline="central">Classify, rank, regress</text></g>
+<g class="node c-purple"><rect x="170" y="424" width="260" height="56" rx="4" stroke-width="0.5"/><text class="th" x="300" y="442" text-anchor="middle" dominant-baseline="central">Input and output</text><text class="ts" x="300" y="464" text-anchor="middle" dominant-baseline="central">What goes in, what comes out</text></g>
+<line class="arr" x1="300" y1="98" x2="300" y2="132" marker-end="url(#arrow)"/>
+<line class="arr" x1="300" y1="194" x2="300" y2="228" marker-end="url(#arrow)"/>
+<text class="ts" x="310" y="211" dominant-baseline="central">Yes</text>
+<line class="arr" x1="432" y1="164" x2="476" y2="164" marker-end="url(#arrow)"/>
+<text class="ts" x="454" y="152" text-anchor="middle" dominant-baseline="central">No</text>
+<line class="arr" x1="300" y1="290" x2="300" y2="324" marker-end="url(#arrow)"/>
+<line class="arr" x1="300" y1="386" x2="300" y2="420" marker-end="url(#arrow)"/>
+</svg>

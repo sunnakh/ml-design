@@ -1,0 +1,19 @@
+<svg width="100%" viewBox="0 0 680 300" role="img"><title>When fraud labels arrive</title><desc>Timeline from day 0 to day 120 after an order. Manual review outcomes arrive within hours but only for reviewed orders. Issuer fraud alerts arrive from day 3 to day 30 and are partial. Chargebacks arrive from day 30 to day 120 and are the most complete but slowest.</desc><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<g class="c-gray"><rect x="40" y="40" width="165" height="50" rx="4" stroke-width="0.5"/><text class="th" x="122.5" y="56" text-anchor="middle" dominant-baseline="central">Review outcome</text><text class="ts" x="122.5" y="76" text-anchor="middle" dominant-baseline="central">Hours, reviewed only</text></g>
+<g class="c-gray"><rect x="40" y="110" width="165" height="50" rx="4" stroke-width="0.5"/><text class="th" x="122.5" y="126" text-anchor="middle" dominant-baseline="central">Issuer fraud alerts</text><text class="ts" x="122.5" y="146" text-anchor="middle" dominant-baseline="central">Days, partial</text></g>
+<g class="c-gray"><rect x="40" y="180" width="165" height="50" rx="4" stroke-width="0.5"/><text class="th" x="122.5" y="196" text-anchor="middle" dominant-baseline="central">Chargebacks</text><text class="ts" x="122.5" y="216" text-anchor="middle" dominant-baseline="central">Slow, most complete</text></g>
+<rect class="c-purple" x="220" y="55" width="8" height="20" rx="2" stroke-width="0.5"/>
+<rect class="c-purple" x="231" y="125" width="94" height="20" rx="2" stroke-width="0.5"/>
+<rect class="c-purple" x="325" y="195" width="315" height="20" rx="2" stroke-width="0.5"/>
+<line x1="220" y1="250" x2="640" y2="250" stroke="var(--text-secondary)" stroke-width="0.5"/>
+<line x1="220" y1="246" x2="220" y2="254" stroke="var(--text-secondary)" stroke-width="0.5"/>
+<line x1="325" y1="246" x2="325" y2="254" stroke="var(--text-secondary)" stroke-width="0.5"/>
+<line x1="430" y1="246" x2="430" y2="254" stroke="var(--text-secondary)" stroke-width="0.5"/>
+<line x1="535" y1="246" x2="535" y2="254" stroke="var(--text-secondary)" stroke-width="0.5"/>
+<line x1="640" y1="246" x2="640" y2="254" stroke="var(--text-secondary)" stroke-width="0.5"/>
+<text class="ts" x="220" y="268" text-anchor="start" dominant-baseline="central">Day 0</text>
+<text class="ts" x="325" y="268" text-anchor="middle" dominant-baseline="central">30</text>
+<text class="ts" x="430" y="268" text-anchor="middle" dominant-baseline="central">60</text>
+<text class="ts" x="535" y="268" text-anchor="middle" dominant-baseline="central">90</text>
+<text class="ts" x="640" y="268" text-anchor="end" dominant-baseline="central">120</text>
+</svg>
