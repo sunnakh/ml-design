@@ -1,0 +1,24 @@
+---
+title: 4. Training setup
+description: Everything that decides what the model actually learns.
+---
+
+## 4.1 Loss functions
+
+Match the loss to the task: log loss for probabilities, pairwise or listwise losses for ranking, regression losses for amounts.
+
+## 4.2 Splits and leakage
+
+Split by time or entity, not randomly, so validation reflects future traffic.
+
+## 4.3 Imbalance, negative sampling
+
+Rare positives need resampling, reweighting or sampled negatives. Correct the probabilities afterwards.
+
+## 4.4 Bias in logged data
+
+Logs only contain reactions to items you showed. Position and selection bias need correction or exploration data.
+
+## 4.5 Calibration
+
+Make predicted probabilities match observed rates (Platt scaling, isotonic regression), especially when scores are multiplied or thresholded.

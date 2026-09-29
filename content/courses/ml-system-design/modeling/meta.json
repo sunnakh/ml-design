@@ -1,0 +1,5 @@
+{
+  "title": "Modeling",
+  "icon": "Network",
+  "pages": ["index", "objective-and-label", "baselines", "model-selection", "training-setup", "training-at-scale", "tuning-and-debugging", "retraining-and-evolution"]
+}

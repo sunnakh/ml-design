@@ -1,0 +1,20 @@
+---
+title: 7. Retraining and evolution
+description: Keeping the model current after launch.
+---
+
+## 7.1 Retrain cadence
+
+Scheduled, triggered by drift, or continuous. Match it to how fast the world changes.
+
+## 7.2 Cold start
+
+New users and items have no history. Use content features, popularity or exploration until data arrives.
+
+## 7.3 Continual learning
+
+Update the model incrementally on fresh data. Fresher, but riskier and harder to validate.
+
+## 7.4 Replacing a live model
+
+Validate offline, shadow, canary and A/B test before a new model takes over, with a fast rollback path.

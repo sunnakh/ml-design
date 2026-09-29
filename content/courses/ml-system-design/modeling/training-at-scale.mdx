@@ -1,0 +1,16 @@
+---
+title: 5. Training at scale
+description: Training when data or models outgrow one machine.
+---
+
+## 5.1 Data parallelism
+
+Split batches across many workers, each holding a full model copy, and combine gradients.
+
+## 5.2 Model parallelism, big embeddings
+
+Split large models or huge embedding tables across devices when they don't fit on one.
+
+## 5.3 Hardware, checkpointing
+
+Pick CPUs, GPUs or accelerators for cost and speed, and checkpoint regularly so failures don't lose progress.

@@ -1,0 +1,96 @@
+---
+title: 1. Objective and label
+description: Connect the business goal to the loss the optimizer actually sees.
+---
+
+## 1.1 Business → ML objective
+
+### The objective ladder
+
+<Diagram src="modeling/objective-ladder.svg" />
+
+Each rung down is **easier to measure** but **less faithful** to the goal. Every gap between two rungs is a place the system can go wrong. The optimizer only sees the bottom rung. Only the **A/B test** tells you whether improving the bottom rung actually moves the top one.
+
+### Design choice 1: which target?
+
+| Candidate target | Positives per 1k impressions | Feedback delay | Alignment with GMV |
+|---|---|---|---|
+| Click | ~30 | Seconds | Weak: clickbait wins |
+| Add-to-cart | ~3 | Minutes | Medium |
+| Purchase | ~0.5 | Hours to days | Strong |
+| Purchase × price | ~0.5, heavy-tailed | Days (returns: weeks) | Strongest, but high variance |
+
+*(Illustrative numbers, realistic orders of magnitude for e-commerce.)*
+
+The pattern: **dense, fast signals are misaligned; aligned signals are sparse and slow.** There's no free option.
+
+### Design choice 2: one blended label, or decomposed predictions?
+
+**Blended:** one model on one label, such as "purchased". Simple, but sparse, and business priorities get baked into training.
+
+**Decomposed** (the industry standard for feeds, ads and search): separate predictions combined at serving time:
+
+```
+score(u, i) = P(click | u, i)
+            × P(purchase | click, u, i)
+            × price(i)^α
+            − λ · P(return | purchase, u, i)
+```
+
+Why decompose:
+
+- **Denser data per model.** The purchase model trains only on clicks, so its positive rate is ~0.5/30 ≈ 1.7% instead of 0.05%.
+- **Business weights live outside training.** α and λ are product decisions you can tune weekly without retraining.
+- **Debuggable.** When GMV drops, you can tell which piece broke.
+
+Costs: more models (or heads) to train, serve and monitor; errors multiply through the product; and **each P must be a calibrated probability**, not just a good ranking score (see 4.5).
+
+### Assumptions
+
+1. **The proxy correlates with the goal and keeps correlating after you optimize it.** Goodhart's law: once a measure becomes a target, it stops being a good measure.
+2. **Short-term signals predict long-term value.** A purchase today doesn't guarantee the user returns next month.
+3. **Logged behavior reflects preference.** It really reflects what you *chose to show*. Users can't click what they never saw (see 4.4).
+
+### Trade-offs
+
+- **Density vs alignment**: see the table above.
+- **Value weighting vs variance**: one $3,000 laptop can dominate the loss and push luxury items. Cap price, log-transform it, or tune α < 1.
+- **Short-term vs long-term**: session GMV can rise while trust and retention fall.
+- **Multiple stakeholders**: buyers, sellers and the platform. Stakeholders not in the objective become **guardrails**.
+
+### Failure modes
+
+| Failure | Symptom |
+|---|---|
+| Proxy hacking | CTR ↑, GMV flat or ↓. Clickbait thumbnails, bait prices. |
+| Offline–online gap | Offline AUC +2%, A/B test flat. |
+| Silent long-term damage | GMV ↑ for 2 weeks, retention ↓ after 2 months. Use a **long-term holdout** (e.g. 1% of users on the old system for months). |
+| Outlier domination | The value-weighted model floods the feed with expensive items. |
+| Guardrail breach | Return rate, complaints or seller concentration climb unnoticed. |
+
+**Guardrail metrics** are defined together with the objective: return rate, p99 latency, seller diversity, complaint rate. The ship rule: the primary metric improves **and** no guardrail regresses.
+
+### Connections
+
+- **← Requirements:** the online metric and guardrails come from there.
+- **→ 1.3 Labels:** your target decides what you must log.
+- **→ Branch 3:** decomposition means several models or one multi-task model.
+- **→ Branch 4:** each target needs its own loss; multiplying probabilities requires calibration.
+- **→ Evaluation:** the A/B test is the only place you verify the link from ML target to business goal.
+- **→ Monitoring:** track the proxy and the business metric side by side.
+
+<Callout title="Exercise 1.1">
+  Bazaar v1 ranks the feed purely by `P(click)`. After a 2-week A/B test: CTR **+9%**, purchases per session **−1%**, return rate **+4%**. Why can better click prediction lead to fewer purchases and more returns? Propose a new objective with predictions, how to combine them, and guardrails. Name one risk a 2-week test can't detect, and how you'd catch it.
+</Callout>
+
+## 1.2 Task type
+
+Classification, regression, ranking or retrieval. The task type decides the loss, metrics and serving setup.
+
+## 1.3 Label definition
+
+State exactly how each label is computed from logs, including the time window.
+
+## 1.4 Prediction unit and timing
+
+Decide what one prediction is about (user, item, user–item pair) and when it is made.

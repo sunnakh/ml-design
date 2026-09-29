@@ -1,0 +1,58 @@
+---
+title: Modeling
+description: Choose the objective, pick a baseline and a model, and train it well.
+icon: Network
+---
+
+Modeling runs in order, with an inner loop: **baseline** (heuristic or simple model) → **model selection** (quality vs latency vs cost) → **training setup** (loss, splits, imbalance) → **scaling training** (distributed, hardware) → **tuning and debugging** (hyperparameters, overfitting, tracking).
+
+<Diagram src="modeling/modeling-stage-subtopics.svg" />
+
+## The multi-stage ranking funnel
+
+For recommendation and search, one model can't score millions of items within the latency budget. Each stage trades speed for quality:
+
+<Diagram src="modeling/multi-stage-ranking-funnel.svg" />
+
+| Stage | Candidates | Model | Optimizes for |
+|---|---|---|---|
+| Retrieval | Millions → ~1,000 | Two-tower embeddings + approximate nearest-neighbor (ANN) search | Recall |
+| Ranking | ~1,000 → ~100 | Heavy model with rich features | Precision |
+| Re-ranking | ~100 → ~10 | Rules on top of scores | Diversity, freshness, business rules |
+
+If you name this funnel in a recommendation or search interview, you've covered the core architecture.
+
+## MLOps components modeling relies on
+
+Model registry, model serving and similar pieces aren't stages; they're the **platform** stages 3–8 run on.
+
+<Diagram src="modeling/mlops-platform-components.svg" />
+
+The middle column is the key: the feature store and model registry are how the offline and online sides share things. The feature store prevents **training-serving skew**; the registry versions every model with its lineage and stage (`staging` → `production` → `archived`), so rollback means pointing back to the previous version. CI/CD for ML tests code, data and models before anything ships.
+
+| Stage | Components used |
+|---|---|
+| Data | Warehouse, data versioning (DVC, lakeFS) |
+| Features | Feature store (Feast, Tecton) |
+| Modeling | Training jobs, experiment tracking (MLflow, W&B) |
+| Evaluation | Experiment tracking, CI/CD |
+| Deployment | Model registry, serving (Triton, KServe), rollout |
+| Monitoring | Monitoring, orchestration (Airflow, Kubeflow) to retrain |
+
+## Running example: Bazaar
+
+Bazaar is an e-commerce marketplace whose home feed ranks products for each user. The business goal is to grow GMV (gross merchandise value).
+
+## Topic map
+
+<Diagram src="modeling/modeling-topic-map.html" />
+
+<Cards>
+  <Card title="1. Objective and label" href="/courses/ml-system-design/modeling/objective-and-label">Business → ML objective · Task type · Label definition · Prediction unit and timing</Card>
+  <Card title="2. Baselines" href="/courses/ml-system-design/modeling/baselines">Heuristic · Simple ML · Sanity check</Card>
+  <Card title="3. Model selection" href="/courses/ml-system-design/modeling/model-selection">Model families · Constraints · Architecture patterns · Build vs fine-tune vs API</Card>
+  <Card title="4. Training setup" href="/courses/ml-system-design/modeling/training-setup">Loss · Splits and leakage · Imbalance · Logged-data bias · Calibration</Card>
+  <Card title="5. Training at scale" href="/courses/ml-system-design/modeling/training-at-scale">Data parallelism · Model parallelism · Hardware and checkpointing</Card>
+  <Card title="6. Tuning and debugging" href="/courses/ml-system-design/modeling/tuning-and-debugging">Bias–variance · Hyperparameter search · Error analysis · Reproducibility</Card>
+  <Card title="7. Retraining and evolution" href="/courses/ml-system-design/modeling/retraining-and-evolution">Cadence · Cold start · Continual learning · Replacing a live model</Card>
+</Cards>
