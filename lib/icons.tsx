@@ -17,10 +17,14 @@ const gradients: Record<string, [string, string]> = {
 };
 const fallback: [string, string] = ['#64748b', '#94a3b8'];
 
+export function iconGradient(name: string): [string, string] {
+  return gradients[name] ?? fallback;
+}
+
 export function ColorIcon({ name, size = 20 }: { name: string; size?: number }) {
   const Icon = icons[name as keyof typeof icons];
   if (!Icon) return null;
-  const [from, to] = gradients[name] ?? fallback;
+  const [from, to] = iconGradient(name);
 
   return (
     <span
