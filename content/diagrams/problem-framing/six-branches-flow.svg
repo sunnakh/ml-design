@@ -1,0 +1,15 @@
+<svg width="100%" viewBox="0 0 680 260" role="img"><title>Problem framing: six branches as one flow</title><desc>Decision and value leads to feasibility, then ML objective, then task formulation, then constraints, then dynamics. A dashed feedback arrow from dynamics back to decision and value shows that production feedback revises the framing.</desc><defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<g class="c-purple"><rect x="40" y="40" width="180" height="60" rx="4" stroke-width="0.5"/><text class="th" x="130" y="60" text-anchor="middle" dominant-baseline="central">Decision and value</text><text class="ts" x="130" y="82" text-anchor="middle" dominant-baseline="central">What to decide, why</text></g>
+<g class="c-purple"><rect x="250" y="40" width="180" height="60" rx="4" stroke-width="0.5"/><text class="th" x="340" y="60" text-anchor="middle" dominant-baseline="central">Feasibility</text><text class="ts" x="340" y="82" text-anchor="middle" dominant-baseline="central">Is ML worth it?</text></g>
+<g class="c-purple"><rect x="460" y="40" width="180" height="60" rx="4" stroke-width="0.5"/><text class="th" x="550" y="60" text-anchor="middle" dominant-baseline="central">ML objective</text><text class="ts" x="550" y="82" text-anchor="middle" dominant-baseline="central">What model optimizes</text></g>
+<g class="c-teal"><rect x="460" y="160" width="180" height="60" rx="4" stroke-width="0.5"/><text class="th" x="550" y="180" text-anchor="middle" dominant-baseline="central">Task formulation</text><text class="ts" x="550" y="202" text-anchor="middle" dominant-baseline="central">Labels, units, policy</text></g>
+<g class="c-teal"><rect x="250" y="160" width="180" height="60" rx="4" stroke-width="0.5"/><text class="th" x="340" y="180" text-anchor="middle" dominant-baseline="central">Constraints</text><text class="ts" x="340" y="202" text-anchor="middle" dominant-baseline="central">Latency, law, fairness</text></g>
+<g class="c-coral"><rect x="40" y="160" width="180" height="60" rx="4" stroke-width="0.5"/><text class="th" x="130" y="180" text-anchor="middle" dominant-baseline="central">Dynamics</text><text class="ts" x="130" y="202" text-anchor="middle" dominant-baseline="central">Delay, bias, adversaries</text></g>
+<line class="arr" x1="222" y1="70" x2="246" y2="70" marker-end="url(#arrow)"/>
+<line class="arr" x1="432" y1="70" x2="456" y2="70" marker-end="url(#arrow)"/>
+<line class="arr" x1="550" y1="102" x2="550" y2="156" marker-end="url(#arrow)"/>
+<line class="arr" x1="458" y1="190" x2="434" y2="190" marker-end="url(#arrow)"/>
+<line class="arr" x1="248" y1="190" x2="224" y2="190" marker-end="url(#arrow)"/>
+<line class="arr" x1="130" y1="158" x2="130" y2="104" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
+<line class="arr" x1="260" y1="244" x2="292" y2="244" stroke-dasharray="5 4"/><text class="ts" x="302" y="244" dominant-baseline="central">Production feedback revises the framing</text>
+</svg>

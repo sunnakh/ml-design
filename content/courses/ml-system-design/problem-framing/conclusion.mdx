@@ -1,0 +1,298 @@
+---
+title: Conclusion
+description: The whole problem-framing stage on one page, from the decision to the dynamics.
+---
+
+## 1. What problem framing is
+
+Problem framing turns a vague business wish ("use ML to stop fraud") into a task that is **precise, valuable, feasible, buildable and safe to operate**. It happens before any data pipeline or model exists, and it decides more of the system's eventual value than any modeling choice made later.
+
+The whole topic rests on one idea:
+
+> **Predictions have no value on their own. Value comes only when a prediction changes a decision, and that decision changes an outcome, measured against what would have happened anyway.**
+
+Everything else follows from this idea. You work out which decision is being made, how to measure a better outcome, whether ML beats simpler options, what the model should optimize, how its output becomes action, what limits apply, and how the system behaves once it starts changing the world it learns from.
+
+The six branches form a sequence, and what production teaches you feeds back into the framing:
+<Diagram src="problem-framing/six-branches-flow.svg" />
+## 2. Branch-by-branch summary
+
+### Branch 1: Objective and decision. *What are we deciding, and what counts as winning?*
+
+**1.1 Find the decision.** Every ML ask hides one or more decisions. Pin down who decides, what the choices are, when the decision is made, what is known at that moment, and what today's default is. The decision point is itself a trade-off: **acting later means more information but less preventable loss**.
+- ShopFast chose checkout, with four actions: approve, step-up, decline and review.
+- That one choice set the latency budget, which features are legal to use, and which labels can ever be observed.
+
+**1.2 Stakeholders and success.** Map everyone who wants, fears, vetoes or pays for the decision.
+- Turn the conflicts into a **common currency**: Total Cost of Fraud (TCF) = fraud loss + fees + false-decline cost + review cost + friction.
+- Write a **success contract** before modeling: baseline, target, guardrails, measurement plan, timing, kill criteria and decision rights.
+- The most dangerous failure is **asymmetric visibility**. Fraud losses appear on reports; false declines appear nowhere. Organizations therefore over-block for years without noticing.
+
+**1.3 Metric hierarchy.** Order metrics from slow and true to fast and approximate:
+- business outcome (TCF, quarterly)
+- online product metrics (approval rate, chargebacks, leading indicators)
+- offline model metrics (PR-AUC, dollar recall at the operating point, calibration)
+- training loss
+- system health
+
+Each layer is a proxy for the one above and is trustworthy only if moving it has been **shown** to move that layer. Guardrails cut across layers with veto power.
+
+**1.4 Cost of errors.** Errors aren't equal. Build a **cost matrix** (action × truth), then choose the action that minimizes *p · C(fraud) + (1 − p) · C(legit)*.
+- Thresholds then **depend on the amount**. Large orders get stricter treatment automatically.
+- Cheap middle actions (step-up, review) often win.
+- The model supplies p; the costs live in a separate **policy layer**, so the business can change them without retraining.
+
+### Branch 2: Feasibility. *Should this be ML at all, and will it pay?*
+
+**2.1 Non-ML baseline.** Climb a ladder: current state → cleaned rules and heuristics → simple model → complex model. Climb only when the gap pays for itself.
+- At ShopFast, the rules cleanup plus cost-based actions captured a large gain **with no ML at all**.
+- Rules survive after ML launches as hard constraints, fallback, cold start and fast response. The mature architecture is a **hybrid**: hard rules → model → cost policy → override rules.
+
+**2.2 Learnable signal.** Four checks, each with a cheap probe:
+- **Information**: expert test, lift tables.
+- **Stability**: out-of-time test.
+- **Sufficiency**: learning curves, count of positives.
+- **Ceiling**: label audit.
+
+The audit found that 25% of "fraud" chargebacks were **friendly fraud**, a different target with a different decision point.
+
+**2.3 Data and label access.** For every feature: does it exist before the decision, can it be served in time, can its history be rebuilt as of each past moment, and is it legal? For labels: speed, coverage, quality and volume.
+- **Log features at serving time from day one.**
+- Never treat immature labels as negatives.
+- Plan for training/serving skew, overwritten history and upstream outages.
+
+**2.4 ROI and risk.** Credit ML only with gains beyond the best non-ML option. Apply haircuts for the offline-to-online gap and for probability of success, and count run costs (people especially). Account for **time to value**, which label delay stretches to roughly 10 months.
+- Prefer staged scope, with kill criteria written in advance.
+- Keep a risk register with named owners.
+
+### Branch 3: ML objective. *What does the model actually optimize, and how far is that from what we want?*
+
+**3.1 Proxy metrics.** TCF can't be trained on directly. The chain runs: loss → prediction → decision → value, with a label gap, a calibration gap and an outcome gap along the way.
+- ShopFast's target is a **calibrated P(true fraud)** trained with log loss.
+- Amount and costs are applied in the policy layer.
+- Negative downsampling requires **calibration correction**.
+
+**3.2 Goodhart and misalignment.** Proxies break under pressure in four ways, each with its own fix:
+
+| Mechanism | Fix |
+|---|---|
+| Regressional (winner's curse) | Untouched holdout |
+| Extremal (pushing too far) | Counter-metrics |
+| Causal (moving a correlate) | Measure the goal itself |
+| Adversarial (gaming) | Features that are costly to fake |
+
+Organizational incentives are objectives too, and people optimize them.
+
+**3.3 Multiple objectives.** Four ways to combine competing goals: **scalarize** (TCF), **constrain** (guardrails, whose shadow prices show what each constraint costs), **Pareto** (show the trade-off curve and look for free gains), and **priority order** (law first). Combine in the policy layer, not in model weights.
+
+**3.4 Short vs long term.** Churn, step-up fatigue, deterrence, label starvation and network standing all play out over months to years. Quarterly A/B tests don't see them. Use long-term holdouts (kept secret), surrogate indexes, friction budgets and an explicit horizon in the success spec.
+
+### Branch 4: Task formulation. *Exactly what is predicted, for what, when, and how it becomes action.*
+
+**4.1 Task type.** It follows from the action, what the policy consumes and the labels you have:
+- binary or multi-task classification (checkout)
+- ranking (capacity-limited review)
+- graph (fraud rings)
+- anomaly detection (novel attacks, feeding analysts and features)
+- a separate friendly-fraud model
+
+Real systems use a **portfolio**, and batch tasks often become features for the real-time model.
+
+**4.2 Label definition.** A label is a versioned **function** over raw events. It specifies positives, negatives, unknowns (declined, immature), maturity window (from the arrival curve), precedence rules and attribution. Reviewer labels are fast but are opinions, and they can echo the model.
+
+**4.3 Prediction unit and horizon.** The unit matches the action's target (order, session, account, device, cluster). Prediction time equals the decision point. The horizon has to be both observable and actionable.
+- Attribute takeover labels only to orders after the takeover began.
+- **Split by time and by entity group**, or offline metrics lie.
+
+**4.4 Prediction to action policy.** The pipeline:
+1. Combine scores.
+2. Run a **value-of-information cascade**: call expensive data only when it could change the action.
+3. Pick the minimum-cost action.
+4. Apply constraints: capacity, guardrails, friction budgets, checked for feasibility.
+5. Explore on a small slice.
+6. Log everything, including propensities.
+
+Operate it with versioned config, shadow mode, staged rollout and a kill switch. **Re-derive thresholds whenever the model changes.**
+
+### Branch 5: Framing constraints. *Which hard limits reshape the design?*
+
+**5.1 Latency and serving mode.** A 100 ms p99 budget forces heavy features into batch or streaming, heavy tasks into features, and sometimes a split decision (fast now, richer later). The timeout default is a **cost decision**, not an accident.
+
+**5.2 Scale and cost.** Volume differs hugely by unit: billions of clickstream events, millions of orders, thousands of chargebacks. **Cost per decision must stay far below the value at stake per decision.** Use heavy models on orders, light ones on logins, rules on payment attempts, and cheap filters before any paid call. People are usually the largest cost.
+
+**5.3 Explainability and regulation.** Identify the regimes that may apply, with Legal. The same model used for a different decision (e.g., buy-now-pay-later credit) can fall under a different regime.
+- **Tier explanations by audience**: coarse for customers, detailed and restricted for analysts and auditors.
+- Use reason codes, monotonic constraints, a human appeal path and documentation built as you go.
+- Transparency to customers is also a gaming risk.
+
+**5.4 Fairness and privacy.** Fraud detection, privacy and fairness pull against each other in pairs.
+- Measure **false declines among legitimate customers per group**, not raw decline rates.
+- Accept the impossibility result: you must *choose* which fairness property to protect.
+- "We don't use protected attributes" isn't fairness, because proxies carry them.
+- Minimize and pseudonymize data, plan retention and deletion, and put contracts on vendor data sharing.
+
+### Branch 6: Feedback and dynamics. *What happens once the system changes the world it learns from?*
+
+**6.1 Delayed labels.** Truth arrives up to 120 days late. Run **three feedback loops at different speeds**:
+- **minutes**: blocklists for confirmed fraud entities
+- **days**: proxy labels for monitoring and rules
+- **months**: mature labels for retraining and final readouts
+
+Use arrival-curve projections for cohort-level rates, never for individual orders.
+
+**6.2 Selection bias.** Only approved orders produce labels. Survivor bias can make a **blocked region look safe**, and replacing rules with a model then reopens the hole.
+- Fix it with targeted, secret, budgeted **exploration** and **propensity logging**, which enable inverse-propensity weighting and offline policy evaluation.
+- Exploration is also how you measure false declines and fairness.
+
+**6.3 Feedback loops.** Bias compounds across model generations: label starvation, reviewer echo, self-fulfilling decision-derived features, rules freezing the model's blind spots, customer behavior shifts, and oscillation when lag meets aggressive corrections.
+- Detect it by measuring **across generations**.
+- Break it with exploration, blind reviews, outcome-based features, rule expiry and damped policy changes.
+
+**6.4 Adversaries and drift.** There are four kinds of drift: covariate, prior, concept and pipeline. **Adversarial drift is mostly concept drift**, which input monitoring can't see.
+- Treat attackers as economic actors and make fraud unprofitable.
+- Build **layered defenses** at different speeds.
+- Keep a register of the attack surfaces created by earlier choices.
+- Retrain with recency weighting **without forgetting old attacks**.
+
+---
+
+## 3. The principles that kept recurring
+
+These twelve ideas showed up across every branch. Together they are the real takeaway:
+
+1. **Decisions, not predictions.** Value exists only where an action changes.
+2. **Everything is relative.** Compare against the best simple alternative, never against nothing.
+3. **Every metric is a proxy.** Pair each one with a counter-metric and re-validate the proxy-goal link regularly.
+4. **Keep the model narrow and the policy explicit.** Calibrated probabilities from the model; costs, constraints and thresholds in versioned policy.
+5. **Point-in-time correctness everywhere.** Features, labels, splits and batch scores must all respect the moment of decision.
+6. **Your actions shape your data.** Selection bias and feedback loops are the default, not the exception.
+7. **Time is a dimension of every choice.** Label delay, long-term effects, retraining cadence, oscillation.
+8. **Costs are asymmetric and per instance.** Thresholds follow expected cost, not accuracy.
+9. **Constraints have prices, and some are values.** Compute shadow prices, and let the right people decide what isn't just a dollar trade.
+10. **Opponents optimize against you.** Every design choice is also an attack surface. Layer defenses at several speeds.
+11. **Log everything.** Features, scores, versions, actions, reasons and propensities. Without them you can't debug, explain or evaluate.
+12. **Ownership is part of the design.** Decision rights, rule owners, risk owners, expiry dates.
+
+---
+
+## 4. The ShopFast framing spec: the deliverable
+
+| Area | Final framing |
+|---|---|
+| **Decisions** | Checkout (approve / step-up / decline / review) · pre-shipment hold · account lock at login · post-order friendly-fraud handling |
+| **Success** | TCF −20% in 2 quarters vs rules baseline; guardrails on approval rate, chargeback rate, p99 latency, review queue and segment decline ratio; 120-day final readout; kill criteria; Risk owns thresholds within the guardrails |
+| **Costs** | Amount-dependent cost matrix; false-decline cost measured with a long-term holdout; liability rules included |
+| **Baseline** | Cleaned rules + velocity + cost-based actions (rung 2); rules kept for hard constraints, fallback and fast response |
+| **Feasibility** | Strong checkout-time lift; monthly decay; ~20k positives/yr; friendly fraud split out; ~$1.6M/yr risk-adjusted net; staged logistic regression → trees |
+| **Objective** | Calibrated P(true fraud), log loss, sampling correction; dollar-weighted evaluation; counter-metrics; long-term holdout |
+| **Portfolio** | Multi-task checkout model · review ranking · nightly graph ring features · anomaly alerts · friendly-fraud model |
+| **Labels** | Versioned function: fraud-coded chargebacks, issuer alerts and confirmed takeovers; 120-day maturity; declined and immature = unknown; precedence rules |
+| **Units** | Order at checkout · session at login · daily account score · nightly clusters · rules at the payment-attempt level; time + group splits |
+| **Policy** | Value-of-information cascade → min expected cost → constraints → ~1% exploration → full logging with propensities; shadow mode, staged rollout, kill switch |
+| **Constraints** | 100 ms p99 with amount-aware timeout fallback; cost per decision matched to unit; tiered explanations with an appeal path; fairness metric and privacy inventory agreed with Legal |
+| **Dynamics** | Three feedback speeds; exploration and propensity weighting; blind reviews; outcome-based features; layered defense; drift monitoring |
+
+---
+
+## 5. A reusable framing checklist
+
+For any new ML problem, answer these before building anything.
+
+**Decision and value**
+- [ ] What decision changes, who owns it, what are the actions, when is it made, what is known then, and what's the default today?
+- [ ] Who are the stakeholders? What's the common currency? Guardrails, kill criteria, decision rights?
+- [ ] What's the metric hierarchy, and has each proxy link been validated?
+- [ ] What's the cost matrix? Are costs per instance? Who bears them?
+
+**Feasibility**
+- [ ] What's the best non-ML baseline, measured the same way?
+- [ ] Is there information, stability, sufficiency and a label ceiling that makes it worthwhile?
+- [ ] Can every feature be served in time, rebuilt as of past moments, and used legally? How fast and complete are the labels?
+- [ ] What's the risk-adjusted ROI and time to value? What's in the risk register?
+
+**ML objective**
+- [ ] What target, loss and weighting? Is calibration preserved?
+- [ ] How could each proxy be gamed or pushed too far? What are the counter-metrics?
+- [ ] How are objectives combined: scalar, constraints, Pareto? What are the shadow prices?
+- [ ] What long-term effects exist, and how will they be measured?
+
+**Task formulation**
+- [ ] Which task type per decision (portfolio)?
+- [ ] Is the label function versioned, with unknowns, maturity and precedence?
+- [ ] What unit, prediction time, horizon, attribution and split strategy?
+- [ ] What's the policy layer: combination, value of information, constraints, exploration, logging, operations?
+
+**Constraints**
+- [ ] What latency budget and serving mode per decision? What's the timeout default?
+- [ ] Does cost per decision stay below value per decision for each unit? Peak sizing?
+- [ ] Which regulatory regimes apply? What explanation tiers and appeal path?
+- [ ] What fairness metric and audit segments? Privacy inventory, retention and deletion?
+
+**Dynamics**
+- [ ] What feedback loops exist at minutes, days and months?
+- [ ] Where are the blind spots? What's the exploration budget? Are propensities logged?
+- [ ] Which loops could compound across generations, and what breaks them?
+- [ ] What's the attack-surface register, drift monitoring and retraining policy?
+
+---
+
+## 6. The most common ways framing fails
+
+1. A **dashboard model** that no decision consumes.
+2. **Time-travel features** caused by an unclear decision point.
+3. **Immature labels treated as negatives.**
+4. **Crediting ML with gains the rules cleanup produced.**
+5. **ROC-AUC or accuracy** standing in for business value.
+6. **Uncalibrated scores** (downsampling, class weights) feeding a cost policy.
+7. **New model, old thresholds**: the day-1 decline-rate spike.
+8. **Survivor bias** reopening a fraud hole the rules had closed.
+9. **Invisible false declines**, leading to years of over-blocking.
+10. **Leaky random splits** inflating offline results.
+11. **Self-fulfilling features** and reviewer echo compounding across versions.
+12. **Fail-open timeouts, paid calls on every attempt and detailed customer explanations** handed to attackers.
+
+---
+
+## 7. How framing hands off to the rest of the system
+
+| Later stage | What framing hands it |
+|---|---|
+| **2. Requirements** | Success spec, guardrails, latency budget, scale per unit, regulatory and fairness requirements |
+| **3. Data** | Data inventory, label function, maturity window, feature logging, exploration traffic |
+| **4. Features** | Point-in-time rules, batch/streaming split, graph and anomaly outputs as features, vendor score as a feature |
+| **5. Modeling** | Target, loss, calibration, sampling correction, portfolio, time + group splits |
+| **6. Evaluation** | Metric hierarchy, cost matrix, baseline, offline policy evaluation, A/B plan, long-term holdout |
+| **7. Deployment** | Policy layer, cascade, timeout fallback, shadow mode, staged rollout, kill switch, peak sizing |
+| **8. Monitoring** | Leading indicators, label projections, drift monitors, per-segment and cross-generation tracking |
+
+---
+
+## 8. In an interview (5–8 minutes)
+
+1. **Clarify the decision**: actions, decision point, today's default.
+2. **Define success**: business metric, common currency, 2–3 guardrails, and the error-cost asymmetry.
+3. **Sanity-check ML**: baseline first, whether there's signal, where the labels come from and how late they arrive.
+4. **State the formulation**: task type, label with its unknowns, unit and horizon, how scores become actions.
+5. **Name the constraints**: latency and serving mode, one fairness or regulatory point.
+6. **Flag the dynamics**: label delay, selection bias from your own decisions, adversaries or feedback loops.
+
+Say the trade-offs out loud. Interviewers score the reasoning, not a perfect design.
+
+---
+
+## Capstone: FoodDash refund abuse
+
+<Callout title="Frame a new problem end to end">
+
+This reuses the FoodDash problem from the branch 1 checkpoint and covers all six branches. Bullets are fine; about 12 lines.
+
+> Customers claim "items missing" to get refunds they don't deserve. The ask: *"Use ML to reduce refund abuse."*
+
+1. **Decision**: the decision point and at least 3 actions.
+2. **Success**: a common currency, one guardrail, and who owns the trade-off.
+3. **Feasibility**: the non-ML baseline you'd try first, and one data-access risk.
+4. **Objective and labels**: the label definition, including what's *unknown*.
+5. **Constraints**: one latency *or* fairness issue specific to this problem.
+6. **Dynamics**: one selection-bias trap and one way abusers will adapt.
+
+</Callout>
