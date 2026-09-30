@@ -5,16 +5,407 @@ description: How labels, the model's own actions and the world change over time.
 
 ## 6.1 Delayed labels
 
-Some labels arrive long after the prediction. Fraud chargebacks come 30–120 days later. You need leading indicators for early readouts and a training setup that handles incomplete recent data.
+### What problem it solves
+
+Labels have come up before: arrival timing (2.3), the maturity window (4.2). This part covers **what the delay does to the whole system**:
+
+| Area | Effect of a 120-day delay |
+|---|---|
+| **Training** | The newest usable labels are about 4 months old, so the model is always **a season behind** attackers |
+| **Evaluation** | The final A/B readout comes at about 120 days (2.4), so decisions wait |
+| **Monitoring** | If the model starts failing today, chargebacks show it **months** from now |
+| **Recent data** | Not-yet-arrived positives look like negatives (2.3) |
+
+Delay is unavoidable. The design question is **how to get useful feedback faster, and how to use partial feedback without being fooled by it.**
+
+### How it works: three feedback speeds
+
+A good design doesn't rely on one feedback loop. It runs **three, at different speeds**, each feeding a different part of the system:
+
+<Diagram src="problem-framing/three-feedback-speeds-for-delayed-labels.svg" />
+
+**Minutes: feedback at the entity level.** Once an analyst confirms a card, device or account as fraudulent, **every future order touching it is blocked or held immediately**. The model doesn't need retraining to stop *that* fraudster. This is the fastest loop, and it's mostly rules and lookups (2.1).
+
+**Days: fast proxy labels.** Issuer fraud alerts, reviewer outcomes, customer "I didn't order this" reports. They're used for:
+- **Monitoring**: leading indicators (1.3). If the issuer-alert rate on approved orders doubles this week, something is wrong *now*.
+- **Rules**: analysts write hotfix rules for new patterns within hours.
+- **Optionally, a fast model**: trained on proxy labels, then corrected with mature labels. It's faster, but it inherits the proxies' biases (reviewer echo, uneven issuer reporting, 4.2).
+
+**Months: mature chargebacks.** The ground truth. Used for retraining, final A/B readouts, recalibration, and checking whether the fast proxies can be trusted.
+
+### Using partial labels without being fooled
+
+**Technique 1: arrival-curve projection (for aggregates).** From 4.2: F(d) = the fraction of eventual chargebacks that have arrived by age d. For a **group** of orders all aged d:
+
+> projected eventual rate ≈ observed rate so far ÷ F(d)
+
+| Cohort | Age | Observed so far | F(age) | Projected eventual |
+|---|---|---|---|---|
+| June orders | 90 days | 0.194% | 0.97 | 0.20% |
+| August orders | 30 days | 0.150% | 0.60 | **0.25%** |
+
+The August cohort *looks* cleaner (0.150% < 0.194%) but is projected to be **worse**. A naive dashboard shows fraud falling while an attack is growing.
+
+**Technique 2: delayed-feedback modeling (for training).** Instead of treating recent unlabeled orders as negatives, model both whether an order is fraud *and* how long its label takes to arrive. This is a known technique from online advertising, where conversions also arrive late. It lets you train on fresher data without the "recent = clean" bias. It's more complex; use it when freshness really matters.
+
+**Technique 3: never relabel individual orders from the curve.** The projection works for *rates across many orders*. For any single order, it tells you nothing.
+
+### Assumptions
+
+- **The arrival curve is stable.** It isn't always: holidays shift when cardholders check statements, and processors change dispute rules. Re-estimate it quarterly.
+- **Proxies track the truth closely enough**, checked against mature labels.
+- **Entity confirmations are accurate.** A wrong confirmation blocks a legitimate card everywhere.
+
+### Design choices
+
+1. **Maturity window**: from the arrival curve (4.2).
+2. **Whether to use proxy labels in training** or only for monitoring. The safer default is **monitoring only**, and training only after they've been validated.
+3. **Correction method**: a simple arrival-curve projection for dashboards; delayed-feedback models for training if freshness pays off.
+4. **Retraining cadence**: monthly retraining on mature labels plus fast entity blocklists is a common setup.
+5. **Entity-level fast feedback**: which entities, and how confirmations expire or get reversed.
+
+### Trade-offs
+
+- **Freshness vs completeness**, now with numbers: a 60-day window gives labels 2 months fresher and misses about 10% of positives. A 120-day window captures about 99%, with 4-month-old patterns.
+- **Proxy speed vs proxy bias**: issuer alerts are fast, but some issuers barely report, and reviewer labels carry reviewer habits.
+- **Aggressive entity blocking vs spreading errors**: a false confirmation propagates to every order on that card or device. Blocks need an owner, an expiry and a reversal path.
+
+### Failure modes
+
+- **Immature labels as negatives**: covered in 2.3 and 4.2, and still the most common mistake.
+- **Naive recent-cohort dashboards**: fraud "falls" in the newest data just because the labels haven't arrived.
+- **Months of silent decay**: no leading indicators, so the model degrades for a quarter before anyone sees it.
+- **A shifted arrival curve**: holiday statements get checked late, projections under-estimate, and the team relaxes during an attack.
+- **Calling A/B tests early**: week-3 labels are 20–40% complete, and the "winner" is noise (3.2 regressional).
+- **Proxy drift**: a major issuer changes its alert behavior, the proxy rate jumps, and the team chases a fraud wave that doesn't exist.
+
+### Connections
+
+- **← 1.3**: leading indicators are the days-speed loop.
+- **← 2.1**: rules and blocklists are the minutes-speed loop.
+- **← 2.3 / 4.2**: label sources, arrival curve, maturity window.
+- **← 2.4**: delay stretches time to value.
+- **→ 6.2**: delayed labels plus missing labels on declined orders compound each other.
+- **→ 6.4**: attackers exploit the lag, since new patterns get about 4 months of free run against the model.
+- **→ Stages 5, 8**: retraining cadence and projection-aware monitoring.
+
+<Callout title="Exercise 6.1 (includes checks)">
+
+1. The arrival curve gives F(30) = 0.6 and F(60) = 0.9. Orders aged **30 days** show **0.15%** chargebacks so far; orders aged **60 days** show **0.18%**. Project each cohort's eventual rate. Is anything alarming?
+2. A new attack pattern starts **today**. Monthly retraining uses labels matured for 120 days. Roughly **when** does the model learn this pattern? What catches it sooner (name two)?
+3. **(4.2 check)** Why is the arrival-curve projection fine for a **cohort dashboard** but wrong for **relabeling individual recent orders** as fraud or legit?
+
+</Callout>
 
 ## 6.2 Selection bias
 
-You only observe outcomes for the actions you took. Once an order is declined, you never learn whether it was fraud. Fix: keep a small random exploration sample where the model's decision is not applied.
+### What problem it solves
+
+This is the idea I flagged in 1.1 as one of the most important on the map. **Your own decisions decide which outcomes you get to see.**
+- **Approved** orders produce labels: a chargeback or not.
+- **Declined** orders produce nothing. You'll never know if they were fraud.
+
+So training data, evaluation data and even your false-decline numbers are all **filtered by the policy that was running at the time**. The model learns P(fraud | x, *the old policy approved it*), not P(fraud | x). In statistics terms, the labels are *missing not at random*.
+
+### The hidden trap: survivor bias makes blocked regions look safe
+
+The ShopFast rule from 1.2: *decline if card country ≠ shipping country and amount > $300.*
+
+- Last year, **almost every** such order was declined, so there are no labels for them.
+- The few that **were** approved got through for special reasons: a trusted long-time customer, an analyst override. They're **unusually clean**.
+- A model trained on last year's approved orders sees "country mismatch + > $300" as **mostly legit**, because the only examples it saw were the survivors.
+- Replace the rules with the model, and it **reopens exactly the fraud hole the rule was closing**.
+
+The model is right about the data it saw. The data just wasn't the world.
+
+### How it works: design for observability
+
+<Diagram src="problem-framing/selection-bias-labels-filtered-by-policy.svg" />
+
+**1. Measure the blind spot.** What % of traffic never gets a clean label? For ShopFast: about 1% declined, plus about 3% stepped-up with about 15% of those failing, which is ambiguous (4.2). Small in volume, but it's **exactly the highest-risk region**.
+
+**2. Exploration: pay a little to see.** For a small random slice of would-be declines, take a gentler action and **log the probability of that action** (the propensity):
+- **Where**: low amounts (bounded loss) and uncertain scores (most label value).
+- **What action**: usually **step-up, not approve**. It's cheaper, and fraudsters mostly fail it. Passing then leads to a chargeback or not, which is a label.
+- **Secret**: randomize by order, never by a pattern attackers can detect (6.4).
+- **Budget**: an explicit yearly fraud-dollar cap, owned by Risk (1.2).
+
+**3. Inverse propensity weighting.** Each labeled example gets weight **1 / P(it was observed)**. An explored order that had a 5% chance of approval stands in for 20 similar orders that weren't explored. This lets you:
+- **Train** without the survivor bias, at least in the explored regions.
+- **Evaluate new policies offline**: estimate a candidate policy's TCF from logged decisions *before* running it (offline policy evaluation). This is why 4.4 insisted on logging propensities.
+
+The catch: it only works where **every relevant action had a nonzero probability** (the overlap condition). Small propensities mean **huge weights and noisy estimates**. "Doubly robust" estimators, which combine a model's prediction with the weighting, reduce that variance.
+
+**4. Directed review sampling.** Spend a slice of review capacity (e.g., 10%) on orders chosen for **label value**, where the model is most uncertain or the data is thinnest, not only for immediate savings (5.2). This is active learning with humans.
+
+**5. Reject inference (weaker alternative).** Impute outcomes for declined orders, e.g., "assume declined = fraud" or use a model to guess. It's cheap, but it **assumes the answer**, which makes the policy confirm itself. Use it only as a stopgap.
+
+**6. Contextual bandits (the formal version).** Treat the decision as learning an action policy directly, balancing exploration against exploitation. Many production teams use a simple variant, "mostly the best action, a small random fraction otherwise," inside guardrails.
+
+### Two old questions this answers
+
+- **False-decline rate** (1.2's asymmetric visibility): measurable **only** through exploration or a holdout. Otherwise it's a guess.
+- **Fairness** (5.4): the false-decline rate among legitimate customers **per group** needs labels where you decline. Exploration is a fairness tool.
+
+### Assumptions
+
+- **Overlap**: the regions you want to learn about get explored with nonzero probability.
+- **Propensities are logged correctly**, for every decision, including rule and override paths.
+- **Attackers can't detect the exploration**, so explored outcomes represent normal behavior.
+
+### Design choices
+
+1. **Exploration budget and regions**: dollar cap, amount limits, score bands.
+2. **Exploration action**: step-up (cheap, noisier labels) vs approve (costly, clean labels).
+3. **Estimator**: plain inverse-propensity weighting (unbiased, high variance) vs doubly robust (lower variance, needs a good model) vs reject inference (low variance, biased).
+4. **Review split**: savings vs label value.
+5. **Holdout vs targeted exploration**: a broad random holdout sees everything at high cost; targeted exploration is cheap and sees only where you aim it.
+
+### Trade-offs
+
+- **Fraud dollars now vs model accuracy later**: exploration looks like pure cost on a quarterly dashboard. Its value appears in the next model version.
+- **Bias vs variance**: weighting is honest but noisy; imputation is stable but assumes the answer.
+- **Step-up vs approve exploration**: failed step-ups are ambiguous (4.2), while approvals give clean labels at full fraud exposure.
+
+### Failure modes
+
+- **Reopened holes**: the rules-replacement story above. This is the classic failure when a model takes over from rules.
+- **Optimistic offline evaluation**: a new policy looks great on logged data because the logs never show what happens in regions the old policy blocked.
+- **Deterministic policy, zero overlap**: propensities are 0 or 1, and offline policy evaluation is mathematically impossible.
+- **Exploration killed after one bad week**: someone sees the exploration fraud line item and turns it off, and the blind spots quietly return.
+- **Detectable exploration**: "orders under $50 at 3 AM sometimes get through," and attackers farm it.
+- **Missing propensities on rule and override paths**: those decisions can't be reweighted, so bias stays in the data.
+
+### Connections
+
+- **← 1.1 / 1.2**: the action hides the label; false declines were invisible.
+- **← 2.1**: labels inherited from rules.
+- **← 2.3 / 4.2**: exploration traffic and "unknown" labels.
+- **← 4.4**: propensity logging and the exploration slice in the policy pipeline.
+- **← 5.2 / 5.4**: review budget for label value; exploration as a fairness tool.
+- **→ 6.3**: selection bias sets off feedback loops over time.
+- **→ 6.4**: attackers probe for exploration.
+- **→ Stage 6**: offline policy evaluation before A/B tests.
+
+<Callout title="Exercise 6.2 (numbers + quick lines)">
+
+1. **Survivor bias.** The new model, trained on last year's approved orders, gives "country mismatch + > $300" orders **p = 0.4%**, which looks safe. Explain in one line **why**, what happens if the rule is deleted, and **one fix**.
+2. **Exploration cost.** There are about **100k** would-be declines/yr, and **60%** are under $100. You explore **5%** of those under $100 by approving them. Their fraud rate is **40%**, with an average amount of **$60**.
+   - What's the annual fraud cost of exploration?
+   - Name one way to make it cheaper.
+3. **Weights.** An explored order approved with propensity **0.05** turns out legit. What's its weight in evaluation? Why can a few orders like it swing an offline estimate?
+4. **(1.2 / 5.4 check)** Which **two** earlier questions become answerable only with exploration or a holdout?
+
+</Callout>
 
 ## 6.3 Feedback loops
 
-The model's predictions shape the data it is later trained on. A recommender that only shows popular items keeps making them more popular. Break loops with exploration and careful logging.
+### What problem it solves
+
+Part 6.2 was a **one-time** bias: labels filtered by one policy. Real systems **retrain repeatedly**. Each model generation shapes the data the next generation learns from, so a small bias in v1 becomes a bigger one in v2 and a big one in v5.
+
+Feedback loops are the **dynamics** of selection bias over time. No single model version looks wrong compared with the one before it, and the system still drifts somewhere nobody chose.
+
+### How it works: the generic loop
+
+<Diagram src="problem-framing/feedback-loop-across-generations.svg" />
+
+### Six loops in ShopFast
+
+| Loop | Mechanism | What goes wrong |
+|---|---|---|
+| **1. Label starvation** (self-reinforcing exclusion) | The model declines a segment → no labels there → the next model is more uncertain or trained on survivors → it declines more, or reopens the hole | Bias grows each generation (5.4, 6.2) |
+| **2. Reviewer echo** | Reviewers see the score → they agree with it → their labels train the next model → it gets more confident → reviewers defer even more | Humans stop being an independent check (automation bias) |
+| **3. Features derived from decisions** | Features like "times ShopFast declined this customer before" encode *the policy's own past behavior* | **Self-fulfilling**: declined once, so risky, so declined again |
+| **4. Rules ↔ model** | A model miss leads to an override rule. The rule declines that pattern, so there are no labels, so the model never learns it, so the rule becomes permanent | Rule rot (2.1) becomes structural |
+| **5. Customer behavior** | Friction pushes good customers to other payment methods, or away entirely | The remaining population changes, and the model sees "riskier-looking" traffic |
+| **6. Adversarial** | Blocking a pattern shifts fraud elsewhere | Performance decays (6.4 in depth) |
+
+A seventh dynamic appears when **loops meet delay (6.1)**: oscillation.
+1. A fraud spike becomes visible 90 days late.
+2. Risk tightens hard.
+3. False-decline complaints arrive months later.
+4. Risk loosens hard.
+5. Fraud spikes again.
+
+In control-systems terms, **long lag plus aggressive corrections produces oscillation**. The fix is smaller steps, faster signals (leading indicators, 6.1) and patience between changes.
+
+### Detecting loops
+
+Loops are invisible within a single model version, so you have to **measure across generations**:
+
+- **Label coverage per segment, per model version**: is the labeled share of each segment shrinking?
+- **Score and decline distributions per segment over versions**: slow, steady creep is the signature of a loop.
+- **Blind-review subset**: 10–20% of reviews done **without showing the score**. Compare agreement rates. The gap *measures* reviewer echo.
+- **Importance of decision-derived features**: if "prior declines by us" is among the top features, suspect self-fulfilment.
+- **Offline loop simulation**: replay several retrain → decide → relabel cycles on historical data. Does any segment drift?
+
+### Breaking loops
+
+1. **Exploration and holdouts (6.2)**: data that doesn't depend on the policy is the basic loop-breaker.
+2. **Blind reviews**: train on blind-review labels, or weight them higher, and use score-shown reviews only as weak labels.
+3. **Outcome-based features instead of decision-based ones**: replace "prior declines by ShopFast" with "prior **confirmed** fraud" or "prior chargebacks." Those are facts about the world, not about your policy.
+4. **Propensity-weighted retraining**: reweight so policy-shaped data doesn't dominate.
+5. **Rule lifecycle**: override rules expire (2.1), and pattern-hotfix rules get exploration built in so labels keep flowing.
+6. **Damped policy changes**: limit threshold moves per cycle, and wait for leading indicators before the next move.
+7. **Override labels with care**: customers who contest a decline via support are **more engaged than average** and aren't representative. Treat their outcomes as weak labels.
+
+### Assumptions that loops violate
+
+- Training data is **independent of the model**, not generated by its previous decisions.
+- **Labels are independent of predictions**. Reviewer echo breaks this.
+- **The population is stable** regardless of policy. Customer and fraudster responses break this.
+
+### Design choices
+
+1. **Blind-review share**: more share means more independent labels and slightly worse review decisions on those cases.
+2. **Allowed feature types**: ban or restrict features derived from decisions.
+3. **Retraining cadence**: frequent retraining on policy-shaped data **amplifies loops faster**. Frequency needs loop breakers alongside it.
+4. **Generation-level monitoring**: which metrics are tracked across versions, and who reviews them.
+
+### Trade-offs
+
+- **Blind review**: reviewers are more accurate with the score, and the labels are more independent without it.
+- **Excluding decision-derived features**: loses real signal (past declines partly reflect real risk) in exchange for no self-fulfilment. Outcome-based versions usually keep most of the signal.
+- **Retraining speed vs loop amplification**: fresh models vs faster drift.
+- **Damping vs responsiveness**: small steps avoid oscillation and react slowly to real attacks. That's why the fast rules layer exists.
+
+### Failure modes
+
+- **Slow drift across versions**: v5 is fine compared with v4, and awful compared with v1. Nobody compares across more than one version.
+- **Rubber-stamp reviewers**: 98% agreement with the model is treated as a quality signal when it's really echo.
+- **Self-fulfilling features**: "prior declines" at the top of feature importance, with a customer permanently trapped after one false decline.
+- **Permanent patch rules**: rules that keep their own region label-free forever.
+- **Oscillating policy**: tighten, complain, loosen, spike, repeat.
+- **Invisible segment exclusion**: one segment's labeled share falls from 8% to 1% over four versions (5.4).
+
+### Connections
+
+- **← 2.1**: rule rot as a loop.
+- **← 3.2**: Goodhart pressure repeated each generation.
+- **← 4.2**: reviewer labels and override labels.
+- **← 4.4**: logging and damped policy changes.
+- **← 5.4**: self-reinforcing exclusion.
+- **← 6.1**: delay plus loops produces oscillation.
+- **← 6.2**: exploration as the loop-breaker.
+- **→ 6.4**: the adversarial loop in depth.
+- **→ Stage 8**: generation-level monitoring.
+
+<Callout title="Exercise 6.3">
+
+1. The feature **"number of times ShopFast declined this customer before"** has the highest importance. Why is it dangerous? Propose a replacement.
+2. Reviewer agreement with the model is **94% when the score is shown** and **81% on the blind subset**. What does the 13-point gap mean? Which labels should training rely on?
+3. A fraud spike is spotted **90 days late**, and Risk tightens sharply. Four months later false-decline complaints spike, so they loosen, and fraud spikes again. Name the dynamic, and give **two fixes**.
+4. **(5.4 check)** Describe the self-reinforcing exclusion loop in two lines, and name one breaker.
+
+</Callout>
 
 ## 6.4 Adversaries and drift
 
-The world changes, and in fraud the other side actively adapts to your model. Expect patterns to shift, monitor for drift, and plan regular retraining.
+### What problem it solves
+
+Every model assumes the future looks like the training data. In fraud it doesn't, for two reasons:
+- **Natural drift**: seasons, new markets, product changes, the economy. It's gradual or periodic, and it isn't aimed at you.
+- **Adversarial drift**: fraudsters **watch your defenses and adapt**. It's fast, strategic, and aimed at your weakest point.
+
+Every earlier part left a weakness an attacker could use: threshold seams (1.4), cheap features (3.2), resettable IDs (4.3), fail-open timeouts (5.1), paid calls (5.2), explanations (5.3), label lag (6.1), detectable exploration (6.2). This part collects them and designs against them.
+
+### First principles: four kinds of drift
+
+Everything the model learned is a snapshot of P(x, y) at one point in time. Drift means that joint distribution changed, in one of four ways:
+
+| Type | What changes | ShopFast example | Seen by input monitoring? |
+|---|---|---|---|
+| **Covariate shift** | P(x): the inputs | Holiday traffic, a new country, a new app version | ✅ Yes |
+| **Prior shift** | P(y): the base rate | A fraud wave doubles the attack rate | ⚠️ Only via labels or leading indicators (6.1) |
+| **Concept drift** | P(y \| x): what inputs *mean* | Fraudsters adopt aged accounts, so "account > 30 days" no longer means safe | ❌ **Often invisible**: inputs look normal |
+| **Pipeline drift** | Feature *meaning*, via engineering | The vendor changes its device-ID format; null rates jump | ✅ If you monitor features |
+
+**Adversarial drift is mostly concept drift**: attackers make fraud *look like* normal traffic. That's why input monitoring alone can't catch it.
+
+### First principles: the attacker is an economic actor
+
+A fraudster maximizes **payout − cost − risk of getting caught**. The goal isn't "detect everything." It's to **make ShopFast unprofitable compared with other targets**. That's deterrence (3.4). Every defense either lowers the payout, raises the cost, or raises the risk.
+
+### How it works: layered defense
+
+No single layer holds. Stack layers so an attacker has to beat **all** of them, and have each layer run at a different speed (6.1):
+
+<Diagram src="problem-framing/layered-defense-and-attacker-adaptations.svg" />
+
+The dashed arrow on the left is the fastest loop from 6.1: fraud confirmed in review goes straight into the blocklists, in minutes.
+
+### The attack-surface register
+
+These are all the weaknesses planted in earlier parts, each with its defense:
+
+| Attack | Exploits | Defense |
+|---|---|---|
+| **Boundary probing / order splitting** | Amount-dependent thresholds (1.4) | Rate limits; velocity on split orders; small randomization at the boundary |
+| **Cheap-feature mimicry** | Account age, email domain (3.2) | Features that are costly to fake: long device history, behavior, graph links |
+| **Identity reset** | Entity-level history (4.3) | Graph linkage across cards, devices and addresses; treat "no history" as uncertainty, not safety |
+| **Hit-and-run campaigns** | ~4-month label lag (6.1) | Fast loops: blocklists, analyst rules, leading-indicator alerts |
+| **Farming exploration or holdouts** | Detectable randomization (6.2, 3.4) | Randomize per order, secretly, within dollar caps |
+| **Forcing timeouts** | Fail-open defaults (5.1) | Amount-aware timeout policy; watch timeout rates for attack patterns |
+| **Denial-of-wallet** | Paid calls on every attempt (5.2) | Cheap filters before any paid call |
+| **Learning from explanations** | Detailed customer reasons (5.3) | Tiered explanations; no counterfactuals to customers |
+| **Bust-out / sleeper accounts** | Trust earned through good history | Watch for sudden behavior change on trusted accounts, not just history |
+| **Support social engineering** | The human override path (5.3) | Override limits, identity verification, audit trails, review of override patterns |
+
+### Detecting drift
+
+1. **Input drift**: distribution shift per feature (e.g., population stability index), null rates, new categories. Catches covariate and pipeline drift.
+2. **Score drift**: the score distribution and decline/step-up rates per segment.
+3. **Leading indicators**: issuer alerts, step-up failure rates, review hit rates (1.3, 6.1). The **main early detector of concept drift**.
+4. **Projected label rates**: arrival-curve projections by cohort (6.1).
+5. **Champion–challenger**: a retrained challenger model scores traffic in shadow mode. If it diverges sharply from the champion, investigate.
+6. **Red teaming**: your own team attacks the system (split orders, fresh identities, forced timeouts) before real attackers do.
+
+### Retraining against drift
+
+- **Regular cadence** (monthly), plus **triggered retraining** when drift alarms fire.
+- **Recency weighting**: give newer data more weight, **but keep old attack types in the training set**. Fraudsters recycle old playbooks, and a model that forgot them reopens old holes.
+- **Poisoning awareness**: sleeper accounts and mass friendly-fraud disputes can distort labels deliberately. Look for label anomalies before retraining.
+
+### Assumptions
+
+- Attackers are **economic**: raise the cost enough and they move elsewhere. True for most organized fraud, less so for sophisticated targeted attacks.
+- Layers fail **independently**. If they share a weakness (every layer trusts account age), stacking them adds little.
+- You can **observe** adaptation soon enough to respond.
+
+### Design choices
+
+1. **Layer structure and speeds**: what each layer stops, and how fast it updates.
+2. **Randomization**: whether and where to add unpredictability (boundary jitter, random step-ups).
+3. **Drift monitors and alert thresholds**, with owners.
+4. **Retraining policy**: cadence, triggers, recency weighting, memory of old attacks.
+5. **Information hygiene**: what is revealed to customers, support and partners.
+6. **Red-team cadence.**
+
+### Trade-offs
+
+- **Unpredictability vs consistency**: randomness makes the boundary harder to learn, but treats similar customers differently. That creates tension with explainability (5.3) and fairness (5.4). Keep it small and well away from protected-group proxies.
+- **Recency vs memory**: adapt fast vs forget old attacks.
+- **Alert sensitivity vs alert fatigue**: catch attacks early vs page people for every holiday shift.
+- **Friction vs deterrence**: more step-ups raise attacker cost *and* good-customer abandonment (3.4).
+
+### Failure modes
+
+- **Treating adversarial drift as natural**: waiting for the monthly retrain during a live attack.
+- **Monitoring only inputs**: concept drift passes unseen because the inputs look normal. That's the whole point of mimicry.
+- **Forgetting old attacks**: over-weighting recent data makes last year's playbook work again.
+- **Correlated layers**: rules, model and review all trust "account age > 30 days," so one purchased aged account beats all three.
+- **Unguarded human override path**: support becomes the weakest layer.
+- **Bust-out blindness**: trust grows with history, so attackers build history, then strike.
+
+### Connections
+
+This part connects to nearly every earlier one: 1.4 seams · 2.1 fast rules · 3.2 adversarial Goodhart · 3.4 deterrence · 4.3 identity resets · 5.1 timeouts · 5.2 denial-of-wallet · 5.3 explanation gaming · 6.1 lag · 6.2 exploration secrecy · 6.3 adversarial loop. **→ Stage 8** carries all of the detection above.
+
+<Callout title="Exercise 6.4">
+
+1. After launch, fraud from accounts **older than 30 days** triples, while input feature distributions look **unchanged**. Which drift type is this? Which monitor catches it?
+2. A retrain weighted heavily toward the last 60 days improves recent metrics, and a **card-testing pattern from last year** starts working again. What went wrong, and what's the fix?
+3. Name **two defense layers that share a weakness**, and explain how an attacker exploits that.
+
+</Callout>
