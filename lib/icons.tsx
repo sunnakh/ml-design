@@ -29,6 +29,7 @@ export function ColorIcon({ name, size = 20 }: { name: string; size?: number }) 
       style={{
         width: size,
         height: size,
+        color: '#fff',
         background: `linear-gradient(135deg, ${from}, ${to})`,
       }}
     >
