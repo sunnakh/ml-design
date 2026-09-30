@@ -1,30 +1,24 @@
 import defaultMdxComponents from 'fumadocs-ui/mdx';
 import type { MDXComponents } from 'mdx/types';
 import { Diagram } from '@/components/diagram';
-import {
-  Activity,
-  BrainCircuit,
-  ChartColumn,
-  ClipboardList,
-  Database,
-  Layers,
-  Network,
-  Rocket,
-  Target,
-} from 'lucide-react';
+import { ColorIcon } from '@/lib/icons';
 
 // Icons used inside MDX content, e.g. <Card icon={<Rocket />} />
-const icons = {
-  Activity,
-  BrainCircuit,
-  ChartColumn,
-  ClipboardList,
-  Database,
-  Layers,
-  Network,
-  Rocket,
-  Target,
-};
+const iconNames = [
+  'Activity',
+  'BrainCircuit',
+  'ChartColumn',
+  'ClipboardList',
+  'Database',
+  'Layers',
+  'Network',
+  'Rocket',
+  'Target',
+] as const;
+
+const icons = Object.fromEntries(
+  iconNames.map((name) => [name, () => <ColorIcon name={name} size={28} />]),
+);
 
 export function getMDXComponents(components?: MDXComponents) {
   return {
