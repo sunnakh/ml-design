@@ -194,10 +194,197 @@ A typical ML fraud system's run costs, from largest to smallest:
 
 </Callout>
 
-## 5.3 Explainability, regulation
+## 5.3 Explainability and regulation
 
-Some decisions must be explained to users or regulators, such as credit or declines under EU strong customer authentication. This can rule out some model types or require reason codes.
+### What problem it solves
+
+A declined customer asks "why?" A regulator asks "how does this work?" A reviewer asks "what should I look at?" A card network asks "what's your evidence?"
+
+If the system can't answer these, it can't legally or practically operate in many settings, however accurate it is. Like latency, these requirements **constrain the formulation**: which model classes, which features, which actions (a human appeal path), and what gets logged.
+
+> Not legal advice. Regulation varies by country and changes over time. The job of framing is to **surface the questions early and bring Legal in** (1.2). Legal answers them.
+
+### How it works
+
+**Step 1: identify the regimes that may apply.** Examples to raise with Legal for ShopFast:
+- **Automated decisions (e.g., EU GDPR, Article 22)**: rights around decisions based *solely* on automated processing with significant effects, including human intervention and the right to contest. Fraud prevention is often a recognized basis for such processing, but **safeguards and transparency still apply**.
+- **Payment authentication rules (e.g., EU strong customer authentication)**: govern when step-up is required and when risk-based exemptions apply. This directly shapes the action space (1.1).
+- **AI-specific rules (e.g., EU AI Act)**: at the time of writing, fraud detection is carved out of the "credit scoring" high-risk category. **But** the classification depends on the use.
+- **Credit rules**: if ShopFast launches **buy-now-pay-later** and uses a risk model to approve it, that's a *credit* decision. Credit comes with its own explanation obligations (e.g., adverse-action notices in the US) and higher-risk treatment. **The same model, used for a different decision, falls under a different regime.**
+- **Card-network dispute rules**: fighting a chargeback requires *evidence*, a form of explanation after the fact.
+
+**Step 2: design explanations per audience.** Different audiences need different detail, and detail is also a **gaming risk** (3.2):
+
+<Diagram src="problem-framing/explanation-tiers-by-audience.svg" />
+
+**Step 3: choose explanation mechanics.**
+
+| Kind | What it answers | Tools |
+|---|---|---|
+| **Global** | How does the model work overall? | Feature importance, partial dependence, model documentation ("model card") |
+| **Local** | Why *this* decision? | Per-decision attributions (e.g., SHAP), mapped to **reason codes** |
+| **Built-in** | The model is readable itself | Logistic regression / scorecards, GAMs, trees with **monotonic constraints** |
+| **Counterfactual** | What would change the outcome? | "Approved if X were different." Useful internally, **dangerous for customers** (it's a gaming guide) |
+
+**Reason codes** are the workhorse. Group raw feature attributions into about 15–30 stable, readable categories, such as "device linked to prior fraud," "unusual shipping pattern" or "velocity: many cards." Every decision logs its top 3 codes (4.4). Support staff, analysts and auditors all read from that one source.
+
+**Monotonic constraints** are an underrated tool. For example: "more prior successful orders never *increases* risk." This makes the model's behavior defensible and resistant to strange extrapolation, usually at very little accuracy cost for tabular models.
+
+**Step 4: design the human path.** Significant automated decisions need a way for a person to **contest them and get a human review**. For ShopFast:
+- A declined customer can reach support.
+- Support sees the reason codes and can **re-route to review or override**, within limits.
+- Each override is logged, and becomes a label signal (with care, as with reviewer echo in 4.2).
+
+That path uses review capacity (4.4, 5.2). Budget for it.
+
+### Assumptions
+
+- **Explanations are faithful** to what the model actually did. Post-hoc methods are approximations.
+- **Legal's interpretation** of the regimes is current, and gets re-checked when the product changes (e.g., BNPL).
+- **Reason-code categories stay stable** across model versions, so support scripts and audits don't break.
+
+### Design choices
+
+1. **Built-in vs post-hoc explanations.** For tabular fraud models, **gradient-boosted trees + monotonic constraints + SHAP-based reason codes** is a common middle path.
+2. **Reason-code taxonomy**: its granularity and who owns it.
+3. **Tier access**: which audience sees which detail (diagram).
+4. **When to compute explanations.** Computing SHAP inline costs latency (5.1). Compute it **asynchronously, and only for declines, step-ups and reviews**. Approvals rarely need an explanation in the moment.
+5. **Documentation package**: model card, data lineage, validation results, monitoring plan, change log. Build it as you go, not the week before an audit.
+
+### Trade-offs
+
+- **Accuracy vs interpretability**: often a smaller gap than people expect for tabular data. Large when the signal lives in complex sequences or graphs.
+- **Transparency vs gaming**: every detail you tell customers teaches attackers (3.2). The answer is tiering: coarse for the public, detailed behind access control.
+- **Human appeal vs cost**: a real appeal path takes reviewer hours; a fake one creates regulatory and reputational exposure.
+- **Explanation fidelity vs simplicity**: an accurate attribution across 200 correlated features doesn't read well; a simple reason code simplifies.
+
+### Failure modes
+
+- **Unfaithful explanations**: correlated features share or swap credit. The reason says "new account" while the real driver was a linked device. The reviewer investigates the wrong thing.
+- **Gaming leak**: customer messages or counterfactuals ("approved if your account were 7+ days old") teach fraudsters exactly what to fake.
+- **Sensitive reasons**: "declined because of your postal code area" can reveal a proxy for a protected attribute, which is a fairness and legal problem (5.4).
+- **Dead-end appeals**: support can't see reasons or can't override, so good customers are stuck and complaints escalate to regulators or social media.
+- **Version mismatch**: the explanation is generated by a different model version than the one that decided, because the version wasn't logged (4.4).
+- **Scope creep across regimes**: the fraud model is reused for BNPL approvals without re-framing, and a credit regime now applies that nobody prepared for.
+
+### Connections
+
+- **← 1.2**: Legal and compliance as stakeholders with veto power.
+- **← 2.1**: deterministic hard rules for legally mandated checks.
+- **← 3.2**: explainability vs gaming.
+- **← 4.4**: reason codes and complete decision logs.
+- **← 5.1 / 5.2**: explanation latency and review capacity.
+- **→ 5.4**: fairness. Explanations reveal proxies.
+- **→ Stages 7–8**: model documentation, audit logs, monitoring the reason-code distribution.
+
+<Callout title="Exercise 5.3">
+
+1. A declined customer emails: *"Why was my order declined?"* Write the **1–2 sentence reply**, and name **two things it must not include**.
+2. SHAP's top driver is **"account younger than 1 day,"** but the analyst finds the device is **linked to 12 fraud accounts**, a correlated feature. Name the failure mode. Why does it matter for **reviewers** specifically?
+3. ShopFast launches **pay-in-4 installments** and wants to reuse the checkout risk model to approve them. What changes in the framing? Name at least two things to re-check.
+4. **(3.2 check)** Why not show customers the counterfactual *"you'd be approved if your account were older than 7 days"*? Which Goodhart mechanism does it feed?
+
+</Callout>
 
 ## 5.4 Fairness and privacy
 
-Check whether the model could treat groups unfairly and whether you are allowed to use each input. Sensitive attributes and personal data may be restricted by law or policy.
+### What problem it solves
+
+Fraud models make two kinds of harm that fall **unevenly**:
+- **Unfair burden**: false declines and step-ups concentrated on certain groups, e.g., customers from certain countries, people on cheap Android phones, non-native-language users, or people living in certain postal codes.
+- **Privacy intrusion**: fraud detection wants *as much data as possible* (devices, locations, linked identities, behavior), while privacy law and user trust push for *as little as necessary*.
+
+Both create legal exposure, reputational damage and lost customers. Both change the formulation: features, labels, thresholds and data handling.
+
+Same caveat as 5.3: **raise these questions with Legal. This isn't legal advice.**
+
+### The three-way tension
+
+Fraud detection, privacy and fairness pull against each other in pairs:
+
+<Diagram src="problem-framing/privacy-fairness-tensions.svg" />
+
+- **Fraud vs privacy**: fraudsters use VPNs, private-relay emails and cookie blocking. So do privacy-conscious legitimate customers. Features like "uses VPN" have real lift *and* penalize people for protecting their privacy. That's a fairness problem too.
+- **Fraud vs fairness**: the model never sees protected attributes, but **proxies** carry them: postal code, name and email patterns, language, device price, prepaid cards (more common among lower-income customers), IP geolocation. Declines concentrate without anyone intending it.
+- **Privacy vs fairness**: to *check* whether declines fall unevenly on protected groups, you often need data on group membership, which privacy rules restrict you from collecting or inferring.
+
+### How it works: fairness
+
+**1. Pick the harm, then the metric.** At checkout, the harm to good customers is a **false decline or unnecessary step-up**. The most meaningful metric is:
+
+> **False-decline rate among legitimate customers, per group**, plus **calibration per group** (so the cost policy is equally correct for everyone).
+
+Not the raw decline rate. If fraud *attacks* genuinely target some segments more, raw decline rates will differ even under a fair model.
+
+**2. Know the impossibility result.** When base rates differ between groups, a model **cannot** be calibrated within every group *and* have equal false-positive and false-negative rates across groups at the same time (except in trivial cases). You must **choose** which property to protect. That's a values decision owned by stakeholders and Legal (1.2), not a hyperparameter.
+
+**3. Audit segments.** Country, language, device tier, new vs returning, payment type, plus protected attributes *where it's lawful and feasible to measure them*. Look at **combinations** too, e.g., new customer + prepaid card + non-English locale.
+
+**4. Mitigations, roughly in order of preference:**
+- **Better signal for underserved groups**: thin-history customers need other trustworthy signals, not harsher thresholds.
+- **Softer actions**: step-up instead of decline where the model is uncertain for a segment (1.4 action space).
+- **Proxy review**: examine high-lift features that track group membership (VPN, postal code, device tier). Removing one isn't a cure, since correlated features take over, but it's part of the review.
+- **Segment guardrails**: the "≤ 2× baseline decline ratio" from 1.3, with its shadow price made visible (3.3).
+- **Group-specific thresholds**: legally sensitive in some jurisdictions. Only with Legal's approval.
+
+**5. Watch the label trap.** Over-declined groups get **fewer labels** (declined orders are unknown, 4.2). So the model stays uncertain about them and keeps declining them. Unfairness can reinforce itself (6.2, 6.3). **Exploration** is also a fairness tool: it measures false declines where you're otherwise blind.
+
+### How it works: privacy
+
+1. **A lawful basis per data source**: extend the 2.3 inventory with purpose, basis, retention and who else receives the data.
+2. **Minimize**: use derived features instead of raw data (hashed emails, tokenized device IDs, aggregates instead of raw location trails).
+3. **Pseudonymize the logs**: decision logs (4.4) are a goldmine of personal data. Restrict access, encrypt, and audit who reads them.
+4. **Plan retention**: labels need 120 days to mature (4.2), plus training history. Define how long each piece is kept, and why.
+5. **Plan for deletion requests**: when a customer asks to be deleted, what happens to their rows in training data and in fraud records? Fraud prevention may justify keeping some data in some regimes, **but decide this with Legal before launch**.
+6. **Vendor data sharing**: the device-fingerprint vendor sees your customers' data. It needs a data-processing agreement, and possibly a cross-border transfer review.
+
+### Assumptions
+
+- Groups can be **identified well enough** to audit, lawfully.
+- Stakeholders **agree on the fairness definition**.
+- Legal's view of the lawful basis and retention **matches how the data is actually used**.
+
+### Design choices
+
+1. **Fairness metric**: false-decline parity among legitimate customers vs calibration per group vs something else. You can't have all of them.
+2. **Audit segments and cadence**: every model version, plus monthly in production.
+3. **Mitigation mix**: better features, softer actions, guardrails, thresholds.
+4. **Privacy posture**: collect broadly and protect heavily vs minimize at the source.
+5. **Measuring protected attributes**: don't measure (blind), infer statistically (risky), or collect with consent for auditing (costly and sensitive).
+
+### Trade-offs
+
+- **Fairness constraints cost TCF**: the shadow price (3.3) makes the cost visible. Whether to pay it is partly a *values and legal* decision, not only an economic one.
+- **Minimization vs signal**: less data means less lift. Some high-lift features aren't worth their privacy cost.
+- **Retention for labels vs deletion rights**.
+- **Auditability vs privacy**: fairness checks need exactly the attributes privacy protects.
+
+### Failure modes
+
+- **"Fairness through unawareness"**: "we don't use race or nationality, so we're fair." Proxies carry them anyway.
+- **Measuring the wrong rate**: comparing raw decline rates (misleading when attack rates differ) instead of false declines among legitimate customers.
+- **Missing intersections**: every single segment passes, and one combination is declined 6× more.
+- **Penalizing privacy**: VPN and private-email users become second-class customers.
+- **Self-reinforcing exclusion**: the label trap above, never broken without exploration.
+- **Personal-data leak from logs**: decision logs copied into analytics tools without access controls.
+- **Vendor without data-processing terms**: customer data shared with no contractual protections.
+- **Deletion breaks reproducibility**: a deletion request removes training rows, and the old model can no longer be rebuilt for an audit. Version datasets with deletion handling in mind.
+
+### Connections
+
+- **← 1.2**: Legal and affected customers as stakeholders; decision rights over the fairness definition.
+- **← 1.3 / 3.3**: segment guardrails and shadow prices.
+- **← 1.4**: softer actions as mitigation.
+- **← 2.3**: the data inventory gains lawful basis and retention columns.
+- **← 5.3**: sensitive reason codes reveal proxies.
+- **→ 6.2 / 6.3**: label starvation and self-reinforcing loops.
+- **→ Stage 8**: per-segment monitoring in production.
+
+<Callout title="Exercise 5.4: branch 5 checkpoint">
+
+1. Decline rates: **country A 3%**, **country B 0.8%**. Risk says: *"A has more fraud attacks. It's fair."* What **exactly** must you measure before agreeing? Why is that hard here?
+2. The feature **"uses a VPN"** has **8× lift**. Name the privacy concern and the fairness concern, and propose a **policy-level** (not model-level) mitigation.
+3. A fairness guardrail (segment decline ratio ≤ 2×) has a **shadow price of $0.8M/yr in TCF**. **(1.2 / 3.3 check)** Who decides whether to keep it? Is this purely a dollar decision?
+4. A customer asks to be deleted. Their orders sit in the training data and the fraud logs. Name **two questions for Legal** and **one engineering implication**.
+
+</Callout>
